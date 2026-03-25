@@ -157,17 +157,9 @@ func swingsPerAttack(class byte, level byte, dualWield bool) int {
 	return 1
 }
 
-// isDualWield returns true if the entity has melee weapons in both hands (no shield).
-// Held items (focus, orb, tome) have non-zero DictID but AttackType 0 or 10 — not dual wield.
+// isDualWield returns true if the entity has weapons in both hands (no shield).
 func isDualWield(primary, secondary, shield uint32) bool {
-	if primary == 0 || secondary == 0 || shield != 0 {
-		return false
-	}
-	// If secondary == primary, it's mirrored display, not dual wield
-	if secondary == primary {
-		return false
-	}
-	return true
+	return primary != 0 && secondary != 0 && shield == 0
 }
 
 // isDualWieldFromItems checks parsed inventory for actual dual-wield weapons.
@@ -791,6 +783,17 @@ func inferAttackTypeFromModel(mgr *models.ModelManager, primary, secondary, shie
 
 	// No SkelType override → infer from slot occupancy
 	return inferAttackType(primary, secondary, shield)
+}
+
+// getWeaponAttackTypeFromItems returns AttackType from parsed inventory items.
+// Slot 12=primary, 14=secondary, 15=twohand. Returns 11 if no weapon.
+func getWeaponAttackTypeFromItems(items []game.ParsedItem) int {
+	for _, item := range items {
+		if (item.Slot == 12 || item.Slot == 14 || item.Slot == 15) && item.AttackType > 0 {
+			return int(item.AttackType)
+		}
+	}
+	return 11
 }
 
 // getWeaponAttackType returns the AttackType of the equipped weapon.

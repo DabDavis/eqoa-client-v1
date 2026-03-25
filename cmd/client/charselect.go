@@ -885,18 +885,10 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	locoAnim := byte(17) // combat idle
 	actionAnim := byte(0)
 
-	// Determine attack anim from weapon SkelType (PS2 SetAttackAction path).
-	// For char select, we don't have inventory AttackType, so held items (focus/orb)
-	// in the secondary slot will incorrectly trigger dual-wield. Use SkelType to
-	// distinguish: real dual-wield weapons have SkelType matching melee types.
-	atkType := inferAttackTypeFromModel(c.modelMgr, primaryWpn, secondaryWpn, shield)
-	// Only use dual-wield table if secondary weapon has a melee SkelType
-	dw := false
-	if primaryWpn != 0 && secondaryWpn != 0 && shield == 0 {
-		secSkelType := c.modelMgr.WeaponSkelType(secondaryWpn)
-		// SkelType 0 = non-weapon (focus/orb/held item), > 0 = real weapon
-		dw = secSkelType > 0
-	}
+	// Determine attack animation from weapon configuration.
+	// At char select we don't have item AttackType — infer from slot occupancy.
+	atkType := inferAttackType(primaryWpn, secondaryWpn, shield)
+	dw := isDualWield(primaryWpn, secondaryWpn, shield)
 	atkTable := weaponAttackAnims
 	if dw {
 		atkTable = weaponAttackAnimsDW
