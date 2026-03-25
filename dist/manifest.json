@@ -1,9 +1,9 @@
 {
-  "version": "20260325-96e37b7",
+  "version": "20260325-ace0b5c",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "25587c8fb0c09745533502bf55726b4bfb2df3e4df0a4bbc69f8447bd397c538",
+  "linux_sha256": "9fcccdc1f3e52551763f991bfcb72e64cec13570aa64d18fc68f54a73341f4fd",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "2cc3a77a27c87487ff4731613f81278f3db3af1cced9c8efbb5279ec49ece605",
-  "changelog": "- Fix combat anim: use weaponAttackAnims for slots, not combatAttackAnim\n- Port PS2 combat animation system (func_00BC76A0 pipeline)\n- Fix multi-swing attack: reduce throttle from 2s to 0.4s per swing\n- Fix weapon attack type: only check equipped items, not full inventory\n- Debug: log all equipped item fields to find proc DictID"
+  "windows_sha256": "35df7603b07b57bee02492bf62cce9526c7d49e7c2951bd3b1282551512040a2",
+  "changelog": "- Wire combatAttackFXHash from PS2 func_00CBE0A8 into spell FX\n- Fix combat anim: use weaponAttackAnims for slots, not combatAttackAnim\n- Port PS2 combat animation system (func_00BC76A0 pipeline)\n- Fix multi-swing attack: reduce throttle from 2s to 0.4s per swing\n- Fix weapon attack type: only check equipped items, not full inventory"
 }

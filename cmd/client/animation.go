@@ -355,28 +355,26 @@ func isDualWieldFromItems(items []game.ParsedItem) bool {
 }
 
 // combatState tracks combat animation state for any combatant (player or entity).
-// PS2 architecture: func_00BC76A0 runs a per-frame combat tick with a timer
-// (entity+0x71E8). Animations are client-side timed, not DamageIndication-driven.
+// Hybrid architecture: DamageIndication-driven swings (server controls timing/count),
+// with PS2 func_00CBDEF8 attack type resolution for spell FX selection.
 type combatState struct {
 	inCombat        bool
 	combatAnim      byte
 	combatAnimEnd   time.Time
-	seenAttackCount int       // last processed AttackCount (triggers combat start)
+	seenAttackCount int       // last processed AttackCount
 	seenHitTime     time.Time // last processed damage-taken time
-	attackCycleIdx  int       // alternates primary/alt for PS2 func_00CC5190
+	attackCycleIdx  int       // alternates primary/alt per swing
 	lastActivity    time.Time // for auto-end detection
 	pendingHitFX    int       // queued hit FX count (fired when swing animation starts)
 	castBarEnd      time.Time // when cast bar finishes (anim starts after this)
 	castAnimEnd     time.Time // when post-cast animation ends (computed once bar completes)
 	castingSelf     bool      // true = self-buff anim, false = offensive
-	nextSwingTime   time.Time // PS2 entity+0x71E8: next attack animation time
-	combatAttackType int      // resolved attack type (0-12) from func_00CBDEF8
+	combatAttackType int      // resolved attack type (0-12) from PS2 func_00CBDEF8
 }
 
 // resolveCombat is the shared combat animation loop used by both player and entities.
-// PS2 func_00BC76A0: per-frame combat tick. Timer-driven swing animations.
-// DamageIndication starts combat + refreshes activity timer.
-// The client drives attack animations at 3500ms intervals (PS2 default).
+// Server-driven: one swing per AttackCount bump (one per DamageIndication).
+// PS2 func_00CBDEF8 resolves class/level/weapon → attack type for spell FX.
 func (cs *combatState) resolveCombat(am *AnimationManager, ctrl *models.SpriteAnimController, now time.Time,
 	attackCount int, hitTime time.Time, attackAnims []byte,
 	cas combatAnimSet, modelID int32, showBattleStance bool, serverDrivenCombat bool,
@@ -386,46 +384,28 @@ func (cs *combatState) resolveCombat(am *AnimationManager, ctrl *models.SpriteAn
 	if cs.inCombat && !cs.lastActivity.IsZero() && now.Sub(cs.lastActivity) > 5*time.Second {
 		cs.inCombat = false
 		cs.combatAnim = 0
-		cs.nextSwingTime = time.Time{}
 		ctrl.ClearAction()
 	}
 
-	// Detect new damage dealt — starts/refreshes combat.
-	// PS2: entity+0x71E4 (combat active flag) set by CastingCombat/DamageIndication.
+	// Detect new damage dealt — one swing per AttackCount bump.
 	if attackCount != cs.seenAttackCount {
 		cs.seenAttackCount = attackCount
-		cs.lastActivity = now
-		if !cs.inCombat {
-			cs.inCombat = true
-			// First swing immediately on combat start
-			cs.nextSwingTime = now
-		}
-	}
-
-	// PS2 timer-driven combat tick (func_00BC76A0).
-	// When nextSwingTime arrives, play the attack animation and advance timer.
-	// Animation slot comes from weaponAttackAnims (SetAttackAction, PS2-verified).
-	// combatAttackType drives spell FX selection and timing only.
-	if cs.inCombat && !cs.nextSwingTime.IsZero() && !now.Before(cs.nextSwingTime) {
 		anim := attackAnims[cs.attackCycleIdx%len(attackAnims)]
 		cs.attackCycleIdx++
-
 		dur := am.animDur(modelID, anim)
 		cs.combatAnim = anim
 		cs.combatAnimEnd = now.Add(dur)
 		ctrl.SetAction(int(anim))
-
-		// PS2: advance timer by 3500ms (default) or 2000ms (after spell FX).
-		// Use animation duration + small gap to pace swings naturally.
-		swingInterval := dur + 200*time.Millisecond
-		if swingInterval < 600*time.Millisecond {
-			swingInterval = 600*time.Millisecond
-		}
-		cs.nextSwingTime = now.Add(swingInterval)
-		cs.lastActivity = now
-
 		log.Printf("ANIM [%s]: ATTACK anim=%d atkType=%d dur=%v cycle=%d",
 			dbgLabel, anim, cs.combatAttackType, dur, cs.attackCycleIdx)
+		if serverDrivenCombat {
+			if cs.inCombat {
+				cs.lastActivity = now
+			}
+		} else {
+			cs.inCombat = true
+			cs.lastActivity = now
+		}
 	}
 
 	// Detect new hit taken.
