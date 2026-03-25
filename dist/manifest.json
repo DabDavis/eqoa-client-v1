@@ -1,0 +1,9 @@
+{
+  "version": "20260325-68bafdd",
+  
+  "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
+  "linux_sha256": "7f29e6419579543b958fba1790c780cb5d1c43bc3271f9b3642150253a1c361c",
+  "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
+  "windows_sha256": "56e3f419270ea301907e2ff630ceea032a9fbe06203100f69e1a409c2943fa4f",
+  "changelog": "- v1 stable: March 23 2026 backup (proven working terrain, models, combat)"
+}
