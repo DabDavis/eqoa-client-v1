@@ -18,7 +18,7 @@ const (
 	animRun        = 3
 	animFall       = 6  // humanoid CPlayList slot 6 (NOT 4 which is swim forward)
 	animSwim       = 12 // CPlayList slot 12 (swim)
-	animLanding    = 5  // humanoid CPlayList slot 5
+	animLanding    = 7  // humanoid CPlayList slot 7 (NOT 5 which is swim backward)
 	animStrafe     = 10 // 64+ anim models only
 
 	// State
@@ -87,7 +87,7 @@ var weaponAttackAnimsDW = map[int][]byte{
 	5:  {27, 28, 24, 25},     // Hand-to-Hand: left/right × Primary/Alt
 	6:  {29, 26},             // 2H Pierce (not dual-wielded)
 	7:  {31, 31},             // Bow
-	8:  {32, 35, 32, 35},     // Throwing: left/right hand throws
+	8:  {35, 32, 35, 32},     // Throwing: right(35)/left(32) hand throws
 	9:  {33, 33},             // Crossbow
 	10: {36, 36},             // Spell/Wand
 	11: {22, 23, 24, 25},     // Dagger: left/right × Primary/Alt
