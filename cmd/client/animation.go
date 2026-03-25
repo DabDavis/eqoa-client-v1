@@ -167,6 +167,10 @@ func isDualWield(primary, secondary, shield uint32) bool {
 func isDualWieldFromItems(items []game.ParsedItem) bool {
 	var hasPrimary, hasSecondary bool
 	for _, item := range items {
+		// Only check equipped items
+		if item.EquipLocation < 0 || item.Location != -1 {
+			continue
+		}
 		if item.Slot == 12 && item.AttackType > 0 && item.AttackType != 10 {
 			hasPrimary = true
 		}
@@ -757,6 +761,10 @@ func inferAttackType(primary, secondary, shield uint32) int {
 // Slot 12=primary, 14=secondary, 15=twohand. Returns 11 if no weapon.
 func getWeaponAttackTypeFromItems(items []game.ParsedItem) int {
 	for _, item := range items {
+		// Only check equipped items
+		if item.EquipLocation < 0 || item.Location != -1 {
+			continue
+		}
 		if (item.Slot == 12 || item.Slot == 14 || item.Slot == 15) && item.AttackType > 0 {
 			return int(item.AttackType)
 		}
@@ -773,6 +781,10 @@ func (am *AnimationManager) getWeaponAttackType(gs *game.GameState) int {
 		return 11
 	}
 	for _, item := range gs.ParsedItems {
+		// Only check equipped weapon items (EquipLocation >= 0 and Location == -1)
+		if item.EquipLocation < 0 || item.Location != -1 {
+			continue
+		}
 		if (item.Slot == 12 || item.Slot == 14 || item.Slot == 15) && item.AttackType > 0 {
 			return int(item.AttackType)
 		}
