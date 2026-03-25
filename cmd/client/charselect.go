@@ -880,18 +880,11 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	// Use a unique entity ID for animation state (won't collide with real entities)
 	entityID := uint32(0xFFFF0000) + uint32(c.charSelectIdx)
 
-	// PS2 char select: combat idle stance with periodic attack swings.
-	// Uses weapon SkelType from ESF to pick the correct attack animation.
-	locoAnim := byte(17) // combat idle
-	actionAnim := byte(0)
-
 	// Weapon AttackType from char select packet (bytes 17-19 of equipment block).
-	// PS2 uses these to call SetAttackAction with the correct animation type.
 	atkType := int(ch.PrimaryAttackType)
 	if atkType == 0 {
-		atkType = 11 // unarmed fallback
+		atkType = 11
 	}
-	// Dual-wield: secondary has a melee AttackType (> 0 and != 10 spell)
 	dw := ch.SecondaryAttackType > 0 && ch.SecondaryAttackType != 10 && shield == 0
 	atkTable := weaponAttackAnims
 	if dw {
@@ -902,20 +895,27 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 		atkAnims = atkTable[11]
 	}
 
-	// Auto-attack cycle matching in-game: class/level determines swing count.
-	// Each swing plays for ~0.8s with 0.3s gap, then combat idle until next round.
+	// Auto-attack cycle: class/level swing count, back-to-back, then idle pause.
 	numSwings := swingsPerAttack(byte(ch.Class), byte(ch.Level), dw)
 	if numSwings > len(atkAnims) {
 		numSwings = len(atkAnims)
 	}
-	swingDur := 0.8   // per-swing animation time
-	swingGap := 0.3   // gap between swings
-	roundDur := float64(numSwings)*(swingDur+swingGap) + 2.0 // + idle pause between rounds
+	swingDur := 0.6
+	attackDur := float64(numSwings) * swingDur
+	roundDur := attackDur + 1.5 // attacks + combat idle pause
 	timeInRound := math.Mod(c.charSelectTime, roundDur)
-	swingIdx := int(timeInRound / (swingDur + swingGap))
-	timeInSwing := math.Mod(timeInRound, swingDur+swingGap)
-	if swingIdx < numSwings && timeInSwing < swingDur {
-		actionAnim = atkAnims[swingIdx%len(atkAnims)]
+
+	var locoAnim, actionAnim byte
+	if timeInRound < attackDur {
+		// Attacking — full body swing
+		swingIdx := int(timeInRound / swingDur)
+		anim := atkAnims[swingIdx%len(atkAnims)]
+		locoAnim = anim  // full body
+		actionAnim = anim
+	} else {
+		// Combat idle pause between rounds
+		locoAnim = 17
+		actionAnim = 0
 	}
 
 	c.modelMgr.DrawEntity(modelID, 0, 0, 0, facing, 1.0, equip, entityID, locoAnim, actionAnim, dt, false, 1.0)
