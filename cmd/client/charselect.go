@@ -101,9 +101,10 @@ func (c *Client) handleCharSelectInput() {
 		}
 	}
 
-	// Play race-specific BGM when highlighted character changes
+	// Play race-specific BGM and reset attack timer when character changes
 	if n > 0 && c.charSelectIdx >= 0 && c.charSelectIdx != prevIdx {
 		c.playCharSelectBGM(gs.Characters[c.charSelectIdx].Race)
+		c.charSelectTime = 0
 	}
 
 	// Cross or Enter: enter world with highlighted character
