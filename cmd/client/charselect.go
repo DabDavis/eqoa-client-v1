@@ -916,9 +916,8 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 		timeInRound := math.Mod(c.charSelectTime-firstDelay, roundDur)
 		if timeInRound < attackDur {
 			swingIdx := int(timeInRound / swingDur)
-			anim := atkAnims[swingIdx%len(atkAnims)]
-			locoAnim = anim
-			actionAnim = anim
+			locoAnim = 17 // combat idle — lower body stays planted
+			actionAnim = atkAnims[swingIdx%len(atkAnims)] // upper body swings
 		} else {
 			locoAnim = 17
 			actionAnim = 0
