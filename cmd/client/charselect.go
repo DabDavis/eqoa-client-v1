@@ -885,10 +885,14 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	locoAnim := byte(17) // combat idle
 	actionAnim := byte(0)
 
-	// Determine attack animation from weapon configuration.
-	// At char select we don't have item AttackType — infer from slot occupancy.
-	atkType := inferAttackType(primaryWpn, secondaryWpn, shield)
-	dw := isDualWield(primaryWpn, secondaryWpn, shield)
+	// Weapon AttackType from char select packet (bytes 17-19 of equipment block).
+	// PS2 uses these to call SetAttackAction with the correct animation type.
+	atkType := int(ch.PrimaryAttackType)
+	if atkType == 0 {
+		atkType = 11 // unarmed fallback
+	}
+	// Dual-wield: secondary has a melee AttackType (> 0 and != 10 spell)
+	dw := ch.SecondaryAttackType > 0 && ch.SecondaryAttackType != 10 && shield == 0
 	atkTable := weaponAttackAnims
 	if dw {
 		atkTable = weaponAttackAnimsDW

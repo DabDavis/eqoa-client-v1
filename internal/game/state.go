@@ -84,6 +84,9 @@ type CharInfo struct {
 	Shield         uint32
 	PrimaryWeapon  uint32
 	SecondaryWeapon uint32
+	PrimaryAttackType   byte // weapon AttackType for primary (PS2 VICSpriteAttackType)
+	SecondaryAttackType byte // weapon AttackType for secondary
+	ShieldAttackType    byte // shield type (usually 0)
 	Chest, Bracer, Gloves, Legs, Boots, Helm, Robe byte
 	ChestTint, BracerTint, GlovesTint, LegsTint, BootsTint, HelmTint, RobeTint byte
 
@@ -974,6 +977,11 @@ func (gs *GameState) handleCharacterSelect(msg *protocol.Message) {
 			ci.PrimaryWeapon = uint32(equipBytes[5]) | uint32(equipBytes[6])<<8 | uint32(equipBytes[7])<<16 | uint32(equipBytes[8])<<24
 			ci.SecondaryWeapon = uint32(equipBytes[9]) | uint32(equipBytes[10])<<8 | uint32(equipBytes[11])<<16 | uint32(equipBytes[12])<<24
 			ci.Shield = uint32(equipBytes[13]) | uint32(equipBytes[14])<<8 | uint32(equipBytes[15])<<16 | uint32(equipBytes[16])<<24
+			// Bytes 17-19: weapon AttackTypes (PS2 VICSpriteAttackType per slot)
+			ci.PrimaryAttackType = equipBytes[17]
+			ci.SecondaryAttackType = equipBytes[18]
+			ci.ShieldAttackType = equipBytes[19]
+
 			ci.Chest = equipBytes[20]
 			ci.Bracer = equipBytes[21]
 			ci.Gloves = equipBytes[22]
