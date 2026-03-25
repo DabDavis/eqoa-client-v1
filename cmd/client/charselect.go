@@ -902,12 +902,17 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 		atkAnims = atkTable[11]
 	}
 
-	// Cycle through primary/alt attacks. Use a counter that increments each
-	// attack window (every 4s) so we alternate through the full pool.
-	swingNum := int(c.charSelectTime / 4.0)
-	attackCycle := math.Mod(c.charSelectTime, 4.0)
-	if attackCycle >= 3.0 && attackCycle < 3.5 {
-		actionAnim = atkAnims[swingNum%len(atkAnims)]
+	// Full attack cycle per rotation (12.57s at 0.5 rad/s).
+	// Evenly space N swings across the rotation, each lasting ~0.7s.
+	rotationPeriod := 2 * math.Pi / 0.5 // ~12.57s
+	numSwings := len(atkAnims)
+	swingInterval := rotationPeriod / float64(numSwings)
+	swingDuration := 0.7 // seconds per swing animation window
+	timeInRotation := math.Mod(c.charSelectTime, rotationPeriod)
+	swingIdx := int(timeInRotation / swingInterval)
+	timeInSwing := math.Mod(timeInRotation, swingInterval)
+	if swingIdx < numSwings && timeInSwing < swingDuration {
+		actionAnim = atkAnims[swingIdx]
 	}
 
 	c.modelMgr.DrawEntity(modelID, 0, 0, 0, facing, 1.0, equip, entityID, locoAnim, actionAnim, dt, false, 1.0)
