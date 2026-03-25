@@ -157,9 +157,32 @@ func swingsPerAttack(class byte, level byte, dualWield bool) int {
 	return 1
 }
 
-// isDualWield returns true if the entity has weapons in both hands (no shield).
+// isDualWield returns true if the entity has melee weapons in both hands (no shield).
+// Held items (focus, orb, tome) have non-zero DictID but AttackType 0 or 10 — not dual wield.
 func isDualWield(primary, secondary, shield uint32) bool {
-	return primary != 0 && secondary != 0 && shield == 0
+	if primary == 0 || secondary == 0 || shield != 0 {
+		return false
+	}
+	// If secondary == primary, it's mirrored display, not dual wield
+	if secondary == primary {
+		return false
+	}
+	return true
+}
+
+// isDualWieldFromItems checks parsed inventory for actual dual-wield weapons.
+// Secondary slot items with AttackType 0 or 10 are held items (focus/orb), not weapons.
+func isDualWieldFromItems(items []game.ParsedItem) bool {
+	var hasPrimary, hasSecondary bool
+	for _, item := range items {
+		if item.Slot == 12 && item.AttackType > 0 && item.AttackType != 10 {
+			hasPrimary = true
+		}
+		if item.Slot == 14 && item.AttackType > 0 && item.AttackType != 10 {
+			hasSecondary = true
+		}
+	}
+	return hasPrimary && hasSecondary
 }
 
 // combatState tracks combat animation state for any combatant (player or entity).
@@ -352,6 +375,7 @@ type animParams struct {
 	level              byte
 	isPC               bool // true = use class for swing count
 	weaponAttackType   int  // >=0: use weaponAttackAnims[type]. <0: derive from equipment
+	parsedItems        []game.ParsedItem // player inventory (for dual-wield detection)
 	showBattleStance   bool
 	serverDrivenCombat bool
 	castBarEnd         time.Time
@@ -396,6 +420,11 @@ func (am *AnimationManager) resolveAnim(ctrl *models.SpriteAnimController, now t
 	}
 	if isHumanoid {
 		dw := isDualWield(p.primaryWeapon, p.secondaryWeapon, p.shield)
+		// For player characters, use inventory AttackType to distinguish
+		// held items (focus/orb, AttackType 0 or 10) from dual-wield weapons.
+		if p.isPC && p.parsedItems != nil {
+			dw = isDualWieldFromItems(p.parsedItems)
+		}
 		// Per-profile weapon attack pools override the global table (for gnolls, etc.).
 		if prof != nil && prof.DualWieldAtks != nil {
 			if dw {
@@ -520,6 +549,7 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		level:              gs.Player.Level,
 		isPC:               true,
 		weaponAttackType:   am.getWeaponAttackType(gs),
+		parsedItems:        gs.ParsedItems,
 		showBattleStance:   am.InCombat,
 		serverDrivenCombat: true,
 		castBarEnd:         castBarEnd,
