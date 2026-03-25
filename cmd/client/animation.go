@@ -693,7 +693,7 @@ func (am *AnimationManager) ResolveEntityAnim(ent *game.Entity, now time.Time) (
 		class:              ent.Class,
 		level:              ent.Level,
 		isPC:               ent.IsPlayer,
-		weaponAttackType:   inferAttackTypeFromModel(am.modelMgr, ent.PrimaryWeapon, ent.SecondaryWeapon, ent.Shield),
+		weaponAttackType:   inferAttackType(ent.PrimaryWeapon, ent.SecondaryWeapon, ent.Shield),
 		showBattleStance:   true,
 		serverDrivenCombat: false,
 		castBarEnd:         ent.CastAnimEnd,
@@ -737,52 +737,20 @@ func (am *AnimationManager) animDur(modelID int32, animByte byte) time.Duration 
 	return dur
 }
 
-// inferAttackType determines attack type from visible equipment for entities.
-// For humanoid entities with a ModelManager, looks up the weapon model's SkelType
-// from CHAR.ESF/ITEM.ESF — exactly what PS2 AttachItem does.
-// SkelType → AttackType mapping from PS2 SetAttackAction (0x00421820):
-//   SkelType 2 → type 2 (2H Slash, animID 26)
-//   SkelType 4 → type 4 (2H Blunt/Bow, animID 42)
-//   SkelType 6 → type 6 (2H Pierce, animID 29)
-//   Other → infer from slot occupancy
+// inferAttackType determines attack type from visible equipment.
+// Without item database AttackType, we infer from slot occupancy.
 func inferAttackType(primary, secondary, shield uint32) int {
-	hasPrimary := primary != 0
-	hasSecondary := secondary != 0
-	hasShield := shield != 0
-
-	if !hasPrimary {
+	if primary == 0 {
 		return 11 // unarmed → dagger anims
 	}
-	if hasShield {
-		return 1 // sword + shield → 1H slash
+	if shield != 0 {
+		return 1 // weapon + shield → 1H slash
 	}
-	if hasSecondary {
+	if secondary != 0 {
 		return 1 // dual wield → 1H slash
 	}
-	// Primary only → 2H weapon, default to 2H slash
-	return 2
-}
-
-// inferAttackTypeFromModel uses the ModelManager to look up weapon SkelType.
-// This is the PS2-accurate path: AttachItem reads SkelType from the weapon's CSprite.
-func inferAttackTypeFromModel(mgr *models.ModelManager, primary, secondary, shield uint32) int {
-	if mgr == nil || primary == 0 {
-		return inferAttackType(primary, secondary, shield)
-	}
-
-	// Check weapon model's SkelType
-	skelType := mgr.WeaponSkelType(primary)
-	switch skelType {
-	case 2:
-		return 2 // 2H Slash
-	case 4:
-		return 4 // 2H Blunt / Bow
-	case 6:
-		return 6 // 2H Pierce / Spear
-	}
-
-	// No SkelType override → infer from slot occupancy
-	return inferAttackType(primary, secondary, shield)
+	// Primary only, no secondary, no shield → 2H weapon
+	return 2 // default to 2H slash
 }
 
 // getWeaponAttackTypeFromItems returns AttackType from parsed inventory items.

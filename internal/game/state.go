@@ -369,6 +369,7 @@ type GameState struct {
 	HitFXTarget         uint32    // target ObjectID for pending hit FX
 	LastAutoAttackEvent time.Time // last CastingCombat auto-attack involving player (combat-end detection)
 	LastMeleeHitFX      time.Time // throttle: last time melee hit FX was played on a target
+	LastProcFXTime      time.Time // throttle: PS2 proc cooldown ~3500ms (func_00BC76A0)
 	FloatingTexts   []FloatingText // rising/fading damage/heal numbers
 
 	// Blacksmith/repair state
@@ -1290,6 +1291,13 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 	gs.InventoryItemCount = len(gs.ParsedItems)
 	log.Printf("MemoryDump: parsed %d inventory items", gs.InventoryItemCount)
 
+	// Log equipped items with proc effects (PS2 func_00BC76A0 uses these for client-side proc FX)
+	for _, item := range gs.ParsedItems {
+		if item.ProcAnim != 0 && item.EquipLocation >= 0 && item.Location == -1 {
+			log.Printf("  PROC ITEM: %q equipLoc=%d procAnim=0x%08X", item.Name, item.EquipLocation, uint32(item.ProcAnim))
+		}
+	}
+
 	// ─── Section 5: Weapon Hotbars ──────────────────────────────────────
 	// PS2: 6 × (4 × ReadBytes(4)) = 96 bytes fixed via func_00BFD178
 	// Sandstorm: SKIPPED (not present in wire format)
@@ -1360,8 +1368,8 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 			}
 			statStr += fmt.Sprintf("%d=%d", idx, val)
 		}
-		writeItemLog("MemDump", fmt.Sprintf("ITEM id=%d name=%q slot=%d equipLoc=%d loc=%d cost=%d icon=%d lvl=%d atk=%d dmg=%d stack=%d stats={%s}",
-			item.ItemID, item.Name, item.Slot, item.EquipLocation, item.Location, item.ItemCost, item.ItemIcon, item.LevelReq, item.AttackType, item.WeaponDamage, item.MaxStack, statStr))
+		writeItemLog("MemDump", fmt.Sprintf("ITEM id=%d name=%q slot=%d equipLoc=%d loc=%d cost=%d icon=%d lvl=%d atk=%d dmg=%d stack=%d proc=0x%X stats={%s}",
+			item.ItemID, item.Name, item.Slot, item.EquipLocation, item.Location, item.ItemCost, item.ItemIcon, item.LevelReq, item.AttackType, item.WeaponDamage, item.MaxStack, item.ProcAnim, statStr))
 	}
 	for _, sp := range gs.ParsedSpells {
 		writeSpellLog(fmt.Sprintf("SPELL id=%d name=%q ability=%d addedOrder=%d range=%d cast=%d power=%d icon=%d scope=%d recast=%d",
@@ -2955,6 +2963,18 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 				gs.LastMeleeHitFX = time.Now()
 				gs.SpellFXSys.Play(0xDA9BEA14, 0, sourceID, targetID)
 			}
+			// PS2 client-side proc FX (func_00BC76A0): iterate equipped items,
+			// check ProcAnim (item+0x2F0 = proc type, item+0x28 = DictID).
+			// PS2 rolls proc chance locally and plays spell effect with ~3500ms cooldown.
+			// We trigger on every melee hit since Sandstorm handles proc chance server-side
+			// and sends separate DamageIndications for proc damage/heals.
+			if gs.SpellFXSys != nil && time.Since(gs.LastProcFXTime) > 3500*time.Millisecond {
+				if procDictID := gs.getEquippedProcAnim(); procDictID != 0 {
+					gs.LastProcFXTime = time.Now()
+					gs.SpellFXSys.Play(procDictID, 0, sourceID, targetID)
+					log.Printf("  ProcFX.Play: 0x%08X caster=0x%08X target=0x%08X", procDictID, sourceID, targetID)
+				}
+			}
 		}
 		if sourceID != gs.PlayerObjectID && dmg < 0 {
 			if ent, ok := gs.Entities[sourceID]; ok {
@@ -2982,6 +3002,24 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 			IsHeal:    dmg > 0,
 		})
 	}
+}
+
+// getEquippedProcAnim returns the ProcAnim DictID from the first equipped item
+// that has a non-zero proc effect. PS2 func_00BC76A0 iterates items at entity+0xC428
+// checking item+0x2F0 for proc type codes (14-20) and item+0x28 for the spell FX DictID.
+// EquipLocation values for weapon/armor slots: 0=helm, 1=gloves, 5=chest, 8=bracer,
+// 12=legs, 13=boots, 14=primary, 15=secondary, 21=robe. Procs can be on any slot.
+func (gs *GameState) getEquippedProcAnim() uint32 {
+	for _, item := range gs.ParsedItems {
+		// Only equipped items (EquipLocation != -1 means equipped in a slot)
+		if item.EquipLocation < 0 || item.Location != -1 {
+			continue
+		}
+		if item.ProcAnim != 0 {
+			return uint32(item.ProcAnim)
+		}
+	}
+	return 0
 }
 
 func (gs *GameState) handleResourceUpdate(msg *protocol.Message) {

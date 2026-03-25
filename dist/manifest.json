@@ -1,9 +1,9 @@
 {
-  "version": "20260325-68bafdd",
+  "version": "20260325-3400803",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "7f29e6419579543b958fba1790c780cb5d1c43bc3271f9b3642150253a1c361c",
+  "linux_sha256": "bd36f41bd4017cec6b698104dc624c05921b22c138a6fff141dc13a5f92c8d46",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "56e3f419270ea301907e2ff630ceea032a9fbe06203100f69e1a409c2943fa4f",
-  "changelog": "- v1 stable: March 23 2026 backup (proven working terrain, models, combat)"
+  "windows_sha256": "91e5da73ad3b802efe77acd112781eceb998ad81972eddff8a8cddc10e9a47bd",
+  "changelog": "- Char select: both pairs get attack anim (PS2 SetAction verified)\n- Char select: combat idle locomotion during attacks (PS2 dual-pair)\n- Char select: 3s combat idle delay before first attack salvo\n- Char select: reset timer on all selection methods, start in combat idle\n- Char select: 3s combat idle between attack rounds (matches in-game)"
 }
