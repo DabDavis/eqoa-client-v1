@@ -903,20 +903,29 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	}
 	swingDur := 0.6
 	attackDur := float64(numSwings) * swingDur
-	roundDur := attackDur + 1.5 // attacks + combat idle pause
-	timeInRound := math.Mod(c.charSelectTime, roundDur)
+	roundDur := attackDur + 1.5
 
+	// Start in normal idle, first attack after 2s, then combat idle between rounds.
+	firstAttackDelay := 2.0
 	var locoAnim, actionAnim byte
-	if timeInRound < attackDur {
-		// Attacking — full body swing
-		swingIdx := int(timeInRound / swingDur)
-		anim := atkAnims[swingIdx%len(atkAnims)]
-		locoAnim = anim  // full body
-		actionAnim = anim
-	} else {
-		// Combat idle pause between rounds
-		locoAnim = 17
+	if c.charSelectTime < firstAttackDelay {
+		// Initial idle before first attack
+		locoAnim = 0 // normal idle
 		actionAnim = 0
+	} else {
+		combatTime := c.charSelectTime - firstAttackDelay
+		timeInRound := math.Mod(combatTime, roundDur)
+		if timeInRound < attackDur {
+			// Attacking — full body swing
+			swingIdx := int(timeInRound / swingDur)
+			anim := atkAnims[swingIdx%len(atkAnims)]
+			locoAnim = anim
+			actionAnim = anim
+		} else {
+			// Combat idle between rounds
+			locoAnim = 17
+			actionAnim = 0
+		}
 	}
 
 	c.modelMgr.DrawEntity(modelID, 0, 0, 0, facing, 1.0, equip, entityID, locoAnim, actionAnim, dt, false, 1.0)
