@@ -701,7 +701,7 @@ func (am *AnimationManager) ResolveEntityAnim(ent *game.Entity, now time.Time) (
 		class:              ent.Class,
 		level:              ent.Level,
 		isPC:               ent.IsPlayer,
-		weaponAttackType:   -1, // derive from equipment
+		weaponAttackType:   inferAttackType(ent.PrimaryWeapon, ent.SecondaryWeapon, ent.Shield),
 		showBattleStance:   true,
 		serverDrivenCombat: false,
 		castBarEnd:         ent.CastAnimEnd,
@@ -743,6 +743,28 @@ func (am *AnimationManager) animDur(modelID int32, animByte byte) time.Duration 
 		}
 	}
 	return dur
+}
+
+// inferAttackType guesses attack type from visible equipment for entities
+// (NPCs and other players) where we don't have parsed inventory AttackType.
+// Uses weapon slot occupancy to pick the closest animation pool.
+func inferAttackType(primary, secondary, shield uint32) int {
+	hasPrimary := primary != 0
+	hasSecondary := secondary != 0
+	hasShield := shield != 0
+
+	if !hasPrimary {
+		return 11 // unarmed → dagger anims
+	}
+	if hasShield {
+		return 1 // sword + shield → 1H slash
+	}
+	if hasSecondary {
+		return 1 // dual wield → 1H slash (isDualWield handles the table switch)
+	}
+	// Primary only, no secondary, no shield → 2H weapon
+	// PS2 uses SkelType for 2H type; we default to 2H slash (type 2)
+	return 2
 }
 
 // getWeaponAttackType returns the AttackType of the equipped weapon.
