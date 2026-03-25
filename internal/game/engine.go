@@ -1,0 +1,1234 @@
+package game
+
+import (
+	"encoding/binary"
+	"fmt"
+	"log"
+	"math"
+	"time"
+
+	"github.com/eqoa/client/internal/network"
+	"github.com/eqoa/client/internal/protocol"
+	"github.com/DabDavis/eqoa-esf-tools/pkg/buffer"
+	"github.com/DabDavis/eqoa-esf-tools/pkg/esf"
+)
+
+// Engine is the core game loop, independent of any UI framework.
+type Engine struct {
+	State       *GameState
+	AutoConnect bool // Auto-connect to first game server after receiving server list
+	lastFlush   time.Time
+	started     bool
+	password     string
+	sessionToken []byte // 32-byte token from TCP auth
+	tickCount    int
+	whoToken       byte   // Who list request token (increments by 2)
+	TargetObjectID uint32 // Current target ObjectID (sent in 0x40 position updates)
+	chatMode       byte   // Current server-side chat mode (0=say, 3=group)
+
+	// Movement target (goto command)
+	moveTargetActive bool
+	moveTargetX      float32
+	moveTargetY      float32
+	moveTargetZ      float32
+	moveSpeed        float32 // units per tick (default 5.0 = 50 units/sec)
+	moveArrivalDist  float32 // stop distance (default 3.0)
+
+	// Follow mode
+	followTarget   uint32 // ObjectID to follow (0 = not following)
+	followDist     float32
+
+	// Assets directory for loading SPELLFX, etc.
+	AssetsDir string
+	ISOPath   string // path to EQOA ISO (optional, for reading assets directly)
+
+	// Spell effect runtime system
+	SpellFX     *SpellEffectSystem
+	Audio       AudioPlayer        // set by visual client for sound playback
+	posResolver    PosResolver    // set by visual client for entity position lookups
+	boneResolver   BoneResolver   // set by visual client for bone position lookups
+	facingResolver FacingResolver // set by visual client for entity facing angle
+
+	// PlayAttack callback (set by visual client for spell effect animation triggers)
+	playAttackCB func(actorObjID uint32, animPair int32)
+
+	// SetAction callback (set by visual client for cast/action animation triggers)
+	setActionCB func(actorObjID uint32, actionType int32)
+
+	// IsActionComplete callback (set by visual client for Wait sub-type 0)
+	isActionCompleteCB func(actorObjID uint32) bool
+
+	// 0x40 position send throttle — PS2 runs at 30fps and sends 0x40 at ~6/s
+	// (~every 5 frames). Visual client at 60fps must NOT queue per frame.
+	lastPositionSend time.Time
+
+	// Arrow-key walking (set by UI layer each frame)
+	Walking       bool
+	AnimByte      byte // CPlayList slot: 0=idle, 1=walk, 3=run, 4=swim (matches PS2 wire format)
+	EmoteAnimByte byte // non-zero while an emote is playing (overrides AnimByte in 0x40)
+	InCombat      bool // true when server confirms auto-attack (sets animation byte to 0x09)
+	CombatEngaged bool // true when player pressed spacebar to initiate auto-attack
+	AttackSent    bool // true once the Attack opcode (0x000F) has been sent for current engage
+
+	// PS2 0x40 velocity encoding — world-space velocity set by movement handler each frame.
+	// Encoded as uint16 big-endian in 0x40 bytes 10-15, 0x8000 = center (zero velocity).
+	VelX, VelY, VelZ float32
+
+	// PS2 0x40 auxiliary fields (set by visual client each frame)
+	StickMagnitude byte    // byte 24: analog stick deflection (128=center, 254=max). Keyboard: 254 when moving, 128 idle.
+	AccelState     byte    // byte 26: 0x80=steady/idle, 0xFF=accelerating, 0x00=decelerating
+	SmoothedFacing float32 // byte 28: exponentially smoothed facing (lags during turns)
+	TurnRate       float32 // byte 23: heading change rate in rad/s (0=no turn, positive=right, negative=left)
+	PrevFacing     float32 // previous frame facing for turn rate computation
+
+	// Deferred game server switch — avoids goroutine deadlock with Flush mutex.
+	// After server list arrives, we wait a few ticks for the ACK to go out,
+	// then switch synchronously from Tick.
+	deferredGameServerIdx  int
+	deferredGameServerTick int // countdown ticks before switching (-1 = no pending switch)
+
+	// GM teleport position override — applied AFTER processIncoming (which
+	// overwrites Player pos from state channel 0x00) but BEFORE sendWorldEntryTrigger
+	// builds the 0x40 packet. Set by visual client for GM teleport reconnect.
+	PosOverride      bool
+	PosOverrideX     float32
+	PosOverrideY     float32
+	PosOverrideZ     float32
+}
+
+// NewEngine creates a new Engine with the given connection parameters.
+func NewEngine(host string, gamePort, authPort, patchPort int, username, password string) *Engine {
+	return &Engine{
+		State:                  NewGameState(host, gamePort, authPort, patchPort, username),
+		AutoConnect:            true,
+		lastFlush:              time.Now(),
+		password:               password,
+		deferredGameServerTick: -1,
+	}
+}
+
+// NewEngineWithAuth creates an Engine with pre-completed TCP auth credentials.
+// Used when the login screen performs auth before engine creation.
+func NewEngineWithAuth(host string, gamePort, authPort, patchPort int,
+	username, password string, accountID uint32, sessionToken []byte) *Engine {
+	e := &Engine{
+		State:                  NewGameState(host, gamePort, authPort, patchPort, username),
+		AutoConnect:            true,
+		lastFlush:              time.Now(),
+		password:               password,
+		sessionToken:           sessionToken,
+		deferredGameServerTick: -1,
+	}
+	e.State.AccountID = accountID
+	return e
+}
+
+// SetPosResolver sets the position resolver for spell effect particle emitters.
+// Should be called by the visual client after engine creation.
+func (e *Engine) SetPosResolver(resolve PosResolver) {
+	e.posResolver = resolve
+}
+
+// SetBoneResolver sets the bone position resolver for spell effect bone attachment.
+func (e *Engine) SetBoneResolver(resolve BoneResolver) {
+	e.boneResolver = resolve
+}
+
+// SetFacingResolver sets the facing angle resolver for spell effect emitter direction.
+// PS2 ProcessCreateEmitter applies actor facing to emitter direction matrix.
+func (e *Engine) SetFacingResolver(resolve FacingResolver) {
+	e.facingResolver = resolve
+}
+
+// SetPlayAttackCallback sets a callback for PlayAttack spell events (type 15).
+// Called with (actorObjID, animPairIndex) when a spell effect triggers an attack animation.
+func (e *Engine) SetPlayAttackCallback(cb func(actorObjID uint32, animPair int32)) {
+	e.playAttackCB = cb
+}
+
+// SetSetActionCallback sets a callback for SetAction spell events (type 2).
+// Called with (actorObjID, actionType) when a spell effect triggers a cast/action animation.
+func (e *Engine) SetSetActionCallback(cb func(actorObjID uint32, actionType int32)) {
+	e.setActionCB = cb
+}
+
+// SetIsActionCompleteCallback sets a callback for Wait sub-type 0.
+// PS2 checks VICSprite::IsActionComplete — returns true when play-once action finishes.
+func (e *Engine) SetIsActionCompleteCallback(cb func(actorObjID uint32) bool) {
+	e.isActionCompleteCB = cb
+}
+
+// loadSpellFXAuto tries ISO first, then assetsDir for SPELLFX loading.
+func (e *Engine) loadSpellFXAuto() (*SpellFXDB, error) {
+	if e.ISOPath != "" {
+		file, err := esf.OpenISOFile(e.ISOPath, "SPELLFX.ESF")
+		if err == nil {
+			log.Printf("SpellFX: loaded from ISO")
+			return LoadSpellFXFromFile(file)
+		}
+		log.Printf("SpellFX: ISO read failed: %v (trying files)", err)
+	}
+	if e.AssetsDir != "" {
+		return LoadSpellFX(e.AssetsDir)
+	}
+	return nil, fmt.Errorf("no ISO or assets dir configured")
+}
+
+// Tick runs one iteration of the game loop: drain packets + position update + flush.
+func (e *Engine) Tick() {
+	if !e.started {
+		e.started = true
+		// Load SpellFX database (non-fatal). Try ISO first, then assets dir.
+		if e.State.SpellFX == nil {
+			sfx, err := e.loadSpellFXAuto()
+			if err != nil {
+				log.Printf("SpellFX: %v (spell effect logging disabled)", err)
+			} else {
+				effects, particles := sfx.Stats()
+				log.Printf("Loaded %d spell effects, %d particle definitions", effects, particles)
+				e.State.SpellFX = sfx
+				e.SpellFX = NewSpellEffectSystem(sfx)
+				e.SpellFX.ResolvePos = e.posResolver
+				e.SpellFX.ResolveBone = e.boneResolver
+				e.SpellFX.ResolveFacing = e.facingResolver
+				e.SpellFX.OnPlayAttack = e.playAttackCB
+				e.SpellFX.OnSetAction = e.setActionCB
+				e.SpellFX.IsActionComplete = e.isActionCompleteCB
+				e.SpellFX.Audio = e.Audio
+				// Load spell sounds from SPELLFX file if audio available
+				if e.Audio != nil && sfx.File() != nil {
+					e.Audio.LoadSpellSounds(sfx.File())
+				}
+				e.State.SpellFXSys = e.SpellFX
+			}
+		}
+		go e.StartupSequence()
+		return
+	}
+	if e.State.Conn != nil {
+		e.DrainIncoming()
+	}
+
+	// Handle deferred game server switch (avoids goroutine deadlock with Flush mutex).
+	// We count down ticks to let the server list ACK flush out first.
+	if e.deferredGameServerTick > 0 {
+		e.deferredGameServerTick--
+	} else if e.deferredGameServerTick == 0 {
+		e.deferredGameServerTick = -1 // Consume the trigger
+		e.ConnectToGameServer(e.deferredGameServerIdx)
+	}
+
+	// Apply GM teleport position override after processIncoming (which may
+	// overwrite Player pos from state channel 0x00) but before we build
+	// the world entry 0x40 packet.
+	if e.PosOverride && e.State.Phase == PhaseInWorld {
+		e.State.Player.X = e.PosOverrideX
+		e.State.Player.Y = e.PosOverrideY
+		e.State.Player.Z = e.PosOverrideZ
+	}
+
+	// Send position updates when in world.
+	if e.State.Phase == PhaseInWorld && e.State.Conn != nil {
+		e.tickCount++
+		e.updateFollow()
+		e.updateMovement()
+
+		// Send 0x40 position updates.
+		// The PS2 client sends 0x40 every frame even when idle. Sandstorm
+		// uses continuous 0x40 receipt to initialize EntityInRange (visibility).
+		// Without periodic updates, entity state channels never arrive.
+		if !e.State.WorldEntryAcked {
+			e.sendWorldEntryTrigger()
+		} else if e.State.TeleportPending {
+			// After teleport, PS2 sends EnableChannel (0x0049) + fresh 0x40.
+			// Sandstorm waits for this before processing position at new location.
+			e.sendTeleportArrival()
+		} else {
+			// Face target continuously while server-confirmed auto-attack is active.
+			// CombatEngaged = spacebar was pressed; InCombat = server confirmed via CastingCombat.
+			// Casting spells and being attacked by NPCs do NOT cause auto-facing.
+			if e.InCombat && e.CombatEngaged && e.TargetObjectID != 0 {
+				e.faceTarget(e.TargetObjectID)
+			}
+
+			// Throttle 0x40 to ~6/s (every ~166ms), matching PS2's observed
+			// rate of 5.87/s. PS2 runs at 30fps and sends 0x40 every ~5 frames.
+			// At 60fps visual client, this prevents queuing 6 XOR-chained
+			// messages per 100ms flush cycle.
+			if time.Since(e.lastPositionSend) >= 150*time.Millisecond {
+				e.sendPositionUpdate()
+				e.lastPositionSend = time.Now()
+			}
+		}
+
+		// Update spell effect system (event timelines, wait timers)
+		e.SpellFX.Process()
+
+		// Connection health: warn if server stops sending packets
+		if e.tickCount%100 == 0 { // every 10 seconds
+			lastRecv := e.State.Conn.LastRecvTime()
+			if !lastRecv.IsZero() {
+				sinceRecv := time.Since(lastRecv)
+				if sinceRecv > 10*time.Second {
+					log.Printf("WARNING: no server packets for %.1fs — connection may be dead", sinceRecv.Seconds())
+				} else {
+					log.Printf("HEALTH: lastRecv=%.1fs ago entities=%d",
+						sinceRecv.Seconds(), len(e.State.Entities))
+				}
+			}
+		}
+	}
+
+	if e.State.Conn != nil && time.Since(e.lastFlush) > 100*time.Millisecond {
+		e.State.Conn.Flush()
+		e.lastFlush = time.Now()
+	}
+}
+
+// StartupSequence runs the auth → patch → UDP connection flow.
+// Should be called in a goroutine.
+func (e *Engine) StartupSequence() {
+	gs := e.State
+
+	// Step 1: TCP Auth (skip if pre-authenticated via login screen)
+	if gs.AccountID != 0 && e.sessionToken != nil {
+		log.Printf("Skipping TCP auth (pre-authenticated, accountID=%d)", gs.AccountID)
+	} else {
+		gs.Phase = PhaseAuth
+		gs.StatusMsg = "Authenticating..."
+
+		log.Printf("=== Step 1: TCP Auth ===")
+		accountID, sessionToken, err := network.Login(gs.ServerIP, gs.AuthPort, gs.Username, e.password)
+		if err != nil {
+			gs.StatusMsg = fmt.Sprintf("Auth failed: %v", err)
+			log.Printf("Auth failed: %v", err)
+			return
+		}
+		gs.AccountID = accountID
+		e.sessionToken = sessionToken
+		log.Printf("Auth success: accountID=%d, token=%d bytes", accountID, len(sessionToken))
+	}
+
+	// Step 2: Patch check
+	log.Printf("=== Step 2: Patch Check ===")
+	serverIP, err := network.CheckPatch(gs.ServerIP, gs.PatchPort)
+	if err != nil {
+		log.Printf("Patch check failed (non-fatal): %v", err)
+		serverIP = gs.ServerIP // Fallback to configured IP
+	}
+	_ = serverIP // We already know the server IP
+	log.Printf("Patch check complete, server IP: %s", gs.ServerIP)
+
+	// Step 3: UDP connection to login endpoint (0xFFFE)
+	log.Printf("=== Step 3: UDP Login ===")
+	gs.Phase = PhaseConnecting
+	gs.StatusMsg = "Connecting to game server..."
+
+	conn, err := network.NewConnection(gs.ServerIP, gs.GamePort, 0xFFFE) // Login endpoint
+	if err != nil {
+		gs.StatusMsg = fmt.Sprintf("UDP connect failed: %v", err)
+		log.Printf("UDP connect failed: %v", err)
+		return
+	}
+	gs.Conn = conn
+
+	// Start receive loop
+	go conn.RecvLoop()
+
+	// Send initial login messages (DiscVersion + Authenticate)
+	conn.SendInitialPacket(protocol.GameVersionEQOAFrontiers, gs.Username, e.sessionToken)
+	log.Printf("Sent initial login packet to 0xFFFE")
+
+	gs.Phase = PhaseAuth
+	gs.StatusMsg = "Waiting for server list..."
+}
+
+// DrainIncoming processes all pending incoming packets (non-blocking).
+// ACKs are included in the regular Flush with the 0x40 state channel message,
+// matching PS2 behavior (PS2 never sends empty packets).
+func (e *Engine) DrainIncoming() {
+	for {
+		select {
+		case pkt, ok := <-e.State.Conn.Incoming:
+			if !ok {
+				return
+			}
+			e.ProcessPacket(pkt)
+		default:
+			return
+		}
+	}
+}
+
+// ProcessPacket handles a single received packet.
+func (e *Engine) ProcessPacket(pkt *network.ReceivedPacket) {
+	gs := e.State
+
+	// Detect server reset/terminate packets
+	isReset := pkt.Header.Flags&protocol.SegmentFlagResetConnection != 0
+	if isReset {
+		log.Printf("SERVER RESET: received reset packet (flags=0x%05X) — server terminated connection",
+			pkt.Header.Flags)
+		return
+	}
+
+	// Track session promotion (server sends NewInstance + DidServerInitiate)
+	if pkt.Header.Flags&protocol.SegmentFlagDidServerInitiate != 0 && pkt.SessionID != 0 {
+		if !gs.MasterSession {
+			log.Printf("Master session: playerObjectID=%d", pkt.SessionID)
+		}
+		gs.PlayerObjectID = pkt.SessionID
+		gs.MasterSession = true
+	}
+
+	// Process messages
+	messages := gs.Conn.ProcessIncoming(pkt)
+
+	for _, msg := range messages {
+		if msg.Type.IsStateChannel() && !msg.Type.IsReliable() {
+			// State channel message - already XOR-decoded by ProcessIncoming
+			gs.HandleStateChannel(byte(msg.Type), msg)
+			continue
+		}
+
+		// Reliable/unreliable game message
+		gs.HandleMessage(msg)
+	}
+
+	// Auto-transition: after server list, connect to first game server (once).
+	// Set a deferred switch — the actual switch happens in Tick after one flush
+	// cycle to ensure the server list ACK goes out first.
+	if e.AutoConnect && gs.Phase == PhaseServerList && len(gs.Servers) > 0 {
+		gs.Phase = PhaseConnectingGame // Prevent re-trigger
+		e.deferredGameServerIdx = 0
+		e.deferredGameServerTick = 3 // Wait 3 ticks (~300ms) for ACK flush
+	}
+}
+
+// ConnectToGameServer switches the UDP connection to the game server at the given index.
+func (e *Engine) ConnectToGameServer(index int) {
+	gs := e.State
+	if index < 0 || index >= len(gs.Servers) {
+		return
+	}
+
+	server := gs.Servers[index]
+	log.Printf("=== Connecting to game server: %s (endpoint=0x%04X, port=%d) ===",
+		server.Name, server.EndpointID, server.Port)
+
+	gs.Phase = PhaseConnectingGame
+	gs.StatusMsg = fmt.Sprintf("Connecting to %s...", server.Name)
+
+	// Send Reset to close login endpoint connection (PS2 does this before switching).
+	// Called synchronously from Tick (deferred by 3 ticks to let ACK flush out first).
+	gs.Conn.SendReset()
+
+	// Switch connection to game server endpoint
+	gs.Conn.SwitchToGameServer(server.EndpointID)
+
+	// Send game server auth
+	gs.Conn.SendGameAuth(protocol.GameVersionEQOAFrontiers, gs.Username, e.sessionToken)
+	log.Printf("Sent game auth to endpoint 0x%04X", server.EndpointID)
+
+	gs.StatusMsg = "Waiting for character list..."
+}
+
+// SetPosition updates the player's desired position. The engine will
+// continuously send this position to the server on each tick.
+func (e *Engine) SetPosition(x, y, z, facing float32) {
+	e.State.Player.X = x
+	e.State.Player.Y = y
+	e.State.Player.Z = z
+	e.State.Player.Facing = facing
+}
+
+// sendWorldEntryTrigger sends the first 0x40 with the player's current position.
+// PS2 sends the first 0x40 in the SAME packet as the world entry opcodes
+// (CharacterInWorld + ChangeChatMode + FactionMessages + LootMessages).
+// The reliable messages were already queued by handleMemoryDump but NOT flushed.
+// We queue the 0x40, then flush everything together in one packet.
+func (e *Engine) sendWorldEntryTrigger() {
+	// Initialize smoothed facing to current facing to prevent initial lag.
+	p := &e.State.Player
+	e.SmoothedFacing = p.Facing
+	e.PrevFacing = p.Facing
+	e.AccelState = 0x80
+	e.StickMagnitude = 0x80
+
+	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
+	e.State.Conn.Flush()
+	e.State.WorldEntryAcked = true
+	log.Printf("sendWorldEntryTrigger: sent world entry batch + initial 0x40 in one packet")
+}
+
+// buildPositionBuffer builds a 41-byte 0x40 state buffer matching the PS2 format.
+// PS2 sends 41 bytes: position + velocity + facing + turning + flags + animation + target.
+func (e *Engine) buildPositionBuffer() []byte {
+	p := &e.State.Player
+
+	rawX := uint32(float64(p.X+4000.0) / 36000.0 * float64(0xFFFFFF))
+	rawY := uint32(float64(p.Y+1000.0) / 2000.0 * float64(0xFFFFFF))
+	rawZ := uint32(float64(p.Z+4000.0) / 36000.0 * float64(0xFFFFFF))
+
+	// Clamp to uint24 range
+	if rawX > 0xFFFFFF {
+		rawX = 0xFFFFFF
+	}
+	if rawY > 0xFFFFFF {
+		rawY = 0xFFFFFF
+	}
+	if rawZ > 0xFFFFFF {
+		rawZ = 0xFFFFFF
+	}
+
+	// PS2 facing byte encoding:
+	// facingByte = heading * 128/PI + 128
+	// The +128 offset means: heading=0 (north/+Z) → byte 128, heading=PI (south) → byte 0.
+	// Java server reads: getByte(22) + 128, which undoes the offset to get unsigned 0-255.
+	// C# ConvertFacing: (sbyte)(byte - 128) * PI/128 recovers radians.
+	// PS2 pcap verified: facing byte 128 when facing north, 0 when facing south.
+	facingByte := byte(p.Facing*128/math.Pi) + 128
+
+	// Build 41-byte state buffer matching PS2 format exactly.
+	// The Java Sandstorm server reads the full buffer for enteredGame() / EntityInRange.
+	buf := make([]byte, 41)
+
+	// [0] World ID — must match server's world for entity visibility
+	buf[0] = p.World
+
+	// [1-9] Position: X, Y, Z as uint24 big-endian
+	buf[1] = byte(rawX >> 16)
+	buf[2] = byte(rawX >> 8)
+	buf[3] = byte(rawX)
+	buf[4] = byte(rawY >> 16)
+	buf[5] = byte(rawY >> 8)
+	buf[6] = byte(rawY)
+	buf[7] = byte(rawZ >> 16)
+	buf[8] = byte(rawZ >> 8)
+	buf[9] = byte(rawZ)
+
+	// [10-15] Velocity: VelX(uint16), VelY(uint16), VelZ(uint16) — big-endian
+	// 0x8000 = center (zero velocity). PS2 encodes actual movement velocity.
+	// Java Sandstorm decodes: vx = 15.3*2*raw/0xFFFF - 15.3 = 30.6*raw/65535 - 15.3
+	// Inverting: raw = (vx + 15.3) / 30.6 * 65535 = vx * 2142.0 + 32768
+	// So raw = 0x8000 + vx * 2142.0 (matching uint16 offset-from-center encoding).
+	//
+	// Sandstorm relays this velocity to PS2 clients via state channel bytes 40-42
+	// (scaled by speed_adjust=6.0 → int8). PS2 clients use it for dead-reckoning
+	// between state updates. Zero velocity forces PS2 to compute implicit velocity
+	// from position deltas, causing overshoot/slingshot on stop.
+	const velEncode = 65535.0 / 30.6 // 2142.16 — converts u/s to uint16 offset
+	rawVX := int(float64(e.VelX)*velEncode) + 0x8000
+	rawVZ := int(float64(e.VelZ)*velEncode) + 0x8000
+	if rawVX < 0 {
+		rawVX = 0
+	} else if rawVX > 0xFFFF {
+		rawVX = 0xFFFF
+	}
+	if rawVZ < 0 {
+		rawVZ = 0
+	} else if rawVZ > 0xFFFF {
+		rawVZ = 0xFFFF
+	}
+	buf[10] = byte(rawVX >> 8)
+	buf[11] = byte(rawVX)
+	// PS2 pcap: VelY bytes are always 0xF739 (even when idle). Not actually velocity —
+	// the server code comments `// float vy= ???`. Match PS2 exactly.
+	buf[12] = 0xF7
+	buf[13] = 0x39
+	buf[14] = byte(rawVZ >> 8)
+	buf[15] = byte(rawVZ)
+
+	// [16-21] Target Velocity — 0x8000 (center) for now.
+	// PS2 pcap shows these are input-desired velocity, but populating them
+	// may confuse Sandstorm. Keep at center until proven safe.
+	buf[16] = 0x80
+	buf[17] = 0x00
+	buf[18] = 0x80
+	buf[19] = 0x00
+	buf[20] = 0x80
+	buf[21] = 0x00
+
+	// [22] Facing (0-255 → 0-360°)
+	buf[22] = facingByte
+
+	// [23] Turning — 0x80 = center (no turn)
+	buf[23] = 0x80
+
+	// [24-29] All 0x80 center values.
+	// PS2 pcap shows byte 24 varies (stick mag), byte 26 varies (accel state),
+	// byte 28 = smoothed facing. But changing these from 0x80 causes overshoot
+	// on Sandstorm — byte 24 may act as a speed multiplier server-side.
+	buf[24] = 0x80
+	buf[25] = 0x80
+	buf[26] = 0x80
+	buf[27] = 0x80
+	buf[28] = facingByte // same as byte 22
+	buf[29] = 0x80
+
+	// [30-34] Flags/state
+	// PS2 pcap: byte 32 = 0x01 for first packet (world entry), 0x05 for all subsequent.
+	// Bit 2 (0x04) signals "fully in world" state.
+	buf[30] = 0x00
+	buf[31] = 0x01
+	if e.State.WorldEntryAcked {
+		buf[32] = 0x05 // in world
+	} else {
+		buf[32] = 0x01 // initial/entering
+	}
+	buf[33] = 0x00
+	buf[34] = 0x00
+
+	// [35] Animation byte → Sandstorm copies to state channel byte 58.
+	// PS2 clients use this for remote entity animation (idle/walk/run).
+	// Without it, PS2 shows idle while position moves → sliding.
+	// Combat anim (0x09) is NOT sent here — combat is driven by Attack
+	// opcode (0x000F), not the animation byte.
+	if e.EmoteAnimByte != 0 {
+		buf[35] = e.EmoteAnimByte
+	} else {
+		buf[35] = e.AnimByte
+	}
+
+	// [36] Auto-attack toggle — set to 1 when player presses spacebar/cross to engage.
+	if e.CombatEngaged {
+		buf[36] = 0x01
+	}
+
+	// [37-40] Target ObjectID (uint32 LITTLE-ENDIAN). 0xFFFFFFFF = no target.
+	// PS2 pcap confirms LE format: target 0x013CC7F3 at bytes 37-40 = F3 C7 3C 01.
+	targetID := e.TargetObjectID
+	if targetID == 0 {
+		targetID = 0xFFFFFFFF
+	}
+	buf[37] = byte(targetID)
+	buf[38] = byte(targetID >> 8)
+	buf[39] = byte(targetID >> 16)
+	buf[40] = byte(targetID >> 24)
+
+	return buf
+}
+
+// sendPositionUpdate sends a 0x40 client update with the current position.
+func (e *Engine) sendPositionUpdate() {
+	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
+}
+
+// ForcePositionFlush queues an immediate 0x40 position update with the current
+// target ObjectID and flushes it. Call after setting TargetObjectID to ensure
+// Sandstorm sees the target in the 0x40 buffer before processing UseSkill.
+func (e *Engine) ForcePositionFlush() {
+	if e.State.Conn == nil || e.State.Phase != PhaseInWorld {
+		return
+	}
+	buf := e.buildPositionBuffer()
+	targetInBuf := uint32(buf[37]) | uint32(buf[38])<<8 | uint32(buf[39])<<16 | uint32(buf[40])<<24
+	log.Printf("FLUSH: 0x40 target=0x%08X facing=0x%02X anim=0x%02X", targetInBuf, buf[22], buf[35])
+	e.State.Conn.QueueClientUpdate(buf)
+	e.State.Conn.Flush()
+}
+
+// sendTeleportArrival sends EnableChannel (0x0049) + fresh 0x40 after a teleport.
+// PS2 sends this sequence after a loading screen to re-register with the server
+// at the new position. Without this, Sandstorm doesn't process the new location.
+func (e *Engine) sendTeleportArrival() {
+	world := e.State.TeleportWorld
+	e.State.TeleportPending = false
+
+	// 1. Send EnableChannel (opcode 0x0049) with world byte
+	if !e.State.Conn.QueueReliable(protocol.OpcodeEnableChannel, []byte{world}) {
+		log.Printf("WARNING: EnableChannel send window full")
+	}
+
+	// 2. Send 0x40 with new position
+	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
+
+	// 3. Flush both in one packet
+	e.State.Conn.Flush()
+
+	log.Printf("sendTeleportArrival: EnableChannel(world=%d) + 0x40 at (%.1f, %.1f, %.1f)",
+		world, e.State.Player.X, e.State.Player.Y, e.State.Player.Z)
+}
+
+// SetMoveTarget starts smooth movement toward a destination.
+func (e *Engine) SetMoveTarget(x, y, z float32) {
+	e.moveTargetActive = true
+	e.moveTargetX = x
+	e.moveTargetY = y
+	e.moveTargetZ = z
+	if e.moveSpeed == 0 {
+		e.moveSpeed = e.parsedSpeed()
+	}
+	if e.moveArrivalDist == 0 {
+		e.moveArrivalDist = 3.0
+	}
+}
+
+// StopMovement cancels any active goto/follow movement.
+func (e *Engine) StopMovement() {
+	e.moveTargetActive = false
+	e.followTarget = 0
+	e.VelX = 0
+	e.VelY = 0
+	e.VelZ = 0
+	e.StickMagnitude = 0x80
+	e.AccelState = 0x80
+}
+
+// Follow starts continuously following an entity by objectID.
+func (e *Engine) Follow(objectID uint32, dist float32) {
+	e.followTarget = objectID
+	if dist == 0 {
+		dist = 5.0
+	}
+	e.followDist = dist
+}
+
+// updateFollow refreshes the move target from the followed entity's current position.
+func (e *Engine) updateFollow() {
+	if e.followTarget == 0 {
+		return
+	}
+	ent, ok := e.State.Entities[e.followTarget]
+	if !ok {
+		return
+	}
+	// Update move target to entity's current position
+	e.moveTargetX = ent.X
+	e.moveTargetY = ent.Y
+	e.moveTargetZ = ent.Z
+	e.moveTargetActive = true
+	if e.moveSpeed == 0 {
+		e.moveSpeed = e.parsedSpeed()
+	}
+	if e.moveArrivalDist == 0 {
+		e.moveArrivalDist = 3.0
+	}
+}
+
+// parsedSpeed returns the movement speed from the MemoryDump CM data,
+// or 5.0 as fallback if CM data isn't available yet.
+func (e *Engine) parsedSpeed() float32 {
+	if e.State.ParsedCM != nil && e.State.ParsedCM.Speed > 0 {
+		return e.State.ParsedCM.Speed
+	}
+	return 5.0
+}
+
+// IsMoving returns true if the engine is actively moving toward a target.
+func (e *Engine) IsMoving() bool {
+	return e.moveTargetActive
+}
+
+// updateMovement steps the player toward the movement target.
+func (e *Engine) updateMovement() {
+	if !e.moveTargetActive {
+		return
+	}
+
+	p := &e.State.Player
+	dx := e.moveTargetX - p.X
+	dy := e.moveTargetY - p.Y
+	dz := e.moveTargetZ - p.Z
+	dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
+
+	if dist <= e.moveArrivalDist {
+		if e.followTarget == 0 {
+			// Only print arrival for goto, not follow (follow re-acquires target each tick)
+			e.moveTargetActive = false
+			fmt.Printf("Arrived at (%.1f, %.1f, %.1f) — distance %.1f\n", p.X, p.Y, p.Z, dist)
+		}
+		return
+	}
+
+	// Normalize and step
+	step := e.moveSpeed
+	if step > dist {
+		step = dist
+	}
+	ratio := step / dist
+	p.X += dx * ratio
+	p.Y += dy * ratio
+	p.Z += dz * ratio
+
+	// Update facing (atan2 of XZ movement direction).
+	// PS2 heading range is [-PI, +PI] from atan2. No normalization needed —
+	// the 0x40 facing byte encoding (heading * 128/PI) handles any range.
+	p.Facing = float32(math.Atan2(float64(dx), float64(dz)))
+
+	// Set velocity for 0x40 encoding (headless has no speed ramping).
+	e.VelX = dx * ratio / 0.1 // approximate velocity from step/tick (100ms tick)
+	e.VelZ = dz * ratio / 0.1
+
+	// PS2 0x40 auxiliary fields for headless client.
+	e.StickMagnitude = 254 // full deflection (no analog)
+	e.AccelState = 0x80    // steady (no ramping in headless)
+	e.SmoothedFacing = p.Facing // no lag (headless doesn't turn gradually)
+}
+
+// SendSay sends a local say chat message.
+// Wire format: int32(charCount) + UTF-16LE(text)
+func (e *Engine) SendSay(text string) {
+	if e.State.Conn == nil {
+		return
+	}
+	// Ensure server chat mode is say (0)
+	if e.chatMode != 0 {
+		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{0})
+		e.chatMode = 0
+	}
+	runes := []rune(text)
+	data := make([]byte, 4+len(runes)*2)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
+	for i, r := range runes {
+		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
+		log.Printf("WARNING: Say send window full")
+	}
+	log.Printf("Sent say chat: %s", text)
+}
+
+// SendShout sends a zone-wide shout chat message.
+// Wire format: byte(chatModeFlag) + int32(charCount) + UTF-16LE(text)
+func (e *Engine) SendShout(text string) {
+	if e.State.Conn == nil {
+		return
+	}
+	runes := []rune(text)
+	data := make([]byte, 1+4+len(runes)*2)
+	data[0] = 1 // chat mode flag
+	binary.LittleEndian.PutUint32(data[1:5], uint32(len(runes)))
+	for i, r := range runes {
+		binary.LittleEndian.PutUint16(data[5+i*2:], uint16(r))
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeClientShout, data) {
+		log.Printf("WARNING: Shout send window full")
+	}
+	log.Printf("Sent shout chat: %s", text)
+}
+
+// SendGroupChat sends a group chat message.
+// PS2 client sets chat mode persistently via ChangeChatMode, then sends text
+// through ClientSayChat. Server routes by active mode, not a separate opcode.
+func (e *Engine) SendGroupChat(text string) {
+	if e.State.Conn == nil {
+		return
+	}
+	// Ensure server chat mode is group (2)
+	if e.chatMode != 2 {
+		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{2})
+		e.chatMode = 2
+	}
+
+	// Send text via normal say opcode (server routes by mode)
+	runes := []rune(text)
+	data := make([]byte, 4+len(runes)*2)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
+	for i, r := range runes {
+		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
+		log.Printf("WARNING: GroupChat send window full")
+	}
+	log.Printf("Sent group chat: %s", text)
+}
+
+// SendGuildChat sends a guild chat message.
+// Same pattern as group chat: set mode to 3 (guild), then send via ClientSayChat.
+func (e *Engine) SendGuildChat(text string) {
+	if e.State.Conn == nil {
+		return
+	}
+	if e.chatMode != 3 {
+		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{3})
+		e.chatMode = 3
+	}
+	runes := []rune(text)
+	data := make([]byte, 4+len(runes)*2)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
+	for i, r := range runes {
+		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
+		log.Printf("WARNING: GuildChat send window full")
+	}
+	log.Printf("Sent guild chat: %s", text)
+}
+
+// SendGroupInvite sends a group invite to a target player (opcode 0x0625).
+// Wire format: uint32(targetObjectID) + uint32(nameLen) + ASCII(name)
+func (e *Engine) SendGroupInvite(targetObjectID uint32, targetName string) {
+	if e.State.Conn == nil {
+		return
+	}
+	nameBytes := []byte(targetName)
+	data := make([]byte, 8+len(nameBytes))
+	binary.LittleEndian.PutUint32(data[0:4], targetObjectID)
+	binary.LittleEndian.PutUint32(data[4:8], uint32(len(nameBytes)))
+	copy(data[8:], nameBytes)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeGroupInvite, data) {
+		log.Printf("WARNING: GroupInvite send window full")
+	}
+	log.Printf("Sent group invite: target=0x%08X name=%s", targetObjectID, targetName)
+}
+
+// SendAcceptGroupInvite accepts a pending group invite (opcode 0x0622).
+// Wire format: uint32(groupID)
+func (e *Engine) SendAcceptGroupInvite(groupID uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data[0:4], groupID)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeAcceptGroupInvite, data) {
+		log.Printf("WARNING: AcceptGroupInvite send window full")
+	}
+	log.Printf("Sent accept group invite: groupID=%d", groupID)
+}
+
+// SendDeclineGroupInvite declines a pending group invite (opcode 0x0624).
+// Wire format: uint32(groupID)
+func (e *Engine) SendDeclineGroupInvite(groupID uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data[0:4], groupID)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeDeclineGroupInvite, data) {
+		log.Printf("WARNING: DeclineGroupInvite send window full")
+	}
+	log.Printf("Sent decline group invite: groupID=%d", groupID)
+}
+
+// SendLeaveGroup leaves the current group (opcode 0x0623).
+// Wire format: (no payload)
+func (e *Engine) SendLeaveGroup() {
+	if e.State.Conn == nil {
+		return
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeLeaveGroup, nil) {
+		log.Printf("WARNING: LeaveGroup send window full")
+	}
+	log.Printf("Sent leave group")
+}
+
+// SendBootGroupMember boots a member from the group (opcode 0x0626).
+// Wire format: uint32(targetObjectID)
+func (e *Engine) SendBootGroupMember(targetObjectID uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data[0:4], targetObjectID)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeBootGroupMember, data) {
+		log.Printf("WARNING: BootGroupMember send window full")
+	}
+	log.Printf("Sent boot group member: target=0x%08X", targetObjectID)
+}
+
+// SendTarget sends a target request for the given objectID.
+func (e *Engine) SendTarget(objectID uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+
+	data := make([]byte, 8)
+	// PS2 pcap: first 4 bytes are always 0x00000000 (not an incrementing counter)
+	binary.LittleEndian.PutUint32(data[0:4], 0)
+	binary.LittleEndian.PutUint32(data[4:8], objectID)
+
+	if !e.State.Conn.QueueReliable(protocol.OpcodeClassicTargetInfo, data) {
+		log.Printf("WARNING: Target send window full")
+	}
+	log.Printf("Sent target request: objectID=0x%08X", objectID)
+}
+
+// SendInteract sends an interact request for the given objectID (opcode 0x0004).
+func (e *Engine) SendInteract(objectID uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data[0:4], objectID)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeInteract, data) {
+		log.Printf("WARNING: Interact send window full")
+	}
+	log.Printf("Sent interact: objectID=%d", objectID)
+}
+
+// SendMerchantDiag sends opcode 0x004C — request merchant item list.
+// PS2 flow: Interact(0x0004) → server greeting → client sends MerchantDiag(0x004C)
+// → server responds with MerchantBox(0x00B7) containing items.
+func (e *Engine) SendMerchantDiag(objectID uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data[0:4], objectID)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantDiag, data) {
+		log.Printf("WARNING: MerchantDiag send window full")
+	}
+	log.Printf("Sent MerchantDiag: objectID=%d", objectID)
+}
+
+// SendMerchantBuy sends opcode 0x004A — buy item from merchant.
+// PS2 wire format (verified via pcap): zigzag(merchantSlot) + zigzag(quantity) + uint32(npcObjectID)
+// The NPC ObjectID prevents cross-merchant item key spoofing.
+func (e *Engine) SendMerchantBuy(merchantSlot int, quantity int) {
+	if e.State.Conn == nil {
+		return
+	}
+	npcObjID := e.State.Player.Target // merchant we're interacting with
+	buf := make([]byte, 16)
+	w := buffer.NewWriter(buf)
+	w.Write7BitEncodedInt64(int64(merchantSlot))
+	w.Write7BitEncodedInt64(int64(quantity))
+	w.WriteUint32(npcObjID)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantBuy, w.Bytes()) {
+		log.Printf("WARNING: MerchantBuy send window full")
+	}
+	log.Printf("Sent MerchantBuy: slot=%d qty=%d npc=0x%08X", merchantSlot, quantity, npcObjID)
+}
+
+// SendMerchantBuyRaw sends a raw MerchantBuy for exploit testing.
+func (e *Engine) SendMerchantBuyRaw(data []byte) {
+	if e.State.Conn == nil {
+		return
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantBuy, data) {
+		log.Printf("WARNING: MerchantBuy send window full")
+	}
+	log.Printf("Sent MerchantBuyRaw: %d bytes hex=%X", len(data), data)
+}
+
+// SendMerchantSell sends opcode 0x004B — sell item to merchant.
+// PS2 wire format (verified via pcap): uint32(invSlot) + zigzag(quantity)
+func (e *Engine) SendMerchantSell(invSlot int, quantity int) {
+	if e.State.Conn == nil {
+		return
+	}
+	buf := make([]byte, 16)
+	w := buffer.NewWriter(buf)
+	w.WriteInt32(int32(invSlot))
+	w.Write7BitEncodedInt64(int64(quantity))
+	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantSell, w.Bytes()) {
+		log.Printf("WARNING: MerchantSell send window full")
+	}
+	log.Printf("Sent MerchantSell: invSlot=%d qty=%d", invSlot, quantity)
+}
+
+// SendInteractItem sends opcode 0x003E — interact with an inventory item.
+// PS2 wire format: invSlot(uint32 LE) + target(uint32 LE, 0xFFFFFFFF) + action(byte, 0x00)
+// The server determines equip/unequip/use based on item state.
+func (e *Engine) SendInteractItem(invSlot int) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 9)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(invSlot))
+	binary.LittleEndian.PutUint32(data[4:8], 0xFFFFFFFF)
+	data[8] = 0x00
+	if !e.State.Conn.QueueReliable(protocol.OpcodeInteractItem, data) {
+		log.Printf("WARNING: InteractItem send window full")
+	}
+	log.Printf("Sent InteractItem: invSlot=%d opcode=0x003E", invSlot)
+}
+
+// SendEquipItem sends InteractItem for the given inventory slot.
+func (e *Engine) SendEquipItem(invSlot int) {
+	e.SendInteractItem(invSlot)
+}
+
+// SendUnequipItem sends InteractItem for the given inventory slot.
+func (e *Engine) SendUnequipItem(invSlot int) {
+	e.SendInteractItem(invSlot)
+}
+
+// SendBlacksmithOpen sends opcode 0x0061 — open blacksmith menu.
+func (e *Engine) SendBlacksmithOpen(npcData uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data[0:4], npcData)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeBlackSmithMenu, data) {
+		log.Printf("WARNING: BlackSmithMenu send window full")
+	}
+	log.Printf("Sent BlackSmithMenu: data=0x%08X", npcData)
+}
+
+// SendRepairItem sends opcode 0x0062 — repair a specific item.
+// PS2 wire: invSlot(uint32 LE) + repairCost(uint32 LE).
+func (e *Engine) SendRepairItem(invSlot int, repairCost uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(invSlot))
+	binary.LittleEndian.PutUint32(data[4:8], repairCost)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeRequestRepair, data) {
+		log.Printf("WARNING: RequestRepair send window full")
+	}
+	log.Printf("Sent RequestRepair: invSlot=%d cost=%d", invSlot, repairCost)
+}
+
+// SendCloseBlacksmith sends opcode 0x0063 — close blacksmith window.
+func (e *Engine) SendCloseBlacksmith() {
+	if e.State.Conn == nil {
+		return
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeCloseBlacksmithMenu, nil) {
+		log.Printf("WARNING: CloseBlacksmith send window full")
+	}
+	log.Printf("Sent CloseBlacksmith")
+	e.State.BlacksmithOpen = false
+}
+
+// SendPetCommand sends a PetCommands opcode (0x0041) with a 1-byte command.
+// PS2 sends byte 0x05 once before all other combat commands. Likely "engage combat"
+// or "pet attack" — the PS2 always sends it even without a pet.
+func (e *Engine) SendPetCommand(cmd byte) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := []byte{cmd}
+	if !e.State.Conn.QueueReliable(protocol.OpcodePetCommands, data) {
+		log.Printf("WARNING: PetCommand send window full")
+	}
+	log.Printf("Sent PetCommand: cmd=0x%02X", cmd)
+}
+
+// SendAttack sends an auto-attack request (opcode 0x000F) to the given target.
+// Wire format: uint32 LE target ObjectID (4 bytes).
+// PS2 auto-faces the target on attack — we do the same by computing the
+// angle from player to target entity and updating facing before sending.
+func (e *Engine) SendAttack(objectID uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	// Auto-face target (PS2 behavior)
+	e.faceTarget(objectID)
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, objectID)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeAttack, data) {
+		log.Printf("WARNING: Attack send window full, command dropped")
+	}
+	log.Printf("Sent attack: objectID=%d", objectID)
+}
+
+// faceTarget computes the angle from the player to the target entity and
+// updates the player's facing direction. PS2 does this automatically on
+// attack/cast via VIWalkControl::SetTargetHeading.
+func (e *Engine) faceTarget(objectID uint32) {
+	if ent, ok := e.State.Entities[objectID]; ok {
+		dx := float64(ent.X - e.State.Player.X)
+		dz := float64(ent.Z - e.State.Player.Z)
+		if dx != 0 || dz != 0 {
+			e.State.Player.Facing = float32(math.Atan2(dx, dz))
+		}
+	}
+}
+
+// SendCast sends a UseSkill request (opcode 0x0032) to the server.
+// Wire format (9 bytes): uint32 LE zero + uint8 hotbarSlot + uint32 LE target ObjectID.
+// hotbarSlot = ParsedSpell.WhereOnHotBar (confirmed: NOT AbilityLevel).
+// Use 0xFFFFFFFF as objectID for self-cast.
+func (e *Engine) SendCast(abilityByte uint8, objectID uint32) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 9)
+	// bytes 0-3: always zero (confirmed from 35 PS2 pcap samples)
+	data[4] = abilityByte
+	binary.LittleEndian.PutUint32(data[5:9], objectID)
+	log.Printf("CAST: ability=%d target=0x%08X hex=%X", abilityByte, objectID, data)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeUseSkill, data) {
+		log.Printf("WARNING: UseSkill send window full, command dropped")
+	}
+}
+
+// SendDialogueOption sends a dialogue option selection (opcode 0x0035).
+// dialogueCounter is the counter from the server's 0x0034 OptionBox response.
+// option is the 0-based option index, or 255 to cancel.
+func (e *Engine) SendDialogueOption(dialogueCounter uint32, option byte) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 5)
+	binary.LittleEndian.PutUint32(data[0:4], dialogueCounter)
+	data[4] = option
+	if !e.State.Conn.QueueReliable(protocol.OpcodeDialogueBoxOption, data) {
+		log.Printf("WARNING: DialogueOption send window full")
+	}
+	log.Printf("Sent dialogue option: counter=%d option=%d", dialogueCounter, option)
+}
+
+// SendAddSkillToBar sends opcode 0x0033 to add/move a spell on the hotbar.
+// Wire format (6 bytes): uint32 LE flag + byte spellListIndex + byte hotbarSlot.
+// flag=1 to memorize, flag=0 to remove. spellListIndex is the 0-based position
+// in ParsedSpells. hotbarSlot is 0-9.
+func (e *Engine) SendAddSkillToBar(flag uint32, spellIdx byte, hotbarSlot byte) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 6)
+	binary.LittleEndian.PutUint32(data[0:4], flag)
+	data[4] = spellIdx
+	data[5] = hotbarSlot
+	if !e.State.Conn.QueueReliable(protocol.OpcodeAddSkillToBar, data) {
+		log.Printf("WARNING: AddSkillToBar send window full")
+	}
+	log.Printf("Sent AddSkillToBar: flag=%d spellIdx=%d slot=%d", flag, spellIdx, hotbarSlot)
+}
+
+// SendDisconnect sends opcode 0x09B0 to notify the server of a clean disconnect,
+// then flushes to ensure it's sent before the socket closes.
+func (e *Engine) SendDisconnect() {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 0)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeDisconnectClient, data) {
+		log.Printf("WARNING: Disconnect send window full")
+	}
+	e.State.Conn.Flush()
+	log.Printf("Sent Disconnect (0x09B0)")
+}
+
+// SendClearSpellBar sends opcode 0x00FE to clear all spells from the hotbar.
+func (e *Engine) SendClearSpellBar() {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4) // all zeros
+	if !e.State.Conn.QueueReliable(protocol.OpcodeClearSpellBar, data) {
+		log.Printf("WARNING: ClearSpellBar send window full")
+	}
+	log.Printf("Sent ClearSpellBar")
+}
+
+// SendWhoList sends a who list request (opcode 0x0E01).
+// Format: byte(1) + byte(token). Token is incremented per request.
+func (e *Engine) SendWhoList() {
+	if e.State.Conn == nil {
+		return
+	}
+	e.whoToken += 2
+	data := []byte{1, e.whoToken}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeWhoList, data) {
+		log.Printf("WARNING: WhoList send window full")
+	}
+	log.Printf("Sent WhoList request token=%d", e.whoToken)
+}
+
+// SendLFGToggle toggles the player's LFG registration by sending "lfg" or "lfg off" in chat.
+// Sandstorm uses chat commands for LFG, not a dedicated opcode.
+func (e *Engine) SendLFGToggle(register bool) {
+	if register {
+		e.SendSay("lfg")
+	} else {
+		e.SendSay("lfg off")
+	}
+	e.State.LFGRegistered = register
+}

@@ -1,0 +1,253 @@
+package models
+
+// ArmorTextures maps [armorSet][textSlot] to ESF Surface DictIDs.
+// TextSlots: 0=chest, 1=bracer, 2=gloves, 3=legs, 4=boots
+// Source: PS2 VICSpriteCust::$Armor table at EE 0x004FB910 stores VIRaster pool
+// indices. DictIDs resolved from runtime VIRaster pool in EE memory dump
+// (pool at 0x0076B5A0, VISurface+0x00 = DictID).
+var ArmorTextures = [9][5]int32{
+	{0, 0, 0, 0, 0},                                                                     // 0 = none (base model texture)
+	{-1085571574, 1648643354, -2066550155, 750072456, 2060964273},                        // 1 = cloth
+	{1926263787, -1180968619, 945285206, -1489171117, -178279300},                         // 2 = leather
+	{1477461748, -1058253624, 496483167, 113917398, 1424809215},                           // 3 = chainmail
+	{1085332903, -348034519, 104354322, -184150041, 1126741776},                           // 4 = plate
+	{968685663, -435228783, -12292918, 1978836175, -1005239304},                           // 5 = padded
+	{-112471789, -1599977331, -1093450370, 1872225035, -1111850444},                       // 6 = banded mail
+	{637778783, 596508817, -343199798, -1925225009, -614333192},                           // 7 = scale
+	{1071320539, -2127282779, 90341958, 241961123, 1552852940},                            // 8 = monk
+}
+
+// TextSlot indices for ArmorTextures second dimension.
+const (
+	TextSlotChest  = 0
+	TextSlotBracer = 1
+	TextSlotGloves = 2
+	TextSlotLegs   = 3
+	TextSlotBoots  = 4
+)
+
+// TintColor represents an RGBA tint color from the PS2 VICSpriteCust::$Tints table.
+type TintColor struct {
+	R, G, B, A uint8
+}
+
+// Tints maps tint index to RGBA color.
+var Tints = [14]TintColor{
+	{0xFF, 0xFF, 0xFF, 0xFF}, // 0 = White
+	{0x5A, 0x5A, 0x5A, 0xFF}, // 1 = DarkGray
+	{0x00, 0xB4, 0xFF, 0xFF}, // 2 = Cyan
+	{0x96, 0x64, 0x32, 0xFF}, // 3 = Brown
+	{0x00, 0x00, 0x8C, 0xFF}, // 4 = Navy
+	{0x00, 0xC8, 0x32, 0xFF}, // 5 = Green
+	{0xFA, 0xAF, 0x32, 0xFF}, // 6 = Gold
+	{0x50, 0x64, 0x00, 0xFF}, // 7 = Olive
+	{0xF0, 0x3C, 0x3C, 0xFF}, // 8 = Red
+	{0xA5, 0xF5, 0xFF, 0xFF}, // 9 = IceBlue
+	{0xA0, 0xAA, 0xB4, 0xFF}, // 10 = Silver
+	{0xDC, 0xBE, 0x96, 0xFF}, // 11 = Tan
+	{0x00, 0xC8, 0xB4, 0xFF}, // 12 = Teal
+	{0x96, 0x00, 0x3C, 0xFF}, // 13 = Purple
+}
+
+// RobeTextures maps [robeStyle] to ESF Surface DictIDs.
+// Each robe has 2 textures: [0]=chest, [1]=legs.
+// Source: PS2 $Robe table at 0x004FBB48, pool indices resolved from EE dump.
+var RobeTextures = [4][2]int32{
+	{1163857248, 2111470074},    // robe 0: pool[199,200]
+	{-1466178805, 222590899},    // robe 1: pool[201,202]
+	{1563400161, 1163725733},    // robe 2: pool[203,204]
+	{656438062, -1236576364},    // robe 3: pool[205,206]
+}
+
+// HelmTextures maps helm index to ESF Surface DictID in CHARCUST.CSF.
+// Source: The 8 unidentified 64x64 surfaces in CHARCUST.CSF, matched to
+// PCSX2-captured helm textures via pixel comparison (error=0.00 for helms 1-6).
+// Helms 7-8 are the remaining 2 surfaces (assignment TBD — user verification needed).
+var HelmTextures = [9]int32{
+	0,            // helm 0 = none
+	727259660,    // helm 1: cloth
+	1387357875,   // helm 2: leather
+	-1389497233,  // helm 3: scale
+	-549814268,   // helm 4: chain
+	-1194253819,  // helm 5: banded
+	-941943113,   // helm 6: plate
+	-113096367,   // helm 7: scale armor set — swapped with 8 per user verification
+	1806117984,   // helm 8: monk armor set — swapped with 7 per user verification
+}
+
+// HairTextures maps hair style to ESF Surface DictID.
+// Source: PS2 $Hair table at 0x004FBB28, pool indices resolved from EE dump.
+var HairTextures = [8]int32{
+	-1728551799,  // hair 0: pool[190]
+	572420760,    // hair 1: pool[191]
+	1842279120,   // hair 2: pool[192]
+	-21175083,    // hair 3: pool[193]
+	-728151733,   // hair 4: pool[194]
+	-1993224474,  // hair 5: pool[195]
+	-1618491473,  // hair 6: pool[196]
+	-596002877,   // hair 7: pool[197]
+}
+
+// HairNullTexture is the bald/no-hair ESF Surface DictID.
+var HairNullTexture int32 = 1125869994 // pool[198]
+
+// FaceTextures maps [race][faceIndex*2+sex] to ESF Surface hash DictID.
+// Face textures use unique DictIDs (not duplicated), so DictID lookup is safe.
+// 10 races x 8 entries (4 faces x 2 sexes: male=0, female=1).
+// Ogre faces extracted from CHARFACE.CSF (not in PS2 $Race table — added later).
+var FaceTextures = [10][8]int32{
+	{1249555534, 1985805693, 1544055455, -2014661682, 1838555376, -1720161761, 2133055297, -1425661840},   // Human
+	{1953705756, -130205509, -2046761619, 164294412, -1752261698, 458794333, -1457761777, 753294254},      // Elf
+	{1123782610, -329760479, 1418282531, -35260558, 1712782452, 259239363, 2007282373, 553739284},         // DarkElf
+	{-1716470973, 1662343962, -1421971052, 1956843883, -1127471131, -2043623492, -832971210, -1749123571}, // Gnome
+	{1870557257, -1112454576, -2129910118, -817954655, -1835410197, -523454734, -1540910276, -228954813},  // Halfling
+	{313034802, 2121145473, 607534723, -1879321902, 902034644, -1584821981, 1196534565, -1290322060},      // Dwarf
+	{-638844159, 686922440, -344344238, 981422361, -49844317, 1275922282, 244655604, 1570422203},          // Troll
+	{1837018216, -1150319513, 2131518137, -855819592, -1868949238, -561319671, -1574449317, -266819750},   // Barbarian
+	{-735732927, 131118344, -441233006, 425618265, -146733085, 720118186, 147766836, 1014618107},          // Erudite
+	{-50023566, -620928575, 244476355, -326428654, 538976276, -31928733, 833476197, 262571188},            // Ogre
+}
+
+// GetArmorTextureDictID returns the ESF Surface DictID for an armor texture.
+// Returns 0 if the armor set is 0 (no armor) or out of range.
+func GetArmorTextureDictID(armorSet byte, textSlot int) int32 {
+	if int(armorSet) >= len(ArmorTextures) || textSlot < 0 || textSlot >= 5 {
+		return 0
+	}
+	return ArmorTextures[armorSet][textSlot]
+}
+
+// GetRobeTextureDictID returns the ESF Surface DictID for a robe texture.
+// textSlot 0 (chest) → base robe texture, textSlot 3 (legs) → overlay.
+// Returns 0 for other slots or invalid robe index.
+func GetRobeTextureDictID(robeIndex byte, textSlot int) int32 {
+	if int(robeIndex) >= len(RobeTextures) {
+		return 0
+	}
+	switch textSlot {
+	case TextSlotChest:
+		return RobeTextures[robeIndex][0]
+	case TextSlotLegs:
+		return RobeTextures[robeIndex][1]
+	default:
+		return 0
+	}
+}
+
+// GetHairTextureDictID returns the ESF Surface DictID for a hair texture.
+// Returns HairNullTexture for bald (style >= 8) or 0 if explicitly no-hair.
+func GetHairTextureDictID(hairStyle byte) int32 {
+	if int(hairStyle) >= len(HairTextures) {
+		return HairNullTexture
+	}
+	return HairTextures[hairStyle]
+}
+
+// HairColorRGBA maps HairColor index to an average RGB color sampled from each
+// HairTexture. Used to tint gnome mustache meshes (which have null-texture UVs
+// and white vertex colors — need a solid-color texture to match the beard).
+var HairColorRGBA = [8][4]byte{
+	{67, 67, 61, 255},     // 0: dark gray/charcoal
+	{97, 69, 42, 255},     // 1: brown
+	{190, 170, 116, 255},  // 2: blonde/sandy
+	{155, 155, 155, 255},  // 3: silver/gray
+	{151, 62, 25, 255},    // 4: auburn/red
+	{94, 132, 59, 255},    // 5: green
+	{107, 155, 142, 255},  // 6: teal
+	{143, 92, 136, 255},   // 7: purple/mauve
+}
+
+// GetHairColor returns the RGB tint color for a given HairColor index.
+func GetHairColor(hairColor byte) (r, g, b byte) {
+	if int(hairColor) >= len(HairColorRGBA) {
+		return 67, 67, 61 // fallback to [0]
+	}
+	c := HairColorRGBA[hairColor]
+	return c[0], c[1], c[2]
+}
+
+// GetHelmTextureDictID returns the ESF Surface DictID for a helm texture.
+// Returns 0 if helm index is 0 (none) or out of range.
+func GetHelmTextureDictID(helmIndex byte) int32 {
+	if int(helmIndex) >= len(HelmTextures) {
+		return 0
+	}
+	return HelmTextures[helmIndex]
+}
+
+// HelmModelDictIDs maps helm index to the SimpleSprite DictID for the 3D helm model
+// in CHARCUST.CSF. Each helm is a standalone SimpleSprite with its own geometry,
+// material palette, and collision buffer. The PS2 uses VIScene::CopySprite +
+// VIHSprite::Attach to parent these models to the character hierarchy.
+// Helms 1-4: verified from $Helm pool indices (pools 28-31 were valid at dump).
+// Helms 5-8: pool data was stale; corrected by visual identification in-game.
+//   - Model 1515302081 = padded (user confirmed at helm 5)
+//   - Model 505782879 = scale (original $Helm[7]=pool 34 mapping)
+//   - Models 1904536637/62448723 assigned to 6/8 by vertex complexity
+var HelmModelDictIDs = [9]int32{
+	0,            // helm 0 = none
+	208613338,    // helm 1: cloth       (282 verts)
+	856507303,    // helm 2: leather     (256 verts)
+	127839378,    // helm 3: chainmail   (412 verts) — user confirmed
+	62448723,     // helm 4: plate       (180 verts) — user confirmed
+	1515302081,   // helm 5: padded      (256 verts) — user confirmed
+	1904536637,   // helm 6: banded      (280 verts)
+	-1847324229,  // helm 7: scale       (402 verts) — swapped with chain
+	505782879,    // helm 8: monk        (332 verts) — user confirmed
+}
+
+// GetHelmModelDictID returns the SimpleSprite DictID for a helm 3D model.
+// Returns 0 if helm index is 0 (none) or out of range.
+func GetHelmModelDictID(helmIndex byte) int32 {
+	if int(helmIndex) >= len(HelmModelDictIDs) {
+		return 0
+	}
+	return HelmModelDictIDs[helmIndex]
+}
+
+// GetTintColor returns the RGBA tint color for a tint index.
+// Returns white (index 0) if out of range.
+func GetTintColor(tintIndex byte) TintColor {
+	if int(tintIndex) >= len(Tints) {
+		return Tints[0]
+	}
+	return Tints[tintIndex]
+}
+
+// GetFaceTexture returns the ESF hash DictID for a face texture.
+// Returns 0 if race or index is out of range.
+func GetFaceTexture(race, faceOption, sex byte) int32 {
+	if int(race) >= len(FaceTextures) || int(faceOption) >= 4 {
+		return 0
+	}
+	idx := int(faceOption)*2 + int(sex)
+	if idx >= 8 {
+		return 0
+	}
+	return FaceTextures[race][idx]
+}
+
+// isHairDictID returns true if the given DictID matches any known hair texture.
+func isHairDictID(dictID int32) bool {
+	if dictID == HairNullTexture {
+		return true
+	}
+	for _, h := range HairTextures {
+		if dictID == h {
+			return true
+		}
+	}
+	return false
+}
+
+// isFaceDictID returns true if the given DictID matches any known face texture.
+func isFaceDictID(dictID int32) bool {
+	for r := range FaceTextures {
+		for _, f := range FaceTextures[r] {
+			if dictID == f {
+				return true
+			}
+		}
+	}
+	return false
+}
