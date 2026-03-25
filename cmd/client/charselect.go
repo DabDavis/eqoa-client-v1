@@ -881,16 +881,26 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	entityID := uint32(0xFFFF0000) + uint32(c.charSelectIdx)
 
 	// PS2 char select: combat idle stance with periodic attack swings.
-	// Uses PS2 SetAttackAction/SetAttackAltAction decompiled tables.
-	// Attack count by level: 1-19 single, 20-34 double, 35+ quad.
+	// Uses weapon SkelType from ESF to pick the correct attack animation.
 	locoAnim := byte(17) // combat idle
 	actionAnim := byte(0)
 
-	// Single primary attack every 4 seconds
+	// Determine attack anim from weapon SkelType (PS2 SetAttackAction path)
+	atkType := inferAttackTypeFromModel(c.modelMgr, primaryWpn, secondaryWpn, shield)
+	atkTable := weaponAttackAnims
+	if isDualWield(primaryWpn, secondaryWpn, shield) {
+		atkTable = weaponAttackAnimsDW
+	}
+	atkAnims := atkTable[atkType]
+	if atkAnims == nil {
+		atkAnims = atkTable[11] // fallback to dagger
+	}
+
+	// Alternate primary/alt attack every 4 seconds
 	attackCycle := math.Mod(c.charSelectTime, 4.0)
 	if attackCycle >= 3.0 && attackCycle < 3.5 {
-		actionAnim = 23 // primary right hand (1H Slash)
-		// Keep locoAnim=17 (combat idle) — upper body swings, lower stays planted
+		cycleIdx := int(c.charSelectTime/4.0) % len(atkAnims)
+		actionAnim = atkAnims[cycleIdx]
 	}
 
 	c.modelMgr.DrawEntity(modelID, 0, 0, 0, facing, 1.0, equip, entityID, locoAnim, actionAnim, dt, false, 1.0)
