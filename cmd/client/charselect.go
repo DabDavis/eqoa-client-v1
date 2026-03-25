@@ -131,6 +131,7 @@ func (c *Client) handleCharSelectInput() {
 			idx := int(my-csListY) / int(csListRowH+4)
 			if idx >= 0 && idx < n && idx != c.charSelectIdx {
 				c.charSelectIdx = idx
+				c.charSelectTime = 0
 				c.playCharSelectBGM(gs.Characters[idx].Race)
 			}
 		}
@@ -158,8 +159,9 @@ func (c *Client) handleCharSelectInput() {
 
 	// Number keys 1-9 highlight character
 	for i := 0; i < n && i < 9; i++ {
-		if rl.IsKeyPressed(int32(rl.KeyOne) + int32(i)) {
+		if rl.IsKeyPressed(int32(rl.KeyOne)+int32(i)) && i != c.charSelectIdx {
 			c.charSelectIdx = i
+			c.charSelectTime = 0
 		}
 	}
 }
@@ -905,27 +907,16 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	attackDur := float64(numSwings) * swingDur
 	roundDur := attackDur + 3.0 // 3s combat idle between rounds (matches in-game auto-attack interval)
 
-	// Start in normal idle, first attack after 2s, then combat idle between rounds.
-	firstAttackDelay := 2.0
 	var locoAnim, actionAnim byte
-	if c.charSelectTime < firstAttackDelay {
-		// Initial idle before first attack
-		locoAnim = 0 // normal idle
-		actionAnim = 0
+	timeInRound := math.Mod(c.charSelectTime, roundDur)
+	if timeInRound < attackDur {
+		swingIdx := int(timeInRound / swingDur)
+		anim := atkAnims[swingIdx%len(atkAnims)]
+		locoAnim = anim
+		actionAnim = anim
 	} else {
-		combatTime := c.charSelectTime - firstAttackDelay
-		timeInRound := math.Mod(combatTime, roundDur)
-		if timeInRound < attackDur {
-			// Attacking — full body swing
-			swingIdx := int(timeInRound / swingDur)
-			anim := atkAnims[swingIdx%len(atkAnims)]
-			locoAnim = anim
-			actionAnim = anim
-		} else {
-			// Combat idle between rounds
-			locoAnim = 17
-			actionAnim = 0
-		}
+		locoAnim = 17 // combat idle
+		actionAnim = 0
 	}
 
 	c.modelMgr.DrawEntity(modelID, 0, 0, 0, facing, 1.0, equip, entityID, locoAnim, actionAnim, dt, false, 1.0)
