@@ -903,7 +903,7 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	}
 	swingDur := 0.6
 	attackDur := float64(numSwings) * swingDur
-	roundDur := attackDur + 1.5
+	roundDur := attackDur + 3.0 // 3s combat idle between rounds (matches in-game auto-attack interval)
 
 	// Start in normal idle, first attack after 2s, then combat idle between rounds.
 	firstAttackDelay := 2.0
