@@ -2951,10 +2951,13 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 		// DoTs, multi-hits) but only the first per cycle should trigger a swing anim
 		// and hit effect. Throttle to once per 3 seconds (auto-attack interval is 4-6s).
 		if sourceID == gs.PlayerObjectID && targetID != gs.PlayerObjectID && dmg < 0 {
-			// One swing animation per auto-attack round, not per proc/DoT tick.
-			// Nightshade gloves etc. send multiple DamageIndications per swing
-			// (melee hit + damage proc + heal proc). Only the first triggers a swing.
-			if time.Since(gs.Player.LastAttackAnimTime) > 2*time.Second {
+			// Count attack swings from DamageIndication. Sandstorm sends one
+			// DamageIndication per melee swing, plus extras for procs (damage/heal).
+			// Use a short per-swing throttle (0.4s) to separate swings within a round,
+			// while still allowing multi-swing rounds (2 for PAL/SK, 4 for DW).
+			// Proc damage arrives in the same burst but is typically smaller — the 0.4s
+			// window groups proc DIs with their triggering swing.
+			if time.Since(gs.Player.LastAttackAnimTime) > 400*time.Millisecond {
 				gs.Player.AttackCount++
 				gs.Player.LastAttackAnimTime = time.Now()
 			}

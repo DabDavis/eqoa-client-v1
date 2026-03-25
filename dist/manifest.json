@@ -1,9 +1,9 @@
 {
-  "version": "20260325-d5e5d25",
+  "version": "20260325-de6cc62",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "fb7f84b5d98650a0db83f7a210cdc38c4eeae1b0f53b805c7c714fdae941d5bb",
+  "linux_sha256": "8fbe813c8848156d829172a846fe4fd869c7331f5c4a9379f25410e8fcfd98a7",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "de198421cd725666684df3420c0331bd25353a29d7566c6eafb7988de10f7caa",
-  "changelog": "- Debug: log all equipped item fields to find proc DictID\n- Add client-side proc spell FX from equipped items\n- Char select: both pairs get attack anim (PS2 SetAction verified)\n- Char select: combat idle locomotion during attacks (PS2 dual-pair)\n- Char select: 3s combat idle delay before first attack salvo"
+  "windows_sha256": "8c84dfac462ac384e88abe35b23700a06c7949d2ef235904491e5137e2a72c9f",
+  "changelog": "- Fix weapon attack type: only check equipped items, not full inventory\n- Debug: log all equipped item fields to find proc DictID\n- Add client-side proc spell FX from equipped items\n- Char select: both pairs get attack anim (PS2 SetAction verified)\n- Char select: combat idle locomotion during attacks (PS2 dual-pair)"
 }
