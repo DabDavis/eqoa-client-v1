@@ -168,6 +168,7 @@ func handleCommand(engine *game.Engine, line string) {
 		fmt.Println("  effects         — Show active spell effects currently playing")
 		fmt.Println("  track <name> [dur] [ms] — Track entity interpolation in real-time")
 		fmt.Println("  watch           — Toggle entity movement debug logging")
+		fmt.Println("  statediff       — Toggle self state channel byte-diff (combat RE)")
 		fmt.Println("  interp          — Run 30s interpolation simulation with snap detection")
 		fmt.Println("  stats           — Print opcode statistics")
 		fmt.Println("  sleep <seconds> — Wait N seconds (for scripted input)")
@@ -895,6 +896,22 @@ func handleCommand(engine *game.Engine, line string) {
 			fmt.Println("Entity movement tracking ON — check log output for MOVE lines")
 		} else {
 			fmt.Println("Entity movement tracking OFF")
+		}
+
+	case "statediff":
+		gs := engine.State
+		gs.DebugStateDiffs = !gs.DebugStateDiffs
+		if gs.DebugStateDiffs {
+			gs.ResetStateDiffBaseline()
+			fmt.Println("State channel diff ON — shows byte-level changes on self channel 0x00")
+			fmt.Println("  Use 'attack' to engage combat and watch which unknown bytes change")
+			fmt.Println("  Known offsets: 0=counter, 1-4=objID, 5=type, 6-14=pos, 15=facing,")
+			fmt.Println("  17=world, 26=hpFlag, 27=hp, 28-31=model, 36-39=scale, 40-42=vel,")
+			fmt.Println("  58=anim, 59-62=target, 67-78=weapons, 93-98=armor, 99-104=tints,")
+			fmt.Println("  105-110=hair/face/robe, 116-139=name, 140=level, 141-146=misc")
+			fmt.Println("  UNKNOWN: 16,18-25,32-35,43-57,63-66,79-92,111-115,147-161")
+		} else {
+			fmt.Println("State channel diff OFF")
 		}
 
 	case "interp":

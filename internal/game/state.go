@@ -468,7 +468,15 @@ type GameState struct {
 
 	// Debug: entity movement tracking (enabled by headless 'watch' command)
 	DebugEntityMovement bool
+	DebugStateDiffs     bool     // log byte-level diffs on self state channel
+	prevSelfState       []byte   // previous self state channel bytes for diff
 	LastInterpDebug     time.Time // last time interpolation debug was printed
+}
+
+// ResetStateDiffBaseline clears the previous state channel snapshot
+// so the next update captures a fresh baseline.
+func (gs *GameState) ResetStateDiffBaseline() {
+	gs.prevSelfState = nil
 }
 
 // NewGameState creates a new game state.
@@ -782,6 +790,27 @@ func (gs *GameState) HandleStateChannel(channel byte, msg *protocol.Message) {
 		}
 		log.Printf("StateChannel 0x%02X: seq=%d xor=%d len=%d count=%d hex=%X",
 			channel, msg.Sequence, msg.XORByte, len(data), count, data[:hexLen])
+	}
+
+	// Combat state channel monitor: log byte-level diffs for self channel (0x00).
+	// Shows which of the 47 unknown bytes change during combat.
+	// Always active — the diffs are infrequent and critical for combat RE.
+	if channel == 0 && len(data) > 0 {
+		if gs.prevSelfState == nil {
+			gs.prevSelfState = make([]byte, len(data))
+			copy(gs.prevSelfState, data)
+		} else if len(data) == len(gs.prevSelfState) {
+			var diffs []string
+			for i := 0; i < len(data); i++ {
+				if data[i] != gs.prevSelfState[i] {
+					diffs = append(diffs, fmt.Sprintf("[%d]%02X→%02X", i, gs.prevSelfState[i], data[i]))
+				}
+			}
+			if len(diffs) > 0 {
+				log.Printf("STATE_DIFF ch=0x00: %s", strings.Join(diffs, " "))
+			}
+			copy(gs.prevSelfState, data)
+		}
 	}
 
 	switch {
