@@ -902,17 +902,20 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 		atkAnims = atkTable[11]
 	}
 
-	// Full attack cycle per rotation (12.57s at 0.5 rad/s).
-	// Evenly space N swings across the rotation, each lasting ~0.7s.
-	rotationPeriod := 2 * math.Pi / 0.5 // ~12.57s
-	numSwings := len(atkAnims)
-	swingInterval := rotationPeriod / float64(numSwings)
-	swingDuration := 0.7 // seconds per swing animation window
-	timeInRotation := math.Mod(c.charSelectTime, rotationPeriod)
-	swingIdx := int(timeInRotation / swingInterval)
-	timeInSwing := math.Mod(timeInRotation, swingInterval)
-	if swingIdx < numSwings && timeInSwing < swingDuration {
-		actionAnim = atkAnims[swingIdx]
+	// Auto-attack cycle matching in-game: class/level determines swing count.
+	// Each swing plays for ~0.8s with 0.3s gap, then combat idle until next round.
+	numSwings := swingsPerAttack(byte(ch.Class), byte(ch.Level), dw)
+	if numSwings > len(atkAnims) {
+		numSwings = len(atkAnims)
+	}
+	swingDur := 0.8   // per-swing animation time
+	swingGap := 0.3   // gap between swings
+	roundDur := float64(numSwings)*(swingDur+swingGap) + 2.0 // + idle pause between rounds
+	timeInRound := math.Mod(c.charSelectTime, roundDur)
+	swingIdx := int(timeInRound / (swingDur + swingGap))
+	timeInSwing := math.Mod(timeInRound, swingDur+swingGap)
+	if swingIdx < numSwings && timeInSwing < swingDur {
+		actionAnim = atkAnims[swingIdx%len(atkAnims)]
 	}
 
 	c.modelMgr.DrawEntity(modelID, 0, 0, 0, facing, 1.0, equip, entityID, locoAnim, actionAnim, dt, false, 1.0)
