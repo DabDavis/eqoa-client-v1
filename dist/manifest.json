@@ -1,9 +1,9 @@
 {
-  "version": "20260325-9b79715",
+  "version": "20260325-d4d3e95",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "d6cf3cb4b84589b30eedc1899f6e89f90fc56c6e67495bd6a1da1c4c46bd66fc",
+  "linux_sha256": "17c8b9fbb0adda2b0f965eed59648560c0c3b782280c4be31a383e38004e06f9",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "1e7bb84cf5e244cc3b026bdd981a73bd765fa9b9a4f74cecbc175a3877466481",
-  "changelog": "- Fix infinite swing: revert to DI-driven swings, keep PS2 FX hash\n- Wire combatAttackFXHash from PS2 func_00CBE0A8 into spell FX\n- Fix combat anim: use weaponAttackAnims for slots, not combatAttackAnim\n- Port PS2 combat animation system (func_00BC76A0 pipeline)\n- Fix multi-swing attack: reduce throttle from 2s to 0.4s per swing"
+  "windows_sha256": "5884e9cb921c88e71a85c7dcf056da11b50f16996f48517df8d129d767b46834",
+  "changelog": "- Add state channel byte-diff monitor for combat RE\n- Fix infinite swing: revert to DI-driven swings, keep PS2 FX hash\n- Wire combatAttackFXHash from PS2 func_00CBE0A8 into spell FX\n- Fix combat anim: use weaponAttackAnims for slots, not combatAttackAnim\n- Port PS2 combat animation system (func_00BC76A0 pipeline)"
 }

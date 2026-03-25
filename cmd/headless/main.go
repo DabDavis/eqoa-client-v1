@@ -75,11 +75,37 @@ func main() {
 		}()
 	}
 
-	// Start tick loop (100ms interval)
+	// Start tick loop (100ms interval) — also monitors combat/state events
 	ticker := time.NewTicker(100 * time.Millisecond)
+	var lastDICount, lastCCCount int
+	var lastCombatLog time.Time
 	go func() {
 		for range ticker.C {
 			engine.Tick()
+
+			// Live combat monitor — prints DamageIndication, CastingCombat, and
+			// state diffs to stdout so they scroll in the interactive console.
+			gs := engine.State
+			if gs == nil || gs.Phase != game.PhaseInWorld {
+				continue
+			}
+
+			// Print new floating texts (damage/heal numbers) as they appear
+			for i := lastDICount; i < len(gs.FloatingTexts); i++ {
+				ft := gs.FloatingTexts[i]
+				fmt.Printf("  >> %s at (%.0f, %.0f, %.0f)\n", ft.Text, ft.X, ft.Y, ft.Z)
+			}
+			lastDICount = len(gs.FloatingTexts)
+
+			// Periodic combat status when in combat
+			if gs.Player.AttackCount > 0 && time.Since(lastCombatLog) > 2*time.Second {
+				lastCombatLog = time.Now()
+				fmt.Printf("  [combat] attacks=%d target=0x%08X fxHash=0x%08X\n",
+					gs.Player.AttackCount, engine.TargetObjectID, gs.CombatAttackFXHash)
+			}
+
+			// CastingCombat count tracking
+			_ = lastCCCount
 		}
 	}()
 
