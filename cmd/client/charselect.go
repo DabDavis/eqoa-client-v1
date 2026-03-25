@@ -885,22 +885,33 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	locoAnim := byte(17) // combat idle
 	actionAnim := byte(0)
 
-	// Determine attack anim from weapon SkelType (PS2 SetAttackAction path)
+	// Determine attack anim from weapon SkelType (PS2 SetAttackAction path).
+	// For char select, we don't have inventory AttackType, so held items (focus/orb)
+	// in the secondary slot will incorrectly trigger dual-wield. Use SkelType to
+	// distinguish: real dual-wield weapons have SkelType matching melee types.
 	atkType := inferAttackTypeFromModel(c.modelMgr, primaryWpn, secondaryWpn, shield)
+	// Only use dual-wield table if secondary weapon has a melee SkelType
+	dw := false
+	if primaryWpn != 0 && secondaryWpn != 0 && shield == 0 {
+		secSkelType := c.modelMgr.WeaponSkelType(secondaryWpn)
+		// SkelType 0 = non-weapon (focus/orb/held item), > 0 = real weapon
+		dw = secSkelType > 0
+	}
 	atkTable := weaponAttackAnims
-	if isDualWield(primaryWpn, secondaryWpn, shield) {
+	if dw {
 		atkTable = weaponAttackAnimsDW
 	}
 	atkAnims := atkTable[atkType]
 	if atkAnims == nil {
-		atkAnims = atkTable[11] // fallback to dagger
+		atkAnims = atkTable[11]
 	}
 
-	// Alternate primary/alt attack every 4 seconds
+	// Cycle through primary/alt attacks. Use a counter that increments each
+	// attack window (every 4s) so we alternate through the full pool.
+	swingNum := int(c.charSelectTime / 4.0)
 	attackCycle := math.Mod(c.charSelectTime, 4.0)
 	if attackCycle >= 3.0 && attackCycle < 3.5 {
-		cycleIdx := int(c.charSelectTime/4.0) % len(atkAnims)
-		actionAnim = atkAnims[cycleIdx]
+		actionAnim = atkAnims[swingNum%len(atkAnims)]
 	}
 
 	c.modelMgr.DrawEntity(modelID, 0, 0, 0, facing, 1.0, equip, entityID, locoAnim, actionAnim, dt, false, 1.0)
