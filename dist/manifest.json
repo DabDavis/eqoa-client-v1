@@ -1,9 +1,9 @@
 {
-  "version": "20260325-d4d3e95",
+  "version": "20260325-026b9ed",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "17c8b9fbb0adda2b0f965eed59648560c0c3b782280c4be31a383e38004e06f9",
+  "linux_sha256": "9fc2c795fb9a922edb7e0dab406bcdfaa14d3b0f1a8827257d86937b87737eb7",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "5884e9cb921c88e71a85c7dcf056da11b50f16996f48517df8d129d767b46834",
-  "changelog": "- Add state channel byte-diff monitor for combat RE\n- Fix infinite swing: revert to DI-driven swings, keep PS2 FX hash\n- Wire combatAttackFXHash from PS2 func_00CBE0A8 into spell FX\n- Fix combat anim: use weaponAttackAnims for slots, not combatAttackAnim\n- Port PS2 combat animation system (func_00BC76A0 pipeline)"
+  "windows_sha256": "6cbbfe3f7b1afc8020ba9571241ac41b12525a43c565fa586c4bb8bb53bd2c79",
+  "changelog": "- Headless: live combat monitor + statediff in tick loop\n- Add state channel byte-diff monitor for combat RE\n- Fix infinite swing: revert to DI-driven swings, keep PS2 FX hash\n- Wire combatAttackFXHash from PS2 func_00CBE0A8 into spell FX\n- Fix combat anim: use weaponAttackAnims for slots, not combatAttackAnim"
 }

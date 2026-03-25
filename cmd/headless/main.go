@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -120,6 +121,40 @@ func main() {
 
 	fmt.Println("EQOA Headless Client — type 'help' for commands")
 
+	// TCP command port: allows agents to send commands via `nc localhost 7778`
+	// while the headless runs in the background. Each connection is a session.
+	cmdPort := 7778
+	go func() {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cmdPort))
+		if err != nil {
+			log.Printf("CMD port %d unavailable: %v", cmdPort, err)
+			return
+		}
+		log.Printf("CMD port listening on :%d (nc localhost %d)", cmdPort, cmdPort)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				continue
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				// Redirect output to this connection
+				scanner := bufio.NewScanner(c)
+				for scanner.Scan() {
+					line := strings.TrimSpace(scanner.Text())
+					if line == "" {
+						continue
+					}
+					// Capture log output for this command
+					fmt.Fprintf(c, "> %s\n", line)
+					handleCommand(engine, line)
+					fmt.Fprintf(c, "OK\n")
+				}
+			}(conn)
+		}
+	}()
+
+	// Stdin REPL (interactive or piped)
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
