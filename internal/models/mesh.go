@@ -152,6 +152,7 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 		}
 		model.Race = cs.Race
 		model.Sex = cs.Sex
+		model.SkelType = cs.SkelType
 	}
 	// PS2 CenterOff = (0, 1.2 * DefaultScale, 0) from VIWalkControl::InitParms.
 	// Height 1.2 is hardcoded; fixScale = DefaultScale.

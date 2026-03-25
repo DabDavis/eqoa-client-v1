@@ -247,6 +247,7 @@ type CharModel struct {
 	DefaultScale float32    // ESF model scale (from CSprite.DefaultScale, PS2 VIHSprite+0xD0)
 	Race         int32     // VICSpriteRace enum from ESF CSprite (ver >= 3, default 9)
 	Sex          int32     // VICSpriteSex enum from ESF CSprite (ver >= 3, default 0)
+	SkelType     int32     // VICSpriteSkelType enum: weapon topology (0=unarmed, 2=2H slash, 4=2H blunt, 6=2H pierce)
 	Skeleton     *Skeleton            // bone hierarchy with bind-pose matrices (nil if no hierarchy)
 	Animations   []*esf.HSpriteAnim  // animations from CSprite (nil for items/weapons)
 	CenterOff    [3]float32          // centering offset (cx, yBottom, cz) for skinning coord-space conversion
@@ -2071,6 +2072,28 @@ func (m *ModelManager) ModelRace(modelID int32) int32 {
 		return model.Race
 	}
 	return -1
+}
+
+// ModelSkelType returns the SkelType for a loaded model (PS2 VICSprite +0x1110).
+// Used to determine weapon attack animation type. Returns 0 if not loaded.
+func (m *ModelManager) ModelSkelType(modelID int32) int32 {
+	if model, ok := m.cache[modelID]; ok && model != nil {
+		return model.SkelType
+	}
+	return 0
+}
+
+// WeaponSkelType returns the SkelType of a weapon model by its DictID.
+// Checks both character and item model caches.
+func (m *ModelManager) WeaponSkelType(weaponDictID uint32) int32 {
+	id := int32(weaponDictID)
+	if model, ok := m.itemCache[id]; ok && model != nil {
+		return model.SkelType
+	}
+	if model, ok := m.cache[id]; ok && model != nil {
+		return model.SkelType
+	}
+	return 0
 }
 
 // ModelAnimProfile returns the AnimProfile for a loaded model, or nil if not loaded.
