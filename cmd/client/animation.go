@@ -761,6 +761,10 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		dbgLabel:           "PLAYER",
 	})
 
+	// PS2 func_00CBE0A8: push resolved combat spell FX hash to GameState
+	// so DamageIndication handler can play the correct Attack1-4/Range1-4 effect.
+	gs.CombatAttackFXHash = combatAttackFXHash(am.playerCombat.combatAttackType)
+
 	// Sync exported combat state for input.go / engine.
 	if am.playerCombat.inCombat != am.InCombat {
 		am.InCombat = am.playerCombat.inCombat

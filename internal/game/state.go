@@ -370,6 +370,7 @@ type GameState struct {
 	LastAutoAttackEvent time.Time // last CastingCombat auto-attack involving player (combat-end detection)
 	LastMeleeHitFX      time.Time // throttle: last time melee hit FX was played on a target
 	LastProcFXTime      time.Time // throttle: PS2 proc cooldown ~3500ms (func_00BC76A0)
+	CombatAttackFXHash  uint32    // PS2 func_00CBE0A8: resolved spell FX DictID for current weapon/class
 	FloatingTexts   []FloatingText // rising/fading damage/heal numbers
 
 	// Blacksmith/repair state
@@ -2961,24 +2962,17 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 				gs.Player.AttackCount++
 				gs.Player.LastAttackAnimTime = time.Now()
 			}
-			// Fire hit FX once per auto-attack round. The effect's event sequence
-			// paces 4 swings via Wait sub-type 0 (actor action completion) and
-			// sub-type 3 (timeout). Cast=0 since timing is event-driven.
+			// PS2 func_00BC76A0 + func_00CBE0A8: play the resolved combat spell FX.
+			// CombatAttackFXHash is set per-frame by the animation manager from
+			// resolveCombatAttackType (class/level/weapon → Attack1-4 / Range1-4).
+			// Throttle to once per auto-attack round (~3s).
 			if gs.SpellFXSys != nil && time.Since(gs.LastMeleeHitFX) > 3*time.Second {
-				gs.LastMeleeHitFX = time.Now()
-				gs.SpellFXSys.Play(0xDA9BEA14, 0, sourceID, targetID)
-			}
-			// PS2 client-side proc FX (func_00BC76A0): iterate equipped items,
-			// check ProcAnim (item+0x2F0 = proc type, item+0x28 = DictID).
-			// PS2 rolls proc chance locally and plays spell effect with ~3500ms cooldown.
-			// We trigger on every melee hit since Sandstorm handles proc chance server-side
-			// and sends separate DamageIndications for proc damage/heals.
-			if gs.SpellFXSys != nil && time.Since(gs.LastProcFXTime) > 3500*time.Millisecond {
-				if procDictID := gs.getEquippedProcAnim(); procDictID != 0 {
-					gs.LastProcFXTime = time.Now()
-					gs.SpellFXSys.Play(procDictID, 0, sourceID, targetID)
-					log.Printf("  ProcFX.Play: 0x%08X caster=0x%08X target=0x%08X", procDictID, sourceID, targetID)
+				fxHash := gs.CombatAttackFXHash
+				if fxHash == 0 {
+					fxHash = 0xDA9BEA14 // fallback: "Attack4"
 				}
+				gs.LastMeleeHitFX = time.Now()
+				gs.SpellFXSys.Play(fxHash, 0, sourceID, targetID)
 			}
 		}
 		if sourceID != gs.PlayerObjectID && dmg < 0 {
