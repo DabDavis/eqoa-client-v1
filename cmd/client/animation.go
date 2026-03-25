@@ -404,17 +404,10 @@ func (cs *combatState) resolveCombat(am *AnimationManager, ctrl *models.SpriteAn
 
 	// PS2 timer-driven combat tick (func_00BC76A0).
 	// When nextSwingTime arrives, play the attack animation and advance timer.
+	// Animation slot comes from weaponAttackAnims (SetAttackAction, PS2-verified).
+	// combatAttackType drives spell FX selection and timing only.
 	if cs.inCombat && !cs.nextSwingTime.IsZero() && !now.Before(cs.nextSwingTime) {
-		// Select animation: PS2 func_00CC5190
-		alt := cs.attackCycleIdx%2 != 0
-		var anim byte
-		if cs.combatAttackType > 0 {
-			// Use PS2 combat tick animation (specific CPlayList slot)
-			anim = combatAttackAnim(cs.combatAttackType, alt)
-		} else {
-			// Fallback to weaponAttackAnims table for entities without resolved type
-			anim = attackAnims[cs.attackCycleIdx%len(attackAnims)]
-		}
+		anim := attackAnims[cs.attackCycleIdx%len(attackAnims)]
 		cs.attackCycleIdx++
 
 		dur := am.animDur(modelID, anim)
@@ -431,8 +424,8 @@ func (cs *combatState) resolveCombat(am *AnimationManager, ctrl *models.SpriteAn
 		cs.nextSwingTime = now.Add(swingInterval)
 		cs.lastActivity = now
 
-		log.Printf("ANIM [%s]: ATTACK anim=%d atkType=%d dur=%v alt=%v cycle=%d",
-			dbgLabel, anim, cs.combatAttackType, dur, alt, cs.attackCycleIdx)
+		log.Printf("ANIM [%s]: ATTACK anim=%d atkType=%d dur=%v cycle=%d",
+			dbgLabel, anim, cs.combatAttackType, dur, cs.attackCycleIdx)
 	}
 
 	// Detect new hit taken.
