@@ -1,9 +1,9 @@
 {
-  "version": "20260325-3400803",
+  "version": "20260325-6a62f0d",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "bd36f41bd4017cec6b698104dc624c05921b22c138a6fff141dc13a5f92c8d46",
+  "linux_sha256": "ecf4311272efef43001578defd2a221c14774c81edabda87c4b47734c8bd29f3",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "91e5da73ad3b802efe77acd112781eceb998ad81972eddff8a8cddc10e9a47bd",
-  "changelog": "- Char select: both pairs get attack anim (PS2 SetAction verified)\n- Char select: combat idle locomotion during attacks (PS2 dual-pair)\n- Char select: 3s combat idle delay before first attack salvo\n- Char select: reset timer on all selection methods, start in combat idle\n- Char select: 3s combat idle between attack rounds (matches in-game)"
+  "windows_sha256": "cb003947b56fa44d43fb86b844c36e7a288faec3be3f519b3b00b477f4b7afc8",
+  "changelog": "- Add client-side proc spell FX from equipped items\n- Char select: both pairs get attack anim (PS2 SetAction verified)\n- Char select: combat idle locomotion during attacks (PS2 dual-pair)\n- Char select: 3s combat idle delay before first attack salvo\n- Char select: reset timer on all selection methods, start in combat idle"
 }

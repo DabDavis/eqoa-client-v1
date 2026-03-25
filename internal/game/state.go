@@ -1291,10 +1291,12 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 	gs.InventoryItemCount = len(gs.ParsedItems)
 	log.Printf("MemoryDump: parsed %d inventory items", gs.InventoryItemCount)
 
-	// Log equipped items with proc effects (PS2 func_00BC76A0 uses these for client-side proc FX)
+	// Log equipped items with all fields (investigating proc spell FX DictIDs)
 	for _, item := range gs.ParsedItems {
-		if item.ProcAnim != 0 && item.EquipLocation >= 0 && item.Location == -1 {
-			log.Printf("  PROC ITEM: %q equipLoc=%d procAnim=0x%08X", item.Name, item.EquipLocation, uint32(item.ProcAnim))
+		if item.EquipLocation >= 0 && item.Location == -1 {
+			log.Printf("  EQUIPPED: %q id=%d equipLoc=%d atk=%d dmg=%d proc=%d unk1=%d unk2=%d unk3=%d unk4=%d unk5=%d unk6=%d",
+				item.Name, item.ItemID, item.EquipLocation, item.AttackType, item.WeaponDamage,
+				item.ProcAnim, item.Unk1, item.Unk2, item.Unk3, item.Unk4, item.Unk5, item.Unk6)
 		}
 	}
 
