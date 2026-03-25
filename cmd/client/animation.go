@@ -16,7 +16,7 @@ const (
 	animIdle       = 0
 	animWalk       = 1
 	animRun        = 3
-	animFall       = 4  // humanoid CPlayList slot 4
+	animFall       = 6  // humanoid CPlayList slot 6 (NOT 4 which is swim forward)
 	animSwim       = 12 // CPlayList slot 12 (swim)
 	animLanding    = 5  // humanoid CPlayList slot 5
 	animStrafe     = 10 // 64+ anim models only
