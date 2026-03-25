@@ -908,15 +908,21 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 	roundDur := attackDur + 3.0 // 3s combat idle between rounds (matches in-game auto-attack interval)
 
 	var locoAnim, actionAnim byte
-	timeInRound := math.Mod(c.charSelectTime, roundDur)
-	if timeInRound < attackDur {
-		swingIdx := int(timeInRound / swingDur)
-		anim := atkAnims[swingIdx%len(atkAnims)]
-		locoAnim = anim
-		actionAnim = anim
-	} else {
-		locoAnim = 17 // combat idle
+	firstDelay := 3.0 // combat idle before first salvo
+	if c.charSelectTime < firstDelay {
+		locoAnim = 17
 		actionAnim = 0
+	} else {
+		timeInRound := math.Mod(c.charSelectTime-firstDelay, roundDur)
+		if timeInRound < attackDur {
+			swingIdx := int(timeInRound / swingDur)
+			anim := atkAnims[swingIdx%len(atkAnims)]
+			locoAnim = anim
+			actionAnim = anim
+		} else {
+			locoAnim = 17
+			actionAnim = 0
+		}
 	}
 
 	c.modelMgr.DrawEntity(modelID, 0, 0, 0, facing, 1.0, equip, entityID, locoAnim, actionAnim, dt, false, 1.0)
