@@ -2933,8 +2933,13 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 		// DoTs, multi-hits) but only the first per cycle should trigger a swing anim
 		// and hit effect. Throttle to once per 3 seconds (auto-attack interval is 4-6s).
 		if sourceID == gs.PlayerObjectID && targetID != gs.PlayerObjectID && dmg < 0 {
-			// One swing animation per DamageIndication — server controls timing.
-			gs.Player.AttackCount++
+			// One swing animation per auto-attack round, not per proc/DoT tick.
+			// Nightshade gloves etc. send multiple DamageIndications per swing
+			// (melee hit + damage proc + heal proc). Only the first triggers a swing.
+			if time.Since(gs.Player.LastAttackAnimTime) > 2*time.Second {
+				gs.Player.AttackCount++
+				gs.Player.LastAttackAnimTime = time.Now()
+			}
 			// Fire hit FX once per auto-attack round. The effect's event sequence
 			// paces 4 swings via Wait sub-type 0 (actor action completion) and
 			// sub-type 3 (timeout). Cast=0 since timing is event-driven.
