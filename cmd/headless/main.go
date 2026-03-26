@@ -125,12 +125,12 @@ func main() {
 	// while the headless runs in the background. Each connection is a session.
 	cmdPort := 7778
 	go func() {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cmdPort))
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cmdPort))
 		if err != nil {
-			log.Printf("CMD port %d unavailable: %v", cmdPort, err)
+			fmt.Fprintf(os.Stderr, "CMD port %d unavailable: %v\n", cmdPort, err)
 			return
 		}
-		log.Printf("CMD port listening on :%d (nc localhost %d)", cmdPort, cmdPort)
+		fmt.Fprintf(os.Stderr, "CMD port listening on 127.0.0.1:%d\n", cmdPort)
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -138,17 +138,26 @@ func main() {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				// Redirect output to this connection
 				scanner := bufio.NewScanner(c)
 				for scanner.Scan() {
 					line := strings.TrimSpace(scanner.Text())
 					if line == "" {
 						continue
 					}
-					// Capture log output for this command
 					fmt.Fprintf(c, "> %s\n", line)
+					// Capture stdout during command by temporarily redirecting
+					oldStdout := os.Stdout
+					r, w, _ := os.Pipe()
+					os.Stdout = w
 					handleCommand(engine, line)
-					fmt.Fprintf(c, "OK\n")
+					w.Close()
+					os.Stdout = oldStdout
+					var buf [4096]byte
+					n, _ := r.Read(buf[:])
+					r.Close()
+					if n > 0 {
+						c.Write(buf[:n])
+					}
 				}
 			}(conn)
 		}

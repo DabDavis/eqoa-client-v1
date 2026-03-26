@@ -1,9 +1,9 @@
 {
-  "version": "20260325-026b9ed",
+  "version": "20260325-a93fecc",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "9fc2c795fb9a922edb7e0dab406bcdfaa14d3b0f1a8827257d86937b87737eb7",
+  "linux_sha256": "d729422b8efcecac962e55d9c7080504d113bbe4060b6929216b08998e352319",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "6cbbfe3f7b1afc8020ba9571241ac41b12525a43c565fa586c4bb8bb53bd2c79",
-  "changelog": "- Headless: live combat monitor + statediff in tick loop\n- Add state channel byte-diff monitor for combat RE\n- Fix infinite swing: revert to DI-driven swings, keep PS2 FX hash\n- Wire combatAttackFXHash from PS2 func_00CBE0A8 into spell FX\n- Fix combat anim: use weaponAttackAnims for slots, not combatAttackAnim"
+  "windows_sha256": "9a96375eeeabe4627cbe5adc985a90b89235593cb1899de56e97c81015fb6244",
+  "changelog": "- Headless: add TCP command port (7778) for agent control\n- Headless: live combat monitor + statediff in tick loop\n- Add state channel byte-diff monitor for combat RE\n- Fix infinite swing: revert to DI-driven swings, keep PS2 FX hash\n- Wire combatAttackFXHash from PS2 func_00CBE0A8 into spell FX"
 }
