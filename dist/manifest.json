@@ -1,9 +1,9 @@
 {
-  "version": "20260326-5255a07",
+  "version": "20260326-cddb8c9",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "3fd526d63d03d3aa10b7b513bcf07628235c16f12fb0ae97e07818452abd21ce",
+  "linux_sha256": "390897dcd87e7c44315a5413b6bb25936a9b8769a3b1db83230f667792c1175e",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "5a5c8041946ac5df001811bad21c3d5b2c0b162b76d943a2b07a27694075a763",
-  "changelog": "- Implement auction house system with protocol, handler, UI, and headless command\n- Add Guild tab to main menu with Roster and Chat sub-tabs\n- Detect tells and channel types from ColoredChat text content\n- Fix guild chat: 0x0A7A (ClientMessage) is guild chat on Sandstorm\n- Implement guild chat and guild functions"
+  "windows_sha256": "d7f2cea9596d909735bca8356ae059d90ee589210c93549ed105890cb9c6ae62",
+  "changelog": "- Auction WORKING: fix extra byte, get 5000+ bytes of item data\n- Auction: parse 0x1102 session ID, still investigating empty results\n- Auction: seq byte is session-scoped request ID from server\n- Auction init: decode 0x1101 (open/category) + 0x1102 (ack)\n- Auction: fix opcode prefix skip, try PS2 search sequence"
 }
