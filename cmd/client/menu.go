@@ -2323,9 +2323,14 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	listY := startY + lineH + 1
 	listH := contentH - lineH - 5
 
+	hoveredItem := -1
 	c.uiScrollList(resultLeft-2, listY, resultW+4, listH, len(gs.AuctionItems), &c.menuScroll, lineH,
 		func(i int, x, ey, w int32, hover bool) {
 			ai := gs.AuctionItems[i]
+
+			if hover {
+				hoveredItem = i
+			}
 
 			nameClr := colorWhite
 			if ai.Item.LevelReq >= 45 {
@@ -2345,6 +2350,11 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 				c.drawText("-", buyoutCol, ey+2, 10, colorDim)
 			}
 		})
+
+	// Item tooltip on hover (drawn last so it's on top)
+	if hoveredItem >= 0 && hoveredItem < len(gs.AuctionItems) {
+		c.uiItemTooltip(&gs.AuctionItems[hoveredItem].Item, rl.GetMouseX(), rl.GetMouseY())
+	}
 }
 
 // auctionDoSearch sends an auction search with current filter settings.

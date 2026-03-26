@@ -1,9 +1,9 @@
 {
-  "version": "20260326-5285930",
+  "version": "20260326-2d0b6af",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "a89b8f0e1a96ce0c2e781feb84bc362f314c4bbf4415d47ab9c07eaae942a6fd",
+  "linux_sha256": "738418f9b521fdf20ee4c18ef83dffd9cfbfd603cd5140707a60386a58927912",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "92f58f2a2f0360e2e44b41b7ba3cc00d3d25605b76bff5e9ed2a981eb05cd435",
-  "changelog": "- Widgets: add TabBar, CheckboxGroup, ItemTooltip with icon\n- Refactor drawEquipPreview → uiCharPreview widget\n- Widget: CharPreviewData struct for reusable 3D character preview\n- Add UI widget system: Button, TextInput, Slider, ScrollList, Checkbox\n- Session end: auction working, UI widget system planned"
+  "windows_sha256": "825db02a5ecd6318e057029e3a4712115a328bd46c69b123041d8fb087babd4f",
+  "changelog": "- UI Theme toggle: Modern (rounded/shadows/gradients) vs Classic\n- Widgets: add TabBar, CheckboxGroup, ItemTooltip with icon\n- Refactor drawEquipPreview → uiCharPreview widget\n- Widget: CharPreviewData struct for reusable 3D character preview\n- Add UI widget system: Button, TextInput, Slider, ScrollList, Checkbox"
 }
