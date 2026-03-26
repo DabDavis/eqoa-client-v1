@@ -1701,7 +1701,19 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 	for i := 0; i < itemCount; i++ {
 		var ai AuctionItem
 
-		// Seller name: uint32 length + ASCII bytes
+		// PS2 func_00BBD9E8: zigzag(listingID/sellerCharID) then spell_row_read (parseSingleItem)
+		listingID, _ := reader.Read7BitEncodedInt64()
+		_ = listingID
+
+		// Item data: same format as MemoryDump items (23 zigzag + name + desc + stats)
+		item, err := parseSingleItem(reader)
+		if err != nil {
+			log.Printf("AuctionStuff: parseSingleItem failed at item %d (remaining=%d): %v", i, reader.Remaining(), err)
+			break
+		}
+		ai.Item = item
+
+		// After item: seller name as uint32(len) + ASCII
 		sellerLen, err := reader.ReadUint32()
 		if err != nil || sellerLen > 200 {
 			log.Printf("AuctionStuff: bad seller name len %d at item %d", sellerLen, i)
@@ -1719,14 +1731,6 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 			}
 			ai.Seller = string(nameBytes)
 		}
-
-		// Item data — same format as MemoryDump items
-		item, err := parseSingleItem(reader)
-		if err != nil {
-			log.Printf("AuctionStuff: parseSingleItem failed at item %d: %v", i, err)
-			break
-		}
-		ai.Item = item
 
 		// Auction-specific trailing fields
 		ai.CurrentBid, _ = reader.Read7BitEncodedInt64()

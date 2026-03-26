@@ -1315,19 +1315,18 @@ func (e *Engine) SendWhoList() {
 // sub: sub-command byte (e.g. 0x01=browse, 0x07=search).
 // page: pagination page number.
 // extra: optional additional filter/search bytes (nil for simple browse).
-func (e *Engine) SendAuctionRequest(sub byte, page byte, extra []byte) {
+func (e *Engine) SendAuctionRequest(sub byte, seq byte, extra []byte) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 3+len(extra))
+	data := make([]byte, 2+len(extra))
 	data[0] = sub
-	data[1] = page
-	data[2] = 0 // unk byte
-	copy(data[3:], extra)
+	data[1] = seq
+	copy(data[2:], extra)
 	if !e.State.Conn.QueueReliable(protocol.OpcodeAuctionRequest, data) {
 		log.Printf("WARNING: AuctionRequest send window full")
 	}
-	log.Printf("Sent AuctionRequest sub=0x%02X page=%d extraLen=%d", sub, page, len(extra))
+	log.Printf("Sent AuctionRequest sub=0x%02X seq=%d extraLen=%d", sub, seq, len(extra))
 }
 
 // SendAuctionInit sends opcode 0x1101 — auction board init/navigation.
