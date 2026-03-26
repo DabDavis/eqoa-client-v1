@@ -1329,6 +1329,41 @@ func (e *Engine) SendAuctionRequest(sub byte, seq byte, extra []byte) {
 	log.Printf("Sent AuctionRequest sub=0x%02X seq=%d extraLen=%d", sub, seq, len(extra))
 }
 
+// SendAuctionNextPage sends a page 2+ request using cursor from last listing ID.
+// PS2 format: sub=0x07 + seq(+2 each page) + cursor(zigzag lastListingID) + flag(01) + filter
+func (e *Engine) SendAuctionNextPage() {
+	gs := e.State
+	if gs.AuctionLastListing == 0 || gs.AuctionSeq == 0 {
+		log.Printf("AuctionNextPage: no previous page data")
+		return
+	}
+	// Zigzag-encode the cursor (lastListingID)
+	cursor := zigzagEncode(gs.AuctionLastListing)
+	// Page 2+ filter: cursor + 01 + 10 zeros + FF×8 + level + unk + price + sort
+	filter := make([]byte, 0, len(cursor)+30)
+	filter = append(filter, cursor...)
+	filter = append(filter, 0x01)                         // flag
+	filter = append(filter, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // 10 zeros (empty name+type filter)
+	filter = append(filter, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF) // class mask
+	filter = append(filter, 0x02, 0x64)                   // level 2-100
+	filter = append(filter, 0x00)                         // unk
+	filter = append(filter, 0xFE, 0xA7, 0xD6, 0xB9, 0x07) // max price
+	filter = append(filter, 0x03, 0x01, 0x01)             // sort
+	e.SendAuctionRequest(0x07, gs.AuctionSeq, filter)
+}
+
+// zigzagEncode encodes an int64 as zigzag varint bytes.
+func zigzagEncode(val int64) []byte {
+	uval := uint64((val << 1) ^ (val >> 63))
+	var buf []byte
+	for uval >= 0x80 {
+		buf = append(buf, byte(uval)|0x80)
+		uval >>= 7
+	}
+	buf = append(buf, byte(uval))
+	return buf
+}
+
 // SendAuctionInit sends opcode 0x1101 — auction board init/navigation.
 // PS2 pcap: sub=4 opens auction, sub=6 selects category.
 func (e *Engine) SendAuctionInit(sub byte, extra []byte) {

@@ -392,8 +392,11 @@ type GameState struct {
 	WhoList []WhoEntry
 
 	// Auction house (from opcode 0x1206)
-	AuctionItems     []AuctionItem
-	AuctionSessionID byte // from 0x1102 sub=0x0C response — used as seq in 0x1205
+	AuctionItems       []AuctionItem
+	AuctionSessionID   byte  // from 0x1102 sub=0x0C response
+	AuctionSeq         byte  // increments by 2 per request (4, 6, 8...)
+	AuctionLastListing int64 // last listing ID for cursor-based pagination
+	AuctionTotalCount  int   // total results from header byte[3]
 
 	// PS2 Hotkey Menu (parsed from MemoryDump)
 	Hotkeys []HotkeyEntry // tree-structured hotkey entries (25 default)
@@ -4161,6 +4164,7 @@ func parseSingleItem(reader *buffer.Reader) (ParsedItem, error) {
 
 // AuctionItem holds a single auction house listing parsed from opcode 0x1206.
 type AuctionItem struct {
+	ListingID   int64      // auction listing ID (for cursor pagination)
 	Seller      string     // seller character name (ASCII)
 	Item        ParsedItem // item data (same format as MemoryDump items)
 	CurrentBid  int64      // current bid in tunar

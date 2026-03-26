@@ -1713,50 +1713,61 @@ func handleCommand(engine *game.Engine, line string) {
 		}
 
 	case "auction":
-		// Step 1: Init auction session (0x1101 sub=4) to get session ID
 		gs := engine.State
-		if gs.AuctionSessionID == 0 {
-			initData := []byte{0x08, 0xe0, 0x90, 0x03, 0xbc, 0x14, 0xee, 0xac, 0x03, 0xd4, 0x9b, 0x03}
-			engine.SendAuctionInit(4, initData)
-			time.Sleep(1 * time.Second)
-			// Select category All
-			engine.SendAuctionInit(6, []byte{0x00, 0x00, 0x00, 0x00})
-			time.Sleep(1 * time.Second)
-		}
 
-		// Use session ID from 0x1102 response, or fallback to 0x04
-		seq := gs.AuctionSessionID
-		if seq == 0 {
-			seq = 0x04
-		}
-		if len(parts) >= 2 {
-			p, err := strconv.Atoi(parts[1])
-			if err == nil && p >= 0 && p < 256 {
-				seq = byte(p)
+		if len(parts) >= 2 && parts[1] == "next" {
+			// Fetch next page using cursor
+			engine.SendAuctionNextPage()
+			fmt.Printf("Auction next page (seq=%d cursor=%d). Waiting...\n", gs.AuctionSeq, gs.AuctionLastListing)
+		} else if len(parts) >= 2 && parts[1] == "all" {
+			// Fetch all pages: send page 1, then auto-fetch remaining
+			gs.AuctionItems = nil // reset
+			seq := gs.AuctionSessionID
+			if seq == 0 { seq = 0x04 }
+			searchFilter := []byte{
+				0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+				0x02, 0x64, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01,
+			}
+			engine.SendAuctionRequest(0x07, seq, searchFilter)
+			fmt.Println("Auction: fetching page 1...")
+			// Auto-fetch remaining pages in background
+			go func() {
+				for page := 2; page <= 20; page++ {
+					time.Sleep(2 * time.Second)
+					if gs.AuctionLastListing == 0 || len(gs.AuctionItems) >= gs.AuctionTotalCount {
+						break
+					}
+					engine.SendAuctionNextPage()
+					fmt.Printf("Auction: fetching page %d (cursor=%d)...\n", page, gs.AuctionLastListing)
+				}
+				time.Sleep(2 * time.Second)
+				fmt.Printf("Auction: complete — %d/%d items loaded\n", len(gs.AuctionItems), gs.AuctionTotalCount)
+			}()
+		} else {
+			// Default: fetch page 1 (or show cached)
+			if len(gs.AuctionItems) == 0 {
+				gs.AuctionItems = nil
+				seq := gs.AuctionSessionID
+				if seq == 0 { seq = 0x04 }
+				searchFilter := []byte{
+					0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+					0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+					0x02, 0x64, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01,
+				}
+				engine.SendAuctionRequest(0x07, seq, searchFilter)
+				fmt.Println("Auction: fetching page 1...")
 			}
 		}
-
-		// Step 2: Search all items
-		searchFilter := []byte{
-			0x01, 0x01,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-			0x02, 0x64,
-			0x00,
-			0xFE, 0xA7, 0xD6, 0xB9, 0x07,
-			0x03, 0x01, 0x01,
-		}
-		engine.SendAuctionRequest(0x07, seq, searchFilter)
-		fmt.Printf("Auction search (sessionID=%d seq=%d). Waiting...\n", gs.AuctionSessionID, seq)
-		// Print any cached results
+		// Print cached results
 		if len(gs.AuctionItems) > 0 {
-			fmt.Printf("=== Auction Listings (%d) ===\n", len(gs.AuctionItems))
+			fmt.Printf("=== Auction Listings (%d/%d) ===\n", len(gs.AuctionItems), gs.AuctionTotalCount)
 			for i, ai := range gs.AuctionItems {
 				buyoutStr := "none"
 				if ai.BuyoutPrice > 0 {
 					buyoutStr = fmt.Sprintf("%d", ai.BuyoutPrice)
 				}
-				fmt.Printf("  [%d] %-30s  seller=%-15s  bid=%d  buyout=%s\n",
+				fmt.Printf("  [%d] %-30s  seller=%-15s  bid=%-8d  buyout=%s\n",
 					i+1, ai.Item.Name, ai.Seller, ai.CurrentBid, buyoutStr)
 			}
 		}

@@ -1711,7 +1711,7 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 		}
 
 		// Auction header: 7 zigzag fields
-		listingID, _ := reader.Read7BitEncodedInt64()
+		ai.ListingID, _ = reader.Read7BitEncodedInt64()
 		auctionStack, _ := reader.Read7BitEncodedInt64()
 		auctionMaxHP, _ := reader.Read7BitEncodedInt64()
 		auctionUnk, _ := reader.Read7BitEncodedInt64()
@@ -1724,7 +1724,7 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 		sellerLen, err := reader.ReadUint32()
 		if err != nil || sellerLen > 200 {
 			log.Printf("AuctionStuff[%d]: bad seller len %d at pos %d (listingID=%d remaining=%d)",
-				i, sellerLen, reader.Position(), listingID, reader.Remaining())
+				i, sellerLen, reader.Position(), ai.ListingID, reader.Remaining())
 			break
 		}
 		if sellerLen > 0 {
@@ -1809,8 +1809,14 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 			i, ai.Seller, ai.Item.Name, ai.CurrentBid, ai.BuyoutPrice, ai.Item.LevelReq, bytesConsumed)
 	}
 
-	gs.AuctionItems = items
-	gs.addChatMessage(fmt.Sprintf("Auction: %d items listed (page %d)", len(items), page), ChatSystem)
+	// Append to existing items (multi-page accumulation)
+	gs.AuctionItems = append(gs.AuctionItems, items...)
+	gs.AuctionTotalCount = itemCount
+	if len(items) > 0 {
+		gs.AuctionLastListing = items[len(items)-1].ListingID
+		gs.AuctionSeq = page + 2
+	}
+	gs.addChatMessage(fmt.Sprintf("Auction: +%d items (total %d/%d)", len(items), len(gs.AuctionItems), itemCount), ChatSystem)
 }
 
 // handleAdminShutdown handles opcode 0x07C1 — server shutdown announcement.

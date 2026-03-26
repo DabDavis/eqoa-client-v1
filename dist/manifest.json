@@ -1,9 +1,9 @@
 {
-  "version": "20260326-af96217",
+  "version": "20260326-764eaa6",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "bac0d830775aec7f908e23463605b0e340128954ee90c3e9cd7c044bcc84fba2",
+  "linux_sha256": "60dc74466add98c5a2265a72b899384035c6d4560939058bebbafe36c6af6fb3",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "dd735fc1a891fbcaffa6fdb5b69168ad9f6c6140e10b9119ddecbfe905229c9b",
-  "changelog": "- Auction items parsing WORKING! 40 items per page decoded\n- Auction RE: DSP row format decompiled, blob_read difference identified\n- Auction WORKING: fix extra byte, get 5000+ bytes of item data\n- Auction: parse 0x1102 session ID, still investigating empty results\n- Auction: seq byte is session-scoped request ID from server"
+  "windows_sha256": "5472589b76d9f4fb0684627e52bc21661948857575f7f74e1e328b6301aa8ac3",
+  "changelog": "- Auction: itemCount=total results, parse until data exhausted\n- Auction items parsing WORKING! 40 items per page decoded\n- Auction RE: DSP row format decompiled, blob_read difference identified\n- Auction WORKING: fix extra byte, get 5000+ bytes of item data\n- Auction: parse 0x1102 session ID, still investigating empty results"
 }
