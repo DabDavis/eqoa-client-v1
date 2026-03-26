@@ -162,9 +162,16 @@ const (
 // =============================================================================
 
 const (
-	OpcodeGuildInfo       GameOpcode = 0x0468 // Sandstorm: guild info + online players
-	OpcodeGuildWorldEntry GameOpcode = 0x0579 // Full world entry with guild init (server)
-	OpcodeGuildInviteStuff GameOpcode = 0x057A // Guild invite
+	OpcodeGuildInfo        GameOpcode = 0x0468 // Guild info + member list (server→client)
+	OpcodeGuildCreate      GameOpcode = 0x0469 // Create guild (client→server)
+	OpcodeGuildInvite      GameOpcode = 0x046A // Invite player (client→server)
+	OpcodeGuildLeave       GameOpcode = 0x046B // Leave guild (client→server)
+	OpcodeGuildKick        GameOpcode = 0x046C // Kick member (client→server)
+	OpcodeGuildPromote     GameOpcode = 0x046D // Promote member (client→server)
+	OpcodeGuildDemote      GameOpcode = 0x046E // Demote member (client→server)
+	OpcodeGuildSetMOTD     GameOpcode = 0x046F // Set MOTD (client→server)
+	OpcodeGuildWorldEntry  GameOpcode = 0x0579 // Full world entry with guild init (server)
+	OpcodeGuildInviteStuff GameOpcode = 0x057A // Guild invite stuff
 )
 
 // =============================================================================

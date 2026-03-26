@@ -1,9 +1,9 @@
 {
-  "version": "20260326-305c138",
+  "version": "20260326-483193c",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "e6211a1f448e36d8989a3d5c29a70e5af6362b63946b7c5ffbbab3715e9db817",
+  "linux_sha256": "e0ba460ab62befbc6a49c7921198128b58ddbf1ffdef73c7d29cad0c3d2b9d9c",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "02acc3754a3e28441bdfcbd5e5ced5b037e2858581cbb1e0b8fd3540c177adf6",
-  "changelog": "- Add equipment hotbar swap via PrepareItem (0x000A)\n- Parse weapon AttackType from state channel bytes 91-92\n- State channel RE: decode all 162 bytes, monitor entity diffs\n- Add --cmd-port flag for multiple headless instances\n- Fix headless attack: set CombatEngaged for 0x40 byte 36"
+  "windows_sha256": "14c48934835e3f19c65922da878da2cc5b7c493273f191268ab66294438849c9",
+  "changelog": "- Apply pcap findings: combat state, facing float, PrepareItem, AdjustItemHP\n- Add equipment hotbar swap via PrepareItem (0x000A)\n- Parse weapon AttackType from state channel bytes 91-92\n- State channel RE: decode all 162 bytes, monitor entity diffs\n- Add --cmd-port flag for multiple headless instances"
 }

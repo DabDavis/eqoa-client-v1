@@ -856,6 +856,79 @@ func (e *Engine) SendGuildChat(text string) {
 	log.Printf("Sent guild chat: %s", text)
 }
 
+// SendGuildCreate sends guild creation request (opcode 0x0469).
+// PS2 wire: int32(nameLen) + ASCII(name)
+func (e *Engine) SendGuildCreate(name string) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4+len(name))
+	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
+	copy(data[4:], name)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildCreate, data) {
+		log.Printf("WARNING: GuildCreate send window full")
+	}
+	log.Printf("Sent GuildCreate: %s", name)
+}
+
+// SendGuildLeave sends leave guild request (opcode 0x046B). No payload.
+func (e *Engine) SendGuildLeave() {
+	if e.State.Conn == nil {
+		return
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildLeave, nil) {
+		log.Printf("WARNING: GuildLeave send window full")
+	}
+	log.Printf("Sent GuildLeave")
+}
+
+// SendGuildSetMOTD sends guild MOTD update (opcode 0x046F).
+// PS2 wire: int32(motdLen) + UTF-16(motd)
+func (e *Engine) SendGuildSetMOTD(motd string) {
+	if e.State.Conn == nil {
+		return
+	}
+	runes := []rune(motd)
+	data := make([]byte, 4+len(runes)*2)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
+	for i, r := range runes {
+		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
+	}
+	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildSetMOTD, data) {
+		log.Printf("WARNING: GuildSetMOTD send window full")
+	}
+	log.Printf("Sent GuildSetMOTD: %s", motd)
+}
+
+// SendGuildInvite sends guild invite (opcode 0x046A).
+// PS2 wire: int32(nameLen) + ASCII(name)
+func (e *Engine) SendGuildInvite(name string) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4+len(name))
+	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
+	copy(data[4:], name)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildInvite, data) {
+		log.Printf("WARNING: GuildInvite send window full")
+	}
+	log.Printf("Sent GuildInvite: %s", name)
+}
+
+// SendGuildKick sends guild kick (opcode 0x046C).
+func (e *Engine) SendGuildKick(name string) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 4+len(name))
+	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
+	copy(data[4:], name)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildKick, data) {
+		log.Printf("WARNING: GuildKick send window full")
+	}
+	log.Printf("Sent GuildKick: %s", name)
+}
+
 // SendGroupInvite sends a group invite to a target player (opcode 0x0625).
 // Wire format: uint32(targetObjectID) + uint32(nameLen) + ASCII(name)
 func (e *Engine) SendGroupInvite(targetObjectID uint32, targetName string) {

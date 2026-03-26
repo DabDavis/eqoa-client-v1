@@ -1023,9 +1023,24 @@ func (gs *GameState) handleChatMessage(msg *protocol.Message) {
 		}
 	}
 
-	// Read 4-byte metadata
+	// Read 4-byte metadata — byte 0 is chat channel type
+	chatChannel := ChatSay
 	if reader.Remaining() >= 4 {
-		reader.ReadBytes(4)
+		metaBytes, _ := reader.ReadBytes(4)
+		if len(metaBytes) >= 1 {
+			switch metaBytes[0] {
+			case 0:
+				chatChannel = ChatSay
+			case 1:
+				chatChannel = ChatShout
+			case 2:
+				chatChannel = ChatGroup
+			case 3:
+				chatChannel = ChatGuild
+			case 4:
+				chatChannel = ChatTell
+			}
+		}
 	}
 
 	// Read message ID (zigzag)
@@ -1043,12 +1058,28 @@ func (gs *GameState) handleChatMessage(msg *protocol.Message) {
 		}
 	}
 
-	log.Printf("ChatMessage: sender=%q msgID=%d text=%q", senderName, msgID, msgText)
+	channelNames := map[ChatChannel]string{
+		ChatSay: "say", ChatShout: "shout", ChatGroup: "group",
+		ChatGuild: "guild", ChatTell: "tell",
+	}
+	log.Printf("ChatMessage[%s]: sender=%q msgID=%d text=%q",
+		channelNames[chatChannel], senderName, msgID, msgText)
 
 	if senderName != "" && msgText != "" {
-		gs.addChatMessage(fmt.Sprintf("%s: %s", senderName, msgText), ChatSay)
+		prefix := ""
+		switch chatChannel {
+		case ChatGuild:
+			prefix = "[Guild] "
+		case ChatGroup:
+			prefix = "[Group] "
+		case ChatShout:
+			prefix = "[Shout] "
+		case ChatTell:
+			prefix = "[Tell] "
+		}
+		gs.addChatMessage(fmt.Sprintf("%s%s: %s", prefix, senderName, msgText), chatChannel)
 	} else if msgText != "" {
-		gs.addChatMessage(msgText, ChatSay)
+		gs.addChatMessage(msgText, chatChannel)
 	}
 }
 

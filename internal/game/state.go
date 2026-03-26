@@ -1680,10 +1680,31 @@ func (gs *GameState) handleColoredChat(msg *protocol.Message) {
 		r, g, b = 63, 255, 63 // default shout green
 	}
 
-	log.Printf("ColoredChat: %s (color: %d,%d,%d)", text, r, g, b)
+	// Determine chat channel from color bytes.
+	// Sandstorm uses specific colors for different channels:
+	//   Shout:  green (63, 255, 63) or (255, 247, 0) = default
+	//   Guild:  typically teal/cyan or custom guild color
+	//   Server: varies (welcome messages, etc)
+	// The last 2 bytes after RGB may be channel flags.
+	channel := ChatShout
+	colorOff2 := colorOff + 3
+	if colorOff2 < len(data) {
+		flagByte := data[colorOff2]
+		// Check known Sandstorm flag patterns
+		if flagByte == 0xF7 {
+			channel = ChatSystem // server message (0xFFF7 = system)
+		}
+	}
+	// Guild chat detection: if we're in a guild and the color matches guild green
+	// or the text starts with guild-specific prefix
+	if r == 0 && g == 255 && b == 0 {
+		channel = ChatGuild
+	}
+
+	log.Printf("ColoredChat: %s (color: %d,%d,%d ch=%d)", text, r, g, b, channel)
 	gs.ChatLog = append(gs.ChatLog, ChatMessage{
 		Text:    text,
-		Channel: ChatShout,
+		Channel: channel,
 		ColorR:  r, ColorG: g, ColorB: b,
 	})
 }

@@ -231,6 +231,12 @@ func handleCommand(engine *game.Engine, line string) {
 		fmt.Println("  gleave          — Leave current group")
 		fmt.Println("  gboot <name>    — Boot member from group")
 		fmt.Println("  group           — Show group members")
+		fmt.Println("  guildsay <msg>  — Send guild chat message")
+		fmt.Println("  guildcreate <n> — Create guild with name")
+		fmt.Println("  guildleave      — Leave current guild")
+		fmt.Println("  guildmotd <msg> — Set guild MOTD")
+		fmt.Println("  guildinvite <n> — Invite player to guild")
+		fmt.Println("  guildkick <n>   — Kick member from guild")
 		fmt.Println("  who             — Request who list")
 		fmt.Println("  lfg             — Toggle LFG registration")
 		fmt.Println("  create <name> <race> <class> [gender] — Create character")
@@ -1611,6 +1617,55 @@ func handleCommand(engine *game.Engine, line string) {
 	case "gleave":
 		engine.SendLeaveGroup()
 		fmt.Println("Left group.")
+
+	case "guildsay", "gu":
+		if len(parts) < 2 {
+			fmt.Println("Usage: guildsay <message>")
+			return
+		}
+		text := strings.Join(parts[1:], " ")
+		engine.SendGuildChat(text)
+		fmt.Printf("Guild: %s\n", text)
+
+	case "guildcreate":
+		if len(parts) < 2 {
+			fmt.Println("Usage: guildcreate <guild name>")
+			return
+		}
+		name := strings.Join(parts[1:], " ")
+		engine.SendGuildCreate(name)
+		fmt.Printf("Creating guild: %s\n", name)
+
+	case "guildleave":
+		engine.SendGuildLeave()
+		fmt.Println("Left guild.")
+
+	case "guildmotd":
+		if len(parts) < 2 {
+			fmt.Println("Usage: guildmotd <message>")
+			return
+		}
+		text := strings.Join(parts[1:], " ")
+		engine.SendGuildSetMOTD(text)
+		fmt.Printf("Set guild MOTD: %s\n", text)
+
+	case "guildinvite":
+		if len(parts) < 2 {
+			fmt.Println("Usage: guildinvite <player name>")
+			return
+		}
+		name := strings.Join(parts[1:], " ")
+		engine.SendGuildInvite(name)
+		fmt.Printf("Invited %s to guild\n", name)
+
+	case "guildkick":
+		if len(parts) < 2 {
+			fmt.Println("Usage: guildkick <player name>")
+			return
+		}
+		name := strings.Join(parts[1:], " ")
+		engine.SendGuildKick(name)
+		fmt.Printf("Kicked %s from guild\n", name)
 
 	case "gboot":
 		if len(parts) < 2 {
