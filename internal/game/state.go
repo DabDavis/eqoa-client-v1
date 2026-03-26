@@ -2313,13 +2313,15 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 		ent.Scale = math.Float32frombits(binary.LittleEndian.Uint32(data[36:40]))
 	}
 
-	// Facing float32: offset 54-57 (LE, radians) — smoother than byte[15]
-	if len(data) >= 58 {
-		facingF := math.Float32frombits(binary.LittleEndian.Uint32(data[54:58]))
-		if facingF != 0 && !math.IsNaN(float64(facingF)) && !math.IsInf(float64(facingF), 0) {
-			ent.TargetFacing = facingF
-		}
-	}
+	// Facing float32: offset 54-57 (LE, radians) — believed to be spawn/idle facing,
+	// NOT live movement facing. Using this overrides the byte[15] movement facing and
+	// causes entities to freeze facing one direction. Disabled.
+	// if len(data) >= 58 {
+	// 	facingF := math.Float32frombits(binary.LittleEndian.Uint32(data[54:58]))
+	// 	if facingF != 0 && !math.IsNaN(float64(facingF)) && !math.IsInf(float64(facingF), 0) {
+	// 		ent.TargetFacing = facingF
+	// 	}
+	// }
 
 	// Target: offset 58-61 (uint32 LE, 0xFFFFFFFF = none)
 	if len(data) >= 63 {
