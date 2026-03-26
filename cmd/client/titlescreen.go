@@ -467,6 +467,9 @@ func (ts *titleScreen) drawTitleScene(c *Client, showPrompt bool) {
 		promptW := c.measureText(prompt, 20)
 		c.drawText(prompt, (screenWidth-promptW)/2, screenHeight-50, 20, promptColor)
 	}
+
+	// Mute button (top-left)
+	c.uiMuteButton(6, 6)
 }
 
 // drawBackground draws just the background (no overlays) — used behind the login form.

@@ -307,6 +307,9 @@ func (c *Client) drawLoginScreen() {
 	if c.loginError != "" {
 		c.drawCenteredText(c.loginError, loginBtnY()+loginBtnH+10, 14, rl.Color{R: 220, G: 60, B: 60, A: 255})
 	}
+
+	// Mute button (top-left)
+	c.uiMuteButton(6, 6)
 }
 
 // drawLoginField renders a text input field with theme-aware styling.

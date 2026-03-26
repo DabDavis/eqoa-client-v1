@@ -889,3 +889,61 @@ func (c *Client) uiHoverRowSelected(x, y, w, h int32, text string, fontSize int3
 	c.drawText(text, x+8, y+(h-fontSize)/2, fontSize, clr)
 	return hover && rl.IsMouseButtonPressed(rl.MouseButtonLeft)
 }
+
+// --- Screen Utility Buttons ---
+
+// uiMuteButton draws a small mute toggle button at the given position.
+func (c *Client) uiMuteButton(x, y int32) {
+	sz := int32(24)
+	mx, my := rl.GetMouseX(), rl.GetMouseY()
+	hover := mx >= x && mx < x+sz && my >= y && my < y+sz
+
+	bg := rl.Color{R: 20, G: 20, B: 30, A: 180}
+	if hover {
+		bg = rl.Color{R: 40, G: 40, B: 60, A: 220}
+	}
+	rl.DrawRectangle(x, y, sz, sz, bg)
+
+	muted := c.masterVolume == 0
+	if muted {
+		c.drawText("M", x+6, y+4, 14, rl.Color{R: 200, G: 80, B: 80, A: 255})
+	} else {
+		clr := colorDim
+		if hover {
+			clr = colorWhite
+		}
+		c.drawText("S", x+6, y+4, 14, clr)
+	}
+
+	if hover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		if c.masterVolume > 0 {
+			c.prevMasterVolume = c.masterVolume
+			c.masterVolume = 0
+			rl.SetMasterVolume(0)
+		} else {
+			if c.prevMasterVolume <= 0 {
+				c.prevMasterVolume = 1.0
+			}
+			c.masterVolume = c.prevMasterVolume
+			rl.SetMasterVolume(c.masterVolume)
+		}
+		cfg := loadLoginConfig()
+		cfg.MasterVolume = c.masterVolume
+		saveLoginConfig(cfg)
+	}
+}
+
+// uiBackArrow draws a back arrow button at the given position. Returns true if clicked.
+func (c *Client) uiBackArrow(x, y int32) bool {
+	sz := int32(28)
+	mx, my := rl.GetMouseX(), rl.GetMouseY()
+	hover := mx >= x && mx < x+sz && my >= y && my < y+sz
+
+	clr := colorDim
+	if hover {
+		clr = colorGoldHover
+	}
+	c.drawText("<", x+8, y+5, 16, clr)
+
+	return hover && rl.IsMouseButtonPressed(rl.MouseButtonLeft)
+}

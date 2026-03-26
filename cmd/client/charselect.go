@@ -56,15 +56,13 @@ func (c *Client) handleCharSelectInput() {
 		return
 	}
 
-	// Escape or Triangle: dismiss delete confirm or disconnect
+	// Escape or Triangle: dismiss delete confirm only (no disconnect)
 	gpTriangle := gpAvailable() && gpPressed(rl.GamepadButtonRightFaceUp)
 	if rl.IsKeyPressed(rl.KeyEscape) || gpTriangle {
 		if c.deleteConfirmActive {
 			c.deleteConfirmActive = false
 			return
 		}
-		c.disconnectAndReturnToLogin()
-		return
 	}
 
 	// Delete confirmation dialog input
@@ -355,7 +353,10 @@ func (c *Client) drawCharacterSelect() {
 	if len(gs.Characters) == 0 {
 		c.drawText("No characters found.", csListX, csListY, 14, rl.LightGray)
 		c.drawCreateNewButton(gold)
-		c.drawText("ESC - Back", 10, 10, 12, colorHintGray)
+		if c.uiBackArrow(6, 6) {
+			c.disconnectAndReturnToLogin()
+		}
+		c.uiMuteButton(6, 38)
 		return
 	}
 

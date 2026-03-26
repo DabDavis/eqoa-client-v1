@@ -233,7 +233,8 @@ type Client struct {
 	loginRemember bool   // "Remember me" checkbox state
 	loginError    string // error message from last attempt
 	loginBusy      bool   // true while auth goroutine running
-	loginWantsExit bool   // true when X button clicked
+	loginWantsExit  bool // true when window close requested
+	loginWantsTitle bool // true when back arrow clicked (return to title)
 	assetsDir      string // saved for engine creation after login
 	isoPath        string // path to EQOA ISO (optional, reads assets directly from disc image)
 	serverIP       string // server IP (from config or default)
