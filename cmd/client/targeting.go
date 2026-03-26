@@ -28,22 +28,31 @@ func (c *Client) mousePickTarget() {
 	bestDist := float32(50.0) // max screen pixel distance threshold
 	bestID := uint32(0)
 
-	for _, ent := range gs.Entities {
-		height := c.modelHeight(ent.ModelID, 1.8) * ent.Scale
+	// Check all nearby entities + self
+	checkEnt := func(ent *game.Entity) {
+		scale := ent.Scale
+		if scale <= 0 {
+			scale = 1.0
+		}
+		height := c.modelHeight(ent.ModelID, 1.8) * scale
 		worldPos := rl.Vector3{X: ent.X, Y: ent.Y + height*0.5, Z: ent.Z}
 		screenPos := rl.GetWorldToScreen(worldPos, camera)
-
-		// Skip entities behind camera
 		if screenPos.X < 0 || screenPos.X > float32(rl.GetScreenWidth()) ||
 			screenPos.Y < 0 || screenPos.Y > float32(rl.GetScreenHeight()) {
-			continue
+			return
 		}
-
 		dist := mathutil.Dist2D(mousePos.X, mousePos.Y, screenPos.X, screenPos.Y)
 		if dist < bestDist {
 			bestDist = dist
 			bestID = ent.ObjectID
 		}
+	}
+	for _, ent := range gs.Entities {
+		checkEnt(ent)
+	}
+	// Include self
+	if p.ObjectID != 0 && p.Name != "" {
+		checkEnt(&gs.Player)
 	}
 
 	if bestID != 0 {

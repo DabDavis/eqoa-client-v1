@@ -693,23 +693,29 @@ func (c *Client) drawWorld() {
 		}
 	}
 
-	// Draw nameplate for local player.
-	// In third-person the camera always orbits the player, so project the
-	// head-top world position through the same camera used for rendering.
+	// Draw nameplate for local player + include in hover/click detection.
 	if p.Name != "" && !firstPerson {
 		height := c.modelHeight(p.ModelID, 1.8)
 		scale := p.Scale
 		if scale <= 0 {
 			scale = 1.0
 		}
-		// Use the camera target XZ (which is exactly p.X, p.Z) to avoid any
-		// floating-point drift between the player pos and camera target.
 		worldPos := rl.Vector3{X: camera.Target.X, Y: p.Y + height*scale + 0.3, Z: camera.Target.Z}
 		screenPos := rl.GetWorldToScreen(worldPos, camera)
 		sw, sh := float32(rl.GetScreenWidth()), float32(rl.GetScreenHeight())
 		if screenPos.X >= -100 && screenPos.X <= sw+100 &&
 			screenPos.Y >= -50 && screenPos.Y <= sh+50 {
 			c.drawNameplate(screenPos, p.Name, nameColorFromByte(p.NameColor))
+
+			// Hover detection for self (same as other entities)
+			bodyScreen := rl.GetWorldToScreen(rl.Vector3{X: p.X, Y: p.Y + height*scale*0.5, Z: p.Z}, camera)
+			mdx := mousePos.X - bodyScreen.X
+			mdy := mousePos.Y - bodyScreen.Y
+			d2 := mdx*mdx + mdy*mdy
+			if d2 < hoverDistSq {
+				hoverDistSq = d2
+				hoverEnt = &gs.Player
+			}
 		}
 	}
 
