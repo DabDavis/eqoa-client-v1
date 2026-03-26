@@ -252,7 +252,8 @@ type Client struct {
 	charSubTab   int  // 0=Stats, 1=Spells, 2=CM
 	socialSubTab   int // 0=Who, 1=Group, 2=LFG, 3=Auction
 	guildSubTab    int // 0=Roster, 1=Chat
-	settingsSubTab int // 0=Camera, 1=Audio
+	settingsSubTab int     // 0=Camera, 1=Audio
+	uiTheme        uiStyle // 0=modern, 1=classic (PS2 frames)
 	menuStickLatched bool // right stick sub-tab latch (fires once per deflection)
 	whoRequested      bool // true after first who list request sent
 	whoSortByLevel    bool // false=alphabetical, true=by level

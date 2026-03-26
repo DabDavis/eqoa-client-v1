@@ -2547,6 +2547,29 @@ func (c *Client) drawSettingsGraphics(y, rowX, rowW, mx, my int32, clicked bool,
 		buildResolutionPresets()
 	}
 
+	// --- UI Theme ---
+	c.drawText("UI Theme", px, y, 14, gold)
+	y += 18
+	themeLabels := []string{"Modern", "Classic"}
+	for i, label := range themeLabels {
+		bx := px + int32(i)*90
+		isCurrent := int(c.uiTheme) == i
+		isHover := mx >= bx && mx < bx+85 && my >= y && my < y+rowH
+		clr := dim
+		if isCurrent {
+			clr = gold
+			rl.DrawRectangle(bx, y, 85, rowH, rl.Color{R: 40, G: 35, B: 55, A: 255})
+		} else if isHover {
+			clr = white
+			rl.DrawRectangle(bx, y, 85, rowH, hoverBg)
+		}
+		c.drawText(label, bx+4, y+3, 13, clr)
+		if isHover && clicked {
+			c.uiTheme = uiStyle(i)
+		}
+	}
+	y += rowH + 8
+
 	// --- Window Mode ---
 	c.drawText("Window Mode", px, y, 14, gold)
 	y += 18

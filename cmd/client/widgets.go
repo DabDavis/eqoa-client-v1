@@ -17,7 +17,18 @@ import (
 // Immediate-mode widgets that handle drawing + input in one call.
 // Each returns the Y position after the widget for easy vertical stacking.
 // All widgets use the Client's font via c.drawText / c.measureText.
+//
+// UI Style: toggle between "modern" (clean, rounded, gradients) and
+// "classic" (PS2 UI.ESF sprite sheets). Set via c.uiStyleClassic.
 // =============================================================================
+
+// uiStyle controls visual appearance of all widgets.
+type uiStyle int
+
+const (
+	uiStyleModern  uiStyle = 0 // clean dark panels, rounded corners, gradients
+	uiStyleClassic uiStyle = 1 // PS2 UI.ESF sprite frames (future)
+)
 
 // --- Button ---
 
@@ -39,13 +50,32 @@ func (c *Client) uiButton(x, y int32, label string, fontSize int32) bool {
 func (c *Client) uiButtonStyled(x, y, w, h int32, label string, fontSize int32) bool {
 	mx, my := rl.GetMouseX(), rl.GetMouseY()
 	hover := mx >= x && mx < x+w && my >= y && my < y+h
-	bg := rl.Color{R: 30, G: 30, B: 50, A: 255}
-	if hover {
-		bg = rl.Color{R: 40, G: 40, B: 70, A: 255}
+	rect := rl.Rectangle{X: float32(x), Y: float32(y), Width: float32(w), Height: float32(h)}
+
+	if c.uiTheme == uiStyleModern {
+		// Gradient background + rounded corners
+		bg := rl.Color{R: 30, G: 30, B: 55, A: 255}
+		border := rl.Color{R: 60, G: 60, B: 90, A: 255}
+		if hover {
+			bg = rl.Color{R: 40, G: 40, B: 75, A: 255}
+			border = rl.Color{R: 0, G: 180, B: 180, A: 255}
+		}
+		rl.DrawRectangleRounded(rect, 0.15, 4, bg)
+		rl.DrawRectangleRoundedLines(rect, 0.15, 4, border)
+	} else {
+		bg := rl.Color{R: 30, G: 30, B: 50, A: 255}
+		if hover {
+			bg = rl.Color{R: 40, G: 40, B: 70, A: 255}
+		}
+		rl.DrawRectangle(x, y, w, h, bg)
+		rl.DrawRectangleLines(x, y, w, h, rl.Color{R: 60, G: 60, B: 80, A: 255})
 	}
-	rl.DrawRectangle(x, y, w, h, bg)
-	rl.DrawRectangleLines(x, y, w, h, rl.Color{R: 60, G: 60, B: 80, A: 255})
+
 	tw := c.measureText(label, fontSize)
+	// Text shadow in modern mode
+	if c.uiTheme == uiStyleModern {
+		c.drawText(label, x+(w-tw)/2+1, y+(h-fontSize)/2+1, fontSize, rl.Color{R: 0, G: 0, B: 0, A: 120})
+	}
 	c.drawText(label, x+(w-tw)/2, y+(h-fontSize)/2, fontSize, colorGold)
 	return hover && rl.IsMouseButtonPressed(rl.MouseButtonLeft)
 }
@@ -262,7 +292,15 @@ func (c *Client) uiScrollList(x, y, w, h int32, itemCount int, scroll *int, line
 // uiSectionHeader draws a colored header bar with text.
 func (c *Client) uiSectionHeader(x, y, w int32, text string) {
 	h := int32(18)
-	rl.DrawRectangle(x, y, w, h, rl.Color{R: 25, G: 25, B: 40, A: 255})
+	if c.uiTheme == uiStyleModern {
+		// Gradient header: darker at top, lighter at bottom
+		rl.DrawRectangleGradientV(x, y, w, h,
+			rl.Color{R: 30, G: 28, B: 50, A: 255},
+			rl.Color{R: 22, G: 20, B: 38, A: 255})
+		rl.DrawRectangle(x, y+h-1, w, 1, rl.Color{R: 60, G: 55, B: 80, A: 255})
+	} else {
+		rl.DrawRectangle(x, y, w, h, rl.Color{R: 25, G: 25, B: 40, A: 255})
+	}
 	c.drawText(text, x+4, y+2, 12, colorGold)
 }
 
@@ -282,7 +320,17 @@ func (c *Client) uiDividerH(x, y, w int32) {
 
 // uiPanel draws a dark panel background.
 func (c *Client) uiPanel(x, y, w, h int32) {
-	rl.DrawRectangle(x, y, w, h, rl.Color{R: 20, G: 20, B: 32, A: 255})
+	if c.uiTheme == uiStyleModern {
+		// Rounded corners + subtle drop shadow
+		rl.DrawRectangleRounded(
+			rl.Rectangle{X: float32(x + 2), Y: float32(y + 2), Width: float32(w), Height: float32(h)},
+			0.02, 4, rl.Color{R: 0, G: 0, B: 0, A: 60})
+		rl.DrawRectangleRounded(
+			rl.Rectangle{X: float32(x), Y: float32(y), Width: float32(w), Height: float32(h)},
+			0.02, 4, rl.Color{R: 20, G: 20, B: 32, A: 245})
+	} else {
+		rl.DrawRectangle(x, y, w, h, rl.Color{R: 20, G: 20, B: 32, A: 255})
+	}
 }
 
 // --- Character Preview ---
@@ -667,8 +715,17 @@ func (c *Client) uiItemTooltip(item *game.ParsedItem, screenX, screenY int32) {
 	}
 
 	// Draw tooltip background + border
-	rl.DrawRectangle(tx-1, ty-1, ttW+2, ttH+2, rl.Color{R: 60, G: 55, B: 40, A: 255})
-	rl.DrawRectangle(tx, ty, ttW, ttH, rl.Color{R: 15, G: 15, B: 22, A: 245})
+	if c.uiTheme == uiStyleModern {
+		// Drop shadow + rounded
+		rect := rl.Rectangle{X: float32(tx), Y: float32(ty), Width: float32(ttW), Height: float32(ttH)}
+		shadowRect := rl.Rectangle{X: float32(tx + 3), Y: float32(ty + 3), Width: float32(ttW), Height: float32(ttH)}
+		rl.DrawRectangleRounded(shadowRect, 0.04, 4, rl.Color{R: 0, G: 0, B: 0, A: 80})
+		rl.DrawRectangleRounded(rect, 0.04, 4, rl.Color{R: 15, G: 15, B: 22, A: 250})
+		rl.DrawRectangleRoundedLines(rect, 0.04, 4, rl.Color{R: 80, G: 70, B: 50, A: 255})
+	} else {
+		rl.DrawRectangle(tx-1, ty-1, ttW+2, ttH+2, rl.Color{R: 60, G: 55, B: 40, A: 255})
+		rl.DrawRectangle(tx, ty, ttW, ttH, rl.Color{R: 15, G: 15, B: 22, A: 245})
+	}
 
 	// Draw icon (top-left corner)
 	textOffsetX := int32(0)
