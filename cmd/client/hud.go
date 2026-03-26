@@ -132,7 +132,18 @@ func (c *Client) drawInspectionWnd(ent *game.Entity, mousePos rl.Vector2) {
 	nameClr := nameColorFromByte(ent.NameColor)
 	lines = append(lines, inspLine{ent.Name, nameClr, nameFontSz})
 
-	// Line 2: level + race/class (player) or level (NPC)
+	// Line 2: guild (under name, cyan)
+	if c.engine != nil && c.engine.State != nil {
+		gs := c.engine.State
+		if ent.ObjectID == c.targetObjectID && gs.TargetGuildName != "" {
+			lines = append(lines, inspLine{
+				fmt.Sprintf("<%s>", gs.TargetGuildName),
+				rl.Color{R: 100, G: 200, B: 200, A: 255}, infoFontSz,
+			})
+		}
+	}
+
+	// Line 3+: level, race/class (player) or level + NPC type
 	if ent.IsPlayer {
 		lines = append(lines, inspLine{
 			fmt.Sprintf("Lv %d  %s %s", ent.Level, raceName(int(ent.Race)), className(int(ent.Class))),
@@ -143,20 +154,8 @@ func (c *Client) drawInspectionWnd(ent *game.Entity, mousePos rl.Vector2) {
 			fmt.Sprintf("Lv %d", ent.Level),
 			colorWhite, infoFontSz,
 		})
-		// NPC sub-type
 		if label := npcTypeLabel(ent.NPCType); label != "" {
 			lines = append(lines, inspLine{label, colorDim, infoFontSz})
-		}
-	}
-
-	// Guild name (from ClassicTargetInfo 0x0010 — only for targeted entity)
-	if c.engine != nil && c.engine.State != nil {
-		gs := c.engine.State
-		if ent.ObjectID == c.targetObjectID && gs.TargetGuildName != "" {
-			lines = append(lines, inspLine{
-				fmt.Sprintf("<%s>", gs.TargetGuildName),
-				rl.Color{R: 100, G: 200, B: 200, A: 255}, infoFontSz,
-			})
 		}
 	}
 
