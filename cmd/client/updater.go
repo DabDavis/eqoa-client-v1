@@ -138,17 +138,23 @@ func (c *Client) runUpdateCheck() {
 
 		// Progress bar (during download)
 		if state.progress > 0 && state.progress < 1 {
-			barW := float32(300)
-			barH := float32(12)
-			barX := float32(screenWidth)/2 - barW/2
-			barY := float32(screenHeight)/2 + 10
-			rl.DrawRectangle(int32(barX)-1, int32(barY)-1, int32(barW)+2, int32(barH)+2,
-				rl.Color{R: 60, G: 60, B: 80, A: 200})
-			fillW := barW * state.progress
-			rl.DrawRectangle(int32(barX), int32(barY), int32(fillW), int32(barH),
-				rl.Color{R: 212, G: 192, B: 111, A: 220})
+			barW := int32(300)
+			barH := int32(12)
+			barX := screenWidth/2 - barW/2
+			barY := screenHeight/2 + 10
+			fillW := int32(float32(barW) * state.progress)
+
+			if c.uiTheme == uiStyleModern {
+				rect := rl.Rectangle{X: float32(barX), Y: float32(barY), Width: float32(barW), Height: float32(barH)}
+				rl.DrawRectangleRounded(rect, 0.3, 4, rl.Color{R: 30, G: 30, B: 50, A: 200})
+				fillRect := rl.Rectangle{X: float32(barX), Y: float32(barY), Width: float32(fillW), Height: float32(barH)}
+				rl.DrawRectangleRounded(fillRect, 0.3, 4, rl.Color{R: 212, G: 192, B: 111, A: 220})
+			} else {
+				rl.DrawRectangle(barX-1, barY-1, barW+2, barH+2, rl.Color{R: 60, G: 60, B: 80, A: 200})
+				rl.DrawRectangle(barX, barY, fillW, barH, rl.Color{R: 212, G: 192, B: 111, A: 220})
+			}
 			pctText := fmt.Sprintf("%d%%", int(state.progress*100))
-			c.drawCenteredText(pctText, int32(barY+barH)+4, 12, colorDim)
+			c.drawCenteredText(pctText, barY+barH+4, 12, colorDim)
 		}
 
 		// Error (non-fatal)
@@ -212,8 +218,7 @@ func (c *Client) runUpdateCheck() {
 			}
 			boxX := screenWidth/2 - boxW/2
 			boxY := screenHeight/2 - boxH/2
-			rl.DrawRectangle(boxX, boxY, boxW, boxH, rl.Color{R: 15, G: 15, B: 30, A: 230})
-			rl.DrawRectangleLines(boxX, boxY, boxW, boxH, rl.Color{R: 212, G: 192, B: 111, A: 180})
+			c.uiPanel(boxX, boxY, boxW, boxH)
 
 			c.drawCenteredText("Update installed!", boxY+15, 18, colorGoldWarm)
 
