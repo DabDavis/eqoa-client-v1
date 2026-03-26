@@ -161,7 +161,7 @@ func (c *Client) handleMenuInput() {
 	}
 
 	// Controller: L2/R2 = main tabs, L1/R1 = sub-tabs, D-pad = content navigation.
-	const numTabs = 8
+	const numTabs = 9
 	mainMenuItems := 10 // Resume, Inventory, Character, Nearby, Social, Guild, Settings, Music, Lore, Exit
 
 	gpL2 := gpAvailable() && gpPressed(rl.GamepadButtonLeftTrigger2)
