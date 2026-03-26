@@ -263,7 +263,7 @@ func (c *Client) drawLoginScreen() {
 	panelY := loginSubY() - pad20
 	panelW := loginFieldW + pad20*2
 	panelH := (loginBtnY() + loginBtnH) - loginSubY() + pad20*2
-	rl.DrawRectangle(panelX, panelY, panelW, panelH, colorDarkPanel)
+	c.uiPanel(panelX, panelY, panelW, panelH)
 
 	// Close button (top-right X)
 	mx := int32(rl.GetMouseX())
@@ -287,67 +287,23 @@ func (c *Client) drawLoginScreen() {
 
 	// Username label + field
 	c.drawText("Username", loginFieldX(), loginUserLblY(), 16, rl.LightGray)
-	border := unfocusBorder
-	if c.loginFocus == 0 {
-		border = focusBorder
-	}
-	rl.DrawRectangle(loginFieldX()-2, loginUserY()-2, loginFieldW+4, loginFieldH+4, border)
-	rl.DrawRectangle(loginFieldX(), loginUserY(), loginFieldW, loginFieldH, fieldBg)
-	userText := c.loginUser
-	if c.loginFocus == 0 && int(time.Now().UnixMilli()/500)%2 == 0 {
-		userText += "|"
-	}
-	c.drawText(userText, loginFieldX()+6, loginUserY()+7, 16, rl.White)
+	c.drawLoginField(loginFieldX(), loginUserY(), loginFieldW, loginFieldH,
+		c.loginUser, c.loginFocus == 0, false, fieldBg, focusBorder, unfocusBorder)
 
 	// Password label + field
 	c.drawText("Password", loginFieldX(), loginPassLblY(), 16, rl.LightGray)
-	border = unfocusBorder
-	if c.loginFocus == 1 {
-		border = focusBorder
-	}
-	rl.DrawRectangle(loginFieldX()-2, loginPassY()-2, loginFieldW+4, loginFieldH+4, border)
-	rl.DrawRectangle(loginFieldX(), loginPassY(), loginFieldW, loginFieldH, fieldBg)
-	passText := strings.Repeat("*", len(c.loginPass))
-	if c.loginFocus == 1 && int(time.Now().UnixMilli()/500)%2 == 0 {
-		passText += "|"
-	}
-	c.drawText(passText, loginFieldX()+6, loginPassY()+7, 16, rl.White)
+	c.drawLoginField(loginFieldX(), loginPassY(), loginFieldW, loginFieldH,
+		c.loginPass, c.loginFocus == 1, true, fieldBg, focusBorder, unfocusBorder)
 
 	// "Remember me" checkbox
-	border = unfocusBorder
-	if c.loginFocus == 2 {
-		border = focusBorder
-	}
-	rl.DrawRectangle(loginFieldX()-1, loginCheckY()-1, loginCheckSz+2, loginCheckSz+2, border)
-	rl.DrawRectangle(loginFieldX(), loginCheckY(), loginCheckSz, loginCheckSz, fieldBg)
-	if c.loginRemember {
-		inner := int32(4)
-		checkColor := colorGold
-		rl.DrawLine(loginFieldX()+inner, loginCheckY()+inner, loginFieldX()+loginCheckSz-inner, loginCheckY()+loginCheckSz-inner, checkColor)
-		rl.DrawLine(loginFieldX()+inner, loginCheckY()+loginCheckSz-inner, loginFieldX()+loginCheckSz-inner, loginCheckY()+inner, checkColor)
-	}
-	c.drawText("Remember me", loginFieldX()+loginCheckSz+8, loginCheckY()+1, 16, rl.LightGray)
+	c.uiCheckbox(loginFieldX(), loginCheckY(), "Remember me", &c.loginRemember)
 
 	// Login button
-	btnEnabled := !c.loginBusy && len(c.loginUser) > 0 && len(c.loginPass) > 0
-	btnBg := colorGmBtnBg
-	btnText := gold
-	if !btnEnabled {
-		btnBg = rl.Color{R: 25, G: 25, B: 40, A: 255}
-		btnText = rl.Color{R: 80, G: 70, B: 50, A: 255}
-	}
-	btnBorder := unfocusBorder
-	if c.loginFocus == 3 {
-		btnBorder = focusBorder
-	}
-	rl.DrawRectangle(loginFieldX()-2, loginBtnY()-2, loginFieldW+4, loginBtnH+4, btnBorder)
-	rl.DrawRectangle(loginFieldX(), loginBtnY(), loginFieldW, loginBtnH, btnBg)
 	label := "Login"
 	if c.loginBusy {
 		label = "Authenticating..."
 	}
-	labelW := c.measureText(label, 18)
-	c.drawText(label, loginFieldX()+(loginFieldW-labelW)/2, loginBtnY()+8, 18, btnText)
+	c.uiButtonStyled(loginFieldX(), loginBtnY(), loginFieldW, loginBtnH, label, 18)
 
 	// Status message (errors only -- hint removed since we have a button now)
 	if c.loginError != "" {
@@ -355,4 +311,32 @@ func (c *Client) drawLoginScreen() {
 		errW := c.measureText(c.loginError, 14)
 		c.drawText(c.loginError, (screenWidth-errW)/2, statusY, 14, rl.Color{R: 220, G: 60, B: 60, A: 255})
 	}
+}
+
+// drawLoginField renders a text input field with theme-aware styling.
+func (c *Client) drawLoginField(x, y, w, h int32, text string, focused, isPassword bool,
+	fieldBg, focusBorder, unfocusBorder rl.Color) {
+	border := unfocusBorder
+	if focused {
+		border = focusBorder
+	}
+
+	displayText := text
+	if isPassword {
+		displayText = strings.Repeat("*", len(text))
+	}
+	if focused && int(time.Now().UnixMilli()/500)%2 == 0 {
+		displayText += "|"
+	}
+
+	if c.uiTheme == uiStyleModern {
+		rect := rl.Rectangle{X: float32(x), Y: float32(y), Width: float32(w), Height: float32(h)}
+		rl.DrawRectangleRounded(rect, 0.15, 4, fieldBg)
+		rl.DrawRectangleRoundedLines(rect, 0.15, 4, border)
+	} else {
+		rl.DrawRectangle(x-2, y-2, w+4, h+4, border)
+		rl.DrawRectangle(x, y, w, h, fieldBg)
+	}
+
+	c.drawText(displayText, x+6, y+7, 16, rl.White)
 }
