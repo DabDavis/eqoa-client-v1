@@ -1,9 +1,9 @@
 {
-  "version": "20260326-fe468d9",
+  "version": "20260326-305c138",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "c95fa2da03df2b032674be1ee9c222ec618f1ba23303f0f64e2448eadddee963",
+  "linux_sha256": "e6211a1f448e36d8989a3d5c29a70e5af6362b63946b7c5ffbbab3715e9db817",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "59d2a33d5de73a06a506866883117af695f05923bedc11f4525d7cfc2f8f03ab",
-  "changelog": "- Parse weapon AttackType from state channel bytes 91-92\n- State channel RE: decode all 162 bytes, monitor entity diffs\n- Add --cmd-port flag for multiple headless instances\n- Fix headless attack: set CombatEngaged for 0x40 byte 36\n- Add CastingCombat RAW hex dump for wire format debugging"
+  "windows_sha256": "02acc3754a3e28441bdfcbd5e5ced5b037e2858581cbb1e0b8fd3540c177adf6",
+  "changelog": "- Add equipment hotbar swap via PrepareItem (0x000A)\n- Parse weapon AttackType from state channel bytes 91-92\n- State channel RE: decode all 162 bytes, monitor entity diffs\n- Add --cmd-port flag for multiple headless instances\n- Fix headless attack: set CombatEngaged for 0x40 byte 36"
 }

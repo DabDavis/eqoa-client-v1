@@ -1209,30 +1209,44 @@ func (gs *GameState) handleClientCloseLoot(msg *protocol.Message) {
 	log.Printf("ClientCloseLoot: loot window closed")
 }
 
-// handlePrepareItem handles opcode 0x000A — prepare item on hotbar.
+// handlePrepareItem handles opcode 0x000A — equipment hotbar swap confirmation.
+// Server response format (from PS2 pcap): slot(uint8) + action(uint8) = 2 bytes
+// Action: 0=unequip to hotbar, 2=equip from hotbar, 3=swap hotbar slot.
+// Client sends 5 bytes (uint32 slot + action), server confirms with 2 bytes.
 func (gs *GameState) handlePrepareItem(msg *protocol.Message) {
 	data := msg.Data()
-	log.Printf("PrepareItem: dataLen=%d", len(data))
+	payload := data[2:] // skip opcode
+	if len(payload) < 2 {
+		log.Printf("PrepareItem: dataLen=%d (too short)", len(payload))
+		return
+	}
+	slot := payload[0]
+	action := payload[1]
+	actionName := "unknown"
+	switch action {
+	case 0:
+		actionName = "unequip→hotbar"
+	case 2:
+		actionName = "equip←hotbar"
+	case 3:
+		actionName = "swap"
+	}
+	log.Printf("PrepareItem: slot=%d action=%d(%s)", slot, action, actionName)
 }
 
 // handleAdjustItemHP handles opcode 0x0060 — item durability change.
-// PS2 wire: invSlot(uint32 LE) + newHP(zigzag). Sent after repair confirms.
+// PS2 pcap confirmed: invSlot(uint32 LE) + remainingHP(uint16 LE) = 6 bytes after opcode.
 func (gs *GameState) handleAdjustItemHP(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 6 {
+	if len(data) < 8 { // 2 opcode + 4 slot + 2 hp
 		log.Printf("AdjustItemHP: dataLen=%d (too short)", len(data))
 		return
 	}
 	invSlot := binary.LittleEndian.Uint32(data[2:6])
-	log.Printf("AdjustItemHP: invSlot=%d remaining=%d bytes", invSlot, len(data)-6)
-	// Update item HP in ParsedItems if slot is valid.
+	remainingHP := binary.LittleEndian.Uint16(data[6:8])
+	log.Printf("AdjustItemHP: invSlot=%d remainingHP=%d", invSlot, remainingHP)
 	if int(invSlot) < len(gs.ParsedItems) {
-		// Read remaining bytes as zigzag-encoded new HP value.
-		if len(data) >= 9 {
-			newHP := binary.LittleEndian.Uint16(data[6:8])
-			gs.ParsedItems[invSlot].RemainingHP = int64(newHP)
-			log.Printf("AdjustItemHP: slot %d HP → %d", invSlot, newHP)
-		}
+		gs.ParsedItems[invSlot].RemainingHP = int64(remainingHP)
 	}
 }
 

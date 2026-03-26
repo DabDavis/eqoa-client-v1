@@ -140,6 +140,10 @@ type Entity struct {
 	NamePlate byte   // offset 142: 0=own player, 1=show
 	Target    uint32 // offset 58-61: target ObjectID (0xFFFFFFFF = none)
 
+	// Combat state (state channel offsets 63-64)
+	CombatEngaged    bool // offset 63: auto-attack active
+	CombatAttackType byte // offset 64: active weapon AttackType during combat
+
 	// Equipment (state channel offsets 67-78, 91-98)
 	PrimaryWeapon      uint32 // offset 67-70 LE
 	SecondaryWeapon    uint32 // offset 71-74 LE
@@ -1983,6 +1987,12 @@ func (gs *GameState) decodePlayerState(data []byte) {
 		}
 	}
 
+	// Combat flags: offset 63 = CombatEngaged, 64 = active weapon AttackType during combat
+	if len(data) >= 65 {
+		gs.Player.CombatEngaged = data[63] != 0
+		gs.Player.CombatAttackType = data[64]
+	}
+
 	// Equipment: weapon model IDs at offsets 67-78, armor bytes at 93-98
 	if len(data) >= 79 {
 		gs.Player.PrimaryWeapon = binary.LittleEndian.Uint32(data[67:71])
@@ -2252,9 +2262,23 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 		ent.Scale = math.Float32frombits(binary.LittleEndian.Uint32(data[36:40]))
 	}
 
+	// Facing float32: offset 54-57 (LE, radians) — smoother than byte[15]
+	if len(data) >= 58 {
+		facingF := math.Float32frombits(binary.LittleEndian.Uint32(data[54:58]))
+		if facingF != 0 && !math.IsNaN(float64(facingF)) && !math.IsInf(float64(facingF), 0) {
+			ent.TargetFacing = facingF
+		}
+	}
+
 	// Target: offset 58-61 (uint32 LE, 0xFFFFFFFF = none)
 	if len(data) >= 63 {
 		ent.Target = binary.LittleEndian.Uint32(data[59:63])
+	}
+
+	// Combat flags: offset 63 = CombatEngaged, 64 = active weapon AttackType during combat
+	if len(data) >= 65 {
+		ent.CombatEngaged = data[63] != 0
+		ent.CombatAttackType = data[64]
 	}
 
 	// Equipment: weapon model IDs at offsets 66-78, armor bytes at 93-98

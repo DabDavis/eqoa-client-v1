@@ -933,9 +933,12 @@ func (am *AnimationManager) animDur(modelID int32, animByte byte) time.Duration 
 }
 
 // entityAttackType returns the weapon AttackType for an entity.
-// Prefers state channel byte 91 (PrimaryAttackType) which the server populates
-// from the item database. Falls back to inferAttackType for entities without it.
+// Priority: byte 64 (active combat AttackType) > byte 91 (equipped primary) > inferred.
+// Byte 64 is set by the server when combat is engaged — confirmed via PS2 pcap.
 func entityAttackType(ent *game.Entity) int {
+	if ent.CombatEngaged && ent.CombatAttackType > 0 {
+		return int(ent.CombatAttackType)
+	}
 	if ent.PrimaryAttackType > 0 {
 		return int(ent.PrimaryAttackType)
 	}
