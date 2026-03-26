@@ -355,11 +355,6 @@ func (c *Client) drawCharacterSelect() {
 	if len(gs.Characters) == 0 {
 		c.drawText("No characters found.", csListX, csListY, 14, rl.LightGray)
 		c.drawCreateNewButton(gold)
-		if c.uiBackArrow(6, 6) {
-			c.disconnectAndReturnToLogin()
-		}
-		c.uiMuteButton(6, 38)
-		return
 	}
 
 	raceNames := []string{"Human", "Elf", "Dark Elf", "Gnome", "Dwarf", "Troll", "Barbarian", "Halfling", "Erudite", "Ogre"}
@@ -417,11 +412,12 @@ func (c *Client) drawCharacterSelect() {
 		c.drawDeleteConfirm(gs.Characters[c.charSelectIdx].Name)
 	}
 
-	// Back arrow + mute button (top-left)
-	if c.uiBackArrow(6, 6) {
+	// Back arrow (top-right, same position as login X button)
+	if c.uiBackArrow(screenWidth-36, 6) {
 		c.disconnectAndReturnToLogin()
 	}
-	c.uiMuteButton(6, 38)
+	// Mute button (top-left)
+	c.uiMuteButton(6, 6)
 }
 
 // enterAppearanceEdit starts the appearance editor for the selected character.
