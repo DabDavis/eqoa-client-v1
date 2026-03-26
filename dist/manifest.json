@@ -1,9 +1,9 @@
 {
-  "version": "20260326-8c82faa",
+  "version": "20260326-baf2540",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "7a6ce3bea4dc4645f4fe7f58ac291cf2090f4c79410d140fbf1114831f1c4e41",
+  "linux_sha256": "8977887f986c492161b22f6bf27977d690f7e9954d32628c83859bcd17a95f54",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "a603a7b1ef98000d5c6178b05a50b697663799661dfda95a6ec3170b850e6a31",
-  "changelog": "- Replace all 5 inline sub-tab drawings with uiTabBar widget\n- Updater: convert to widget system\n- Login screen: convert to widget system\n- Fix tooltip stat dancing: sort map keys for stable order\n- Wire item tooltip to auction hover — shows stats, icon, description"
+  "windows_sha256": "e6613c17bc1af1c3ea88e2b8576f80e99b836157b112911e2e720f26271947ab",
+  "changelog": "- Convert Who List and LFG panels to widget system\n- Replace all 5 inline sub-tab drawings with uiTabBar widget\n- Updater: convert to widget system\n- Login screen: convert to widget system\n- Fix tooltip stat dancing: sort map keys for stable order"
 }

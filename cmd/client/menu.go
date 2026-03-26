@@ -2897,200 +2897,73 @@ func (c *Client) drawMenuGroup(startY, contentH int32) {
 		return
 	}
 
-	gold := colorGold
-	white := colorWhite
-	dim := colorDim
-	green := rl.Color{R: 100, G: 220, B: 100, A: 255}
-	red := rl.Color{R: 220, G: 100, B: 100, A: 255}
-	rowBg1 := colorRowBg1
-	rowBg2 := colorRowBg2
-	hoverBg := colorRowHover
-
-	mx := rl.GetMouseX()
-	my := rl.GetMouseY()
-	clicked := rl.IsMouseButtonPressed(rl.MouseButtonLeft)
-
+	px := menuXPos() + menuPad
+	listW := menuW - menuPad*2
+	lineH := int32(22)
 	y := startY
 
-	// --- Section 1: Invite by name ---
-	c.drawText("Invite Player", menuXPos()+menuPad, y, 14, gold)
+	// --- Invite by name ---
+	c.uiLabel(px, y, "Invite Player", 14, colorGold)
 	y += 20
-
-	// Text input field
-	inputX := menuXPos() + menuPad
-	inputW := menuW - menuPad*2 - 70 // leave room for Send button
-	inputH := int32(22)
-	inputBg := rl.Color{R: 15, G: 14, B: 25, A: 255}
-	inputBorder := colorSep
-	if c.groupTyping {
-		inputBorder = gold
-	}
-	rl.DrawRectangle(inputX, y, inputW, inputH, inputBg)
-	rl.DrawRectangleLines(inputX, y, inputW, inputH, inputBorder)
-
-	// Display text or placeholder
-	if c.groupInviteInput != "" {
-		dispText := c.groupInviteInput
-		if c.groupTyping {
-			dispText += "_"
-		}
-		c.drawText(dispText, inputX+4, y+4, 13, white)
-	} else if c.groupTyping {
-		c.drawText("_", inputX+4, y+4, 13, white)
-	} else {
-		c.drawText("Enter name...", inputX+4, y+4, 13, dim)
-	}
-
-	// Click on input field activates typing
-	if clicked && mx >= inputX && mx < inputX+inputW && my >= y && my < y+inputH {
-		c.groupTyping = true
-	}
-
-	// Invite button
-	btnX := inputX + inputW + 6
-	btnW := int32(60)
-	btnHover := mx >= btnX && mx < btnX+btnW && my >= y && my < y+inputH
-	btnBg := colorBtnBg
-	if btnHover {
-		btnBg = hoverBg
-	}
-	rl.DrawRectangle(btnX, y, btnW, inputH, btnBg)
-	rl.DrawRectangleLines(btnX, y, btnW, inputH, colorSep)
-	invLabel := "Invite"
-	invLW := c.measureText(invLabel, 13)
-	c.drawText(invLabel, btnX+(btnW-invLW)/2, y+4, 13, green)
-
-	if clicked && btnHover && c.groupInviteInput != "" {
+	inputW := listW - 70
+	c.uiTextInput(px, y, inputW, &c.groupInviteInput, &c.groupTyping, 24)
+	if c.uiButtonStyled(px+inputW+6, y, 60, 18, "Invite", 12) && c.groupInviteInput != "" {
 		c.sendGroupInviteByName(c.groupInviteInput)
 		c.groupInviteInput = ""
 		c.groupTyping = false
 	}
-	y += inputH + 10
+	y += lineH + 10
 
-	// --- Section 2: Pending Invite ---
+	// --- Pending Invite ---
 	if gs.GroupInviteID != 0 {
-		c.drawText("Pending Invite", menuXPos()+menuPad, y, 14, gold)
+		c.uiLabel(px, y, "Pending Invite", 14, colorGold)
 		y += 20
-
-		rl.DrawRectangle(menuXPos()+menuPad, y, menuW-menuPad*2, menuRowH, rowBg1)
-		invText := fmt.Sprintf("From: %s", gs.GroupInviter)
-		c.drawText(invText, menuXPos()+menuPad+4, y+3, 13, white)
-
-		// Accept button
-		accW := int32(54)
-		accX := menuXPos() + menuW - menuPad - accW - 60
-		accHover := mx >= accX && mx < accX+accW && my >= y && my < y+menuRowH
-		accBg := rl.Color{R: 30, G: 50, B: 30, A: 255}
-		if accHover {
-			accBg = rl.Color{R: 40, G: 70, B: 40, A: 255}
-		}
-		rl.DrawRectangle(accX, y+1, accW, menuRowH-2, accBg)
-		rl.DrawRectangleLines(accX, y+1, accW, menuRowH-2, rl.Color{R: 80, G: 120, B: 80, A: 255})
-		aLbl := "Accept"
-		aLW := c.measureText(aLbl, 12)
-		c.drawText(aLbl, accX+(accW-aLW)/2, y+4, 12, green)
-
-		if clicked && accHover {
+		c.uiLabel(px, y, fmt.Sprintf("From: %s", gs.GroupInviter), 13, colorWhite)
+		rightX := px + listW
+		if c.uiButtonStyled(rightX-120, y, 54, 18, "Accept", 12) {
 			c.engine.SendAcceptGroupInvite(gs.GroupInviteID)
 			gs.GroupInviteID = 0
 			gs.GroupInviter = ""
 		}
-
-		// Decline button
-		decW := int32(54)
-		decX := menuXPos() + menuW - menuPad - decW
-		decHover := mx >= decX && mx < decX+decW && my >= y && my < y+menuRowH
-		decBg := rl.Color{R: 50, G: 30, B: 30, A: 255}
-		if decHover {
-			decBg = colorGmRedBg
-		}
-		rl.DrawRectangle(decX, y+1, decW, menuRowH-2, decBg)
-		rl.DrawRectangleLines(decX, y+1, decW, menuRowH-2, rl.Color{R: 120, G: 80, B: 80, A: 255})
-		dLbl := "Decline"
-		dLW := c.measureText(dLbl, 12)
-		c.drawText(dLbl, decX+(decW-dLW)/2, y+4, 12, red)
-
-		if clicked && decHover {
+		if c.uiButtonStyled(rightX-60, y, 54, 18, "Decline", 12) {
 			c.engine.SendDeclineGroupInvite(gs.GroupInviteID)
 			gs.GroupInviteID = 0
 			gs.GroupInviter = ""
 		}
-
-		y += menuRowH + 10
+		y += lineH + 10
 	}
 
-	// --- Section 3: Group Members ---
+	// --- Group Members ---
 	if gs.GroupActive {
-		hdr := fmt.Sprintf("Group Members (%d)", len(gs.GroupMembers))
-		c.drawText(hdr, menuXPos()+menuPad, y, 14, gold)
-
-		// Leave button (top-right of members section)
-		leaveW := int32(52)
-		leaveX := menuXPos() + menuW - menuPad - leaveW
-		leaveY := y - 2
-		leaveH := int32(20)
-		leaveHover := mx >= leaveX && mx < leaveX+leaveW && my >= leaveY && my < leaveY+leaveH
-		leaveBg := rl.Color{R: 50, G: 30, B: 30, A: 255}
-		if leaveHover {
-			leaveBg = colorGmRedBg
-		}
-		rl.DrawRectangle(leaveX, leaveY, leaveW, leaveH, leaveBg)
-		rl.DrawRectangleLines(leaveX, leaveY, leaveW, leaveH, rl.Color{R: 120, G: 80, B: 80, A: 255})
-		lLbl := "Leave"
-		lLW := c.measureText(lLbl, 12)
-		c.drawText(lLbl, leaveX+(leaveW-lLW)/2, leaveY+3, 12, red)
-
-		if clicked && leaveHover {
+		c.uiLabel(px, y, fmt.Sprintf("Group Members (%d)", len(gs.GroupMembers)), 14, colorGold)
+		if c.uiButton(px+listW-50, y, "[Leave]", 12) {
 			c.engine.SendLeaveGroup()
 		}
-
 		y += 20
 
-		for i, m := range gs.GroupMembers {
-			ry := y + int32(i)*menuRowH
-
-			// Alternating row background
-			bg := rowBg1
-			if i%2 == 1 {
-				bg = rowBg2
-			}
-			rl.DrawRectangle(menuXPos()+menuPad, ry, menuW-menuPad*2, menuRowH, bg)
-
-			// Self indicator
-			nameClr := white
-			if m.ObjectID == gs.PlayerObjectID {
-				nameClr = colorPlayerName
-			}
-			c.drawText(m.Name, menuXPos()+menuPad+4, ry+3, 13, nameClr)
-
-			// Boot button (not for self)
-			if m.ObjectID != gs.PlayerObjectID {
-				bootW := int32(42)
-				bootX := menuXPos() + menuW - menuPad - bootW - 4
-				bootHover := mx >= bootX && mx < bootX+bootW && my >= ry && my < ry+menuRowH
-				bootBg := rl.Color{R: 50, G: 30, B: 30, A: 180}
-				if bootHover {
-					bootBg = colorGmRedBg
+		c.uiScrollList(px, y, listW, contentH-(y-startY)-4, len(gs.GroupMembers), &c.menuScroll, 22,
+			func(i int, x, ey, w int32, hover bool) {
+				m := gs.GroupMembers[i]
+				nameClr := colorWhite
+				if m.ObjectID == gs.PlayerObjectID {
+					nameClr = colorPlayerName
 				}
-				rl.DrawRectangle(bootX, ry+2, bootW, menuRowH-4, bootBg)
-				bLbl := "Boot"
-				bLW := c.measureText(bLbl, 11)
-				c.drawText(bLbl, bootX+(bootW-bLW)/2, ry+5, 11, red)
+				c.drawText(m.Name, x+4, ey+3, 13, nameClr)
 
-				if clicked && bootHover {
-					c.engine.SendBootGroupMember(m.ObjectID)
-					// Remove locally — server may not echo RemoveGroupMember back to booter
-					gs.GroupMembers = append(gs.GroupMembers[:i], gs.GroupMembers[i+1:]...)
-					if len(gs.GroupMembers) <= 1 {
-						gs.GroupActive = false
-						gs.GroupID = 0
-						gs.GroupMembers = nil
+				if m.ObjectID != gs.PlayerObjectID && hover {
+					if c.uiButton(x+w-50, ey+2, "[Boot]", 11) {
+						c.engine.SendBootGroupMember(m.ObjectID)
+						gs.GroupMembers = append(gs.GroupMembers[:i], gs.GroupMembers[i+1:]...)
+						if len(gs.GroupMembers) <= 1 {
+							gs.GroupActive = false
+							gs.GroupID = 0
+							gs.GroupMembers = nil
+						}
 					}
 				}
-			}
-		}
+			})
 	} else {
-		c.drawText("Not in a group", menuXPos()+menuPad, y, 14, dim)
+		c.uiLabel(px, y, "Not in a group", 14, colorDim)
 	}
 }
 
