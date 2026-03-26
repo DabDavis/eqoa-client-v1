@@ -2316,130 +2316,162 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	gold := colorGold
 	white := colorWhite
 	dim := colorDim
+	cyan := rl.Color{R: 0, G: 200, B: 200, A: 255}
+	green := rl.Color{R: 100, G: 220, B: 100, A: 255}
 	lineH := int32(18)
 	mx, my := rl.GetMouseX(), rl.GetMouseY()
+	leftX := menuXPos() + menuPad
+	rightX := menuXPos() + menuW - menuPad
 
 	y := startY
 
-	// Browse / Refresh button
-	browseLabel := "[Browse Auction]"
-	bw := c.measureText(browseLabel, 13)
-	bx := menuXPos() + menuPad
-	isBrowseHover := mx >= bx && mx < bx+bw && my >= y && my < y+lineH
-	browseClr := dim
-	if isBrowseHover {
-		browseClr = gold
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			c.engine.SendAuctionRequest(0x08, c.auctionPage, nil)
-			c.auctionRequested = true
-		}
+	// === Top bar: Search + Load All + item count ===
+	searchLabel := "[Search All]"
+	sw := c.measureText(searchLabel, 13)
+	isSearchHover := mx >= leftX && mx < leftX+sw && my >= y && my < y+lineH
+	searchClr := dim
+	if isSearchHover {
+		searchClr = cyan
 	}
-	c.drawText(browseLabel, bx, y, 13, browseClr)
-
-	// Page navigation (right-aligned)
-	pageStr := fmt.Sprintf("Page %d", c.auctionPage+1)
-	pw := c.measureText(pageStr, 12)
-	px := menuXPos() + menuW - menuPad - pw
-	c.drawText(pageStr, px, y+2, 12, dim)
-
-	// Prev / Next buttons
-	nextLabel := "[>]"
-	nw := c.measureText(nextLabel, 13)
-	nx := px - nw - 8
-	isNextHover := mx >= nx && mx < nx+nw && my >= y && my < y+lineH
-	nextClr := dim
-	if isNextHover {
-		nextClr = gold
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			c.auctionPage++
-			c.engine.SendAuctionRequest(0x08, c.auctionPage, nil)
-			c.menuScroll = 0
+	if isSearchHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		gs.AuctionItems = nil
+		seq := gs.AuctionSessionID
+		if seq == 0 { seq = 0x04 }
+		filter := []byte{
+			0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+			0x02, 0x64, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01,
 		}
+		c.engine.SendAuctionRequest(0x07, seq, filter)
+		c.auctionRequested = true
+		c.menuScroll = 0
 	}
-	c.drawText(nextLabel, nx, y, 13, nextClr)
+	c.drawText(searchLabel, leftX, y, 13, searchClr)
 
-	prevLabel := "[<]"
-	pvw := c.measureText(prevLabel, 13)
-	pvx := nx - pvw - 4
-	isPrevHover := mx >= pvx && mx < pvx+pvw && my >= y && my < y+lineH
-	prevClr := dim
-	if isPrevHover {
-		prevClr = gold
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && c.auctionPage > 0 {
-			c.auctionPage--
-			c.engine.SendAuctionRequest(0x08, c.auctionPage, nil)
-			c.menuScroll = 0
+	// Load More button (next page)
+	if gs.AuctionLastListing != 0 && len(gs.AuctionItems) < gs.AuctionTotalCount {
+		moreLabel := "[Load More]"
+		mw := c.measureText(moreLabel, 13)
+		moreX := leftX + sw + 12
+		isMoreHover := mx >= moreX && mx < moreX+mw && my >= y && my < y+lineH
+		moreClr := dim
+		if isMoreHover { moreClr = cyan }
+		if isMoreHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			c.engine.SendAuctionNextPage()
 		}
+		c.drawText(moreLabel, moreX, y, 13, moreClr)
 	}
-	c.drawText(prevLabel, pvx, y, 13, prevClr)
 
-	y += lineH + 4
+	// Item count (right-aligned)
+	if gs.AuctionTotalCount > 0 {
+		countStr := fmt.Sprintf("%d/%d items", len(gs.AuctionItems), gs.AuctionTotalCount)
+		cw := c.measureText(countStr, 12)
+		c.drawText(countStr, rightX-cw, y+2, 12, dim)
+	}
+
+	y += lineH + 2
 
 	// Auto-request on first open
 	if !c.auctionRequested {
-		c.engine.SendAuctionRequest(0x08, 0, nil)
+		seq := gs.AuctionSessionID
+		if seq == 0 { seq = 0x04 }
+		filter := []byte{
+			0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+			0x02, 0x64, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01,
+		}
+		c.engine.SendAuctionRequest(0x07, seq, filter)
 		c.auctionRequested = true
 	}
 
 	if len(gs.AuctionItems) == 0 {
-		c.drawText("No auction listings.", menuXPos()+menuPad, y, 14, dim)
+		c.drawText("Loading auction listings...", leftX, y+20, 14, dim)
 		return
 	}
 
-	// Header
-	c.drawText(fmt.Sprintf("Listings: %d", len(gs.AuctionItems)), menuXPos()+menuPad, y, 14, gold)
-	y += lineH + 2
+	// === Column headers ===
+	nameCol := leftX
+	lvlCol := leftX + menuW*40/100
+	sellerCol := leftX + menuW*48/100
+	bidCol := leftX + menuW*68/100
+	buyoutCol := leftX + menuW*84/100
 
-	// Column headers
-	nameCol := menuXPos() + menuPad + 4
-	sellerCol := menuXPos() + menuPad + menuW*45/100
-	bidCol := menuXPos() + menuPad + menuW*65/100
-	buyoutCol := menuXPos() + menuPad + menuW*82/100
+	headerBg := rl.Color{R: 25, G: 25, B: 40, A: 255}
+	rl.DrawRectangle(leftX-2, y, menuW-menuPad*2+4, lineH, headerBg)
+	c.drawText("Item", nameCol, y+2, 12, gold)
+	c.drawText("Lv", lvlCol, y+2, 12, gold)
+	c.drawText("Seller", sellerCol, y+2, 12, gold)
+	c.drawText("Bid", bidCol, y+2, 12, gold)
+	c.drawText("Buyout", buyoutCol, y+2, 12, gold)
+	y += lineH + 1
 
-	c.drawText("Item", nameCol, y, 12, gold)
-	c.drawText("Seller", sellerCol, y, 12, gold)
-	c.drawText("Bid", bidCol, y, 12, gold)
-	c.drawText("Buyout", buyoutCol, y, 12, gold)
-	y += lineH
-
-	// Scrollable list
+	// === Scrollable item list ===
 	listTop := y
 	listH := contentH - (y - startY) - 4
 	maxVisible := int(listH / lineH)
-	if c.menuScroll > len(gs.AuctionItems)-maxVisible {
-		c.menuScroll = len(gs.AuctionItems) - maxVisible
+	totalItems := len(gs.AuctionItems)
+
+	if c.menuScroll > totalItems-maxVisible {
+		c.menuScroll = totalItems - maxVisible
 	}
 	if c.menuScroll < 0 {
 		c.menuScroll = 0
 	}
 
-	for i := c.menuScroll; i < len(gs.AuctionItems) && int32(i-c.menuScroll)*lineH < listH; i++ {
+	rowBg1 := rl.Color{R: 18, G: 18, B: 28, A: 255}
+	rowBg2 := rl.Color{R: 22, G: 22, B: 35, A: 255}
+	hoverBg := rl.Color{R: 30, G: 30, B: 50, A: 255}
+
+	for i := c.menuScroll; i < totalItems && int32(i-c.menuScroll)*lineH < listH; i++ {
 		ey := listTop + int32(i-c.menuScroll)*lineH
 		ai := gs.AuctionItems[i]
 
-		if i%2 == 0 {
-			rl.DrawRectangle(menuXPos()+menuPad, ey, menuW-menuPad*2, lineH, colorRowBg1)
+		// Row background
+		bg := rowBg1
+		if i%2 == 1 { bg = rowBg2 }
+		isRowHover := mx >= leftX && mx < rightX && my >= ey && my < ey+lineH
+		if isRowHover { bg = hoverBg }
+		rl.DrawRectangle(leftX-2, ey, menuW-menuPad*2+4, lineH, bg)
+
+		// Item name (color by level)
+		nameClr := white
+		if ai.Item.LevelReq >= 45 {
+			nameClr = rl.Color{R: 255, G: 200, B: 50, A: 255} // epic gold
+		} else if ai.Item.LevelReq >= 30 {
+			nameClr = rl.Color{R: 100, G: 180, B: 255, A: 255} // rare blue
+		}
+		c.drawText(ai.Item.Name, nameCol, ey+2, 12, nameClr)
+
+		// Level
+		if ai.Item.LevelReq > 0 {
+			c.drawText(fmt.Sprintf("%d", ai.Item.LevelReq), lvlCol, ey+2, 11, dim)
 		}
 
-		// Item name
-		c.drawText(ai.Item.Name, nameCol, ey+2, 13, white)
-
 		// Seller
-		c.drawText(ai.Seller, sellerCol, ey+2, 12, dim)
+		c.drawText(ai.Seller, sellerCol, ey+2, 11, dim)
 
-		// Current bid
-		bidStr := fmt.Sprintf("%d", ai.CurrentBid)
-		c.drawText(bidStr, bidCol, ey+2, 12, gold)
+		// Bid (format with K suffix for readability)
+		c.drawText(formatTunar(ai.CurrentBid), bidCol, ey+2, 11, green)
 
 		// Buyout
 		if ai.BuyoutPrice > 0 {
-			buyStr := fmt.Sprintf("%d", ai.BuyoutPrice)
-			c.drawText(buyStr, buyoutCol, ey+2, 12, gold)
+			c.drawText(formatTunar(ai.BuyoutPrice), buyoutCol, ey+2, 11, gold)
 		} else {
-			c.drawText("-", buyoutCol, ey+2, 12, dim)
+			c.drawText("-", buyoutCol, ey+2, 11, dim)
 		}
 	}
+
+	// Scrollbar indicator
+	if totalItems > maxVisible && maxVisible > 0 {
+		scrollFrac := float32(c.menuScroll) / float32(totalItems-maxVisible)
+		barH := listH * int32(maxVisible) / int32(totalItems)
+		if barH < 10 { barH = 10 }
+		barY := listTop + int32(scrollFrac*float32(listH-barH))
+		rl.DrawRectangle(rightX-2, barY, 3, barH, rl.Color{R: 60, G: 60, B: 80, A: 200})
+	}
 }
+
+// formatTunar is defined below (shared with merchant/repair UI)
 
 // drawSubTabs renders a row of clickable subtab labels with underline on active.
 func (c *Client) drawSubTabs(labels []string, active int, y int32, onClick func(int)) {
