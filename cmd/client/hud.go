@@ -158,10 +158,6 @@ func (c *Client) drawInspectionWnd(ent *game.Entity, mousePos rl.Vector2) {
 				rl.Color{R: 100, G: 200, B: 200, A: 255}, infoFontSz,
 			})
 		}
-
-		// Con color hint
-		conClr, conLabel := conColor(ent.Level, gs.Player.Level)
-		lines = append(lines, inspLine{conLabel, conClr, infoFontSz})
 	}
 
 	// Compute dimensions

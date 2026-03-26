@@ -1962,8 +1962,8 @@ func (gs *GameState) handleClassicTargetInfo(msg *protocol.Message) {
 		}
 	}
 
-	log.Printf("ClassicTargetInfo: faceColor=%d conColor=%d guild=%q title=%q",
-		gs.TargetFaceColor, gs.TargetConColor, gs.TargetGuildName, gs.TargetTitle)
+	log.Printf("ClassicTargetInfo: dataLen=%d faceColor=%d conColor=%d guildFlag=%d guild=%q title=%q",
+		len(data), gs.TargetFaceColor, gs.TargetConColor, data[4], gs.TargetGuildName, gs.TargetTitle)
 }
 
 
