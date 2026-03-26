@@ -888,7 +888,7 @@ func (am *AnimationManager) ResolveEntityAnim(ent *game.Entity, now time.Time) (
 		class:              ent.Class,
 		level:              ent.Level,
 		isPC:               ent.IsPlayer,
-		weaponAttackType:   inferAttackType(ent.PrimaryWeapon, ent.SecondaryWeapon, ent.Shield),
+		weaponAttackType:   entityAttackType(ent),
 		showBattleStance:   true,
 		serverDrivenCombat: false,
 		castBarEnd:         ent.CastAnimEnd,
@@ -930,6 +930,16 @@ func (am *AnimationManager) animDur(modelID int32, animByte byte) time.Duration 
 		}
 	}
 	return dur
+}
+
+// entityAttackType returns the weapon AttackType for an entity.
+// Prefers state channel byte 91 (PrimaryAttackType) which the server populates
+// from the item database. Falls back to inferAttackType for entities without it.
+func entityAttackType(ent *game.Entity) int {
+	if ent.PrimaryAttackType > 0 {
+		return int(ent.PrimaryAttackType)
+	}
+	return inferAttackType(ent.PrimaryWeapon, ent.SecondaryWeapon, ent.Shield)
 }
 
 // inferAttackType determines attack type from visible equipment.

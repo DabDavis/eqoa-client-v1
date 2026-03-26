@@ -140,10 +140,12 @@ type Entity struct {
 	NamePlate byte   // offset 142: 0=own player, 1=show
 	Target    uint32 // offset 58-61: target ObjectID (0xFFFFFFFF = none)
 
-	// Equipment (state channel offsets 67-78, 93-98)
-	PrimaryWeapon   uint32 // offset 67-70 LE
-	SecondaryWeapon uint32 // offset 71-74 LE
-	Shield          uint32 // offset 75-78 LE
+	// Equipment (state channel offsets 67-78, 91-98)
+	PrimaryWeapon      uint32 // offset 67-70 LE
+	SecondaryWeapon    uint32 // offset 71-74 LE
+	Shield             uint32 // offset 75-78 LE
+	PrimaryAttackType  byte   // offset 91: VICSpriteAttackType (1=1HS,2=2HS,3=1HB,etc)
+	SecondaryAttackType byte  // offset 92: secondary weapon AttackType (0=none)
 	Chest                  byte   // offset 93
 	Bracer                 byte   // offset 94
 	Gloves                 byte   // offset 95
@@ -1987,6 +1989,12 @@ func (gs *GameState) decodePlayerState(data []byte) {
 		gs.Player.SecondaryWeapon = binary.LittleEndian.Uint32(data[71:75])
 		gs.Player.Shield = binary.LittleEndian.Uint32(data[75:79])
 	}
+	// Weapon AttackType from state channel byte 91/92 (same as char select byte 17/18).
+	// Only update from state channel if not already set from char select (which has full data).
+	if len(data) >= 93 && gs.Player.PrimaryAttackType == 0 {
+		gs.Player.PrimaryAttackType = data[91]
+		gs.Player.SecondaryAttackType = data[92]
+	}
 	if len(data) >= 99 {
 		gs.Player.Chest = data[93]
 		gs.Player.Bracer = data[94]
@@ -2254,6 +2262,13 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 		ent.PrimaryWeapon = binary.LittleEndian.Uint32(data[67:71])
 		ent.SecondaryWeapon = binary.LittleEndian.Uint32(data[71:75])
 		ent.Shield = binary.LittleEndian.Uint32(data[75:79])
+	}
+	// Weapon AttackType: offset 91 = primary, 92 = secondary
+	// VICSpriteAttackType used by SetAttackAction for animation pool selection.
+	// Confirmed: matches char select equipment block byte 17 exactly.
+	if len(data) >= 93 {
+		ent.PrimaryAttackType = data[91]
+		ent.SecondaryAttackType = data[92]
 	}
 	if len(data) >= 99 {
 		ent.Chest = data[93]
