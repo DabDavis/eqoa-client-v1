@@ -383,7 +383,7 @@ func (c *Client) drawCharacterSelect() {
 
 		// Highlight row
 		if selected {
-			rl.DrawRectangle(csListX-4, y-2, csListW+8, csListRowH, rl.Color{R: 50, G: 45, B: 70, A: 255})
+			rl.DrawRectangle(csListX-4, y-2, csListW+8, csListRowH, colorSelectBg)
 		}
 
 		// Character name (prominent)
@@ -571,7 +571,7 @@ func (c *Client) drawAppearanceEdit() {
 		selected := i == c.charCreate.selIdx
 		textColor := rl.Color{R: 200, G: 190, B: 140, A: 255}
 		if selected {
-			rl.DrawRectangle(csListX, by, csListW, rowH-2, rl.Color{R: 50, G: 45, B: 70, A: 255})
+			rl.DrawRectangle(csListX, by, csListW, rowH-2, colorSelectBg)
 			textColor = rl.Color{R: 255, G: 245, B: 180, A: 255}
 		}
 		arrowColor := colorHintGray
@@ -599,9 +599,7 @@ func (c *Client) drawAppearanceEdit() {
 	}
 	rl.DrawRectangle(applyX, applyY, applyW, applyH, applyBg)
 	rl.DrawRectangleLines(applyX, applyY, applyW, applyH, rl.Color{R: 100, G: 180, B: 100, A: 220})
-	applyLabel := "Apply"
-	applyLabelW := c.measureText(applyLabel, 16)
-	c.drawText(applyLabel, applyX+(applyW-applyLabelW)/2, applyY+7, 16, rl.Color{R: 200, G: 255, B: 200, A: 255})
+	c.drawTextInRect("Apply", applyX, applyY+7, applyW, 16, rl.Color{R: 200, G: 255, B: 200, A: 255})
 
 	c.drawText("Enter=Apply  ESC=Cancel", csListX, applyY+applyH+8, 10, colorHintGray)
 	c.drawText("A/D or RMB drag = Rotate", csListX, applyY+applyH+22, 10, colorHintGray)
@@ -658,13 +656,11 @@ func (c *Client) drawAppearanceButton() {
 	bg := rl.Color{R: 20, G: 20, B: 35, A: 230}
 	textColor := rl.Color{R: 200, G: 180, B: 100, A: 240}
 	if hover {
-		bg = rl.Color{R: 50, G: 45, B: 70, A: 245}
+		bg = colorSelectBg
 		textColor = rl.Color{R: 255, G: 230, B: 130, A: 255}
 	}
 	rl.DrawRectangleRounded(rl.Rectangle{X: float32(apX), Y: float32(apY), Width: float32(apW), Height: float32(apH)}, 0.3, 4, bg)
-	label := "Change Appearance"
-	labelW := c.measureText(label, 12)
-	c.drawText(label, apX+(apW-labelW)/2, apY+5, 12, textColor)
+	c.drawTextInRect("Change Appearance", apX, apY+5, apW, 12, textColor)
 }
 
 // drawCreateNewButton draws the "Create New" button on the char select screen.
@@ -678,15 +674,13 @@ func (c *Client) drawCreateNewButton(gold rl.Color) {
 	cnBorder := rl.Color{R: 60, G: 60, B: 80, A: 255}
 	cnTextColor := gold
 	if cnHover {
-		cnBg = rl.Color{R: 60, G: 55, B: 85, A: 255}
+		cnBg = colorBtnHoverDk
 		cnBorder = gold
 		cnTextColor = rl.Color{R: 255, G: 245, B: 180, A: 255}
 	}
 	rl.DrawRectangle(cnX-1, cnY-1, cnW+2, cnH+2, cnBorder)
 	rl.DrawRectangle(cnX, cnY, cnW, cnH, cnBg)
-	cnLabel := "Create New"
-	cnLabelW := c.measureText(cnLabel, 16)
-	c.drawText(cnLabel, cnX+(cnW-cnLabelW)/2, cnY+7, 16, cnTextColor)
+	c.drawTextInRect("Create New", cnX, cnY+7, cnW, 16, cnTextColor)
 }
 
 // drawEnterWorldButton draws the "Enter World" button at bottom of model viewport.
@@ -701,15 +695,13 @@ func (c *Client) drawEnterWorldButton() {
 	border := rl.Color{R: 60, G: 60, B: 80, A: 255}
 	textColor := gold
 	if hover {
-		bg = rl.Color{R: 60, G: 55, B: 85, A: 255}
+		bg = colorBtnHoverDk
 		border = gold
 		textColor = rl.Color{R: 255, G: 245, B: 180, A: 255}
 	}
 	rl.DrawRectangle(btnX-1, btnY-1, btnW+2, btnH+2, border)
 	rl.DrawRectangle(btnX, btnY, btnW, btnH, bg)
-	label := "Enter World"
-	labelW := c.measureText(label, 16)
-	c.drawText(label, btnX+(btnW-labelW)/2, btnY+7, 16, textColor)
+	c.drawTextInRect("Enter World", btnX, btnY+7, btnW, 16, textColor)
 }
 
 // drawDeleteButton draws the "Delete" button on the char select screen.
@@ -726,9 +718,7 @@ func (c *Client) drawDeleteButton() {
 		textColor = rl.Color{R: 255, G: 120, B: 120, A: 255}
 	}
 	rl.DrawRectangleRounded(rl.Rectangle{X: float32(dX), Y: float32(dY), Width: float32(dW), Height: float32(dH)}, 0.3, 4, bg)
-	label := "Delete"
-	labelW := c.measureText(label, 12)
-	c.drawText(label, dX+(dW-labelW)/2, dY+5, 12, textColor)
+	c.drawTextInRect("Delete", dX, dY+5, dW, 12, textColor)
 }
 
 // drawDeleteConfirm draws a confirmation dialog for character deletion.
@@ -751,13 +741,9 @@ func (c *Client) drawDeleteConfirm(charName string) {
 	line2 := charName
 	line3 := "Y = Confirm    N / ESC = Cancel"
 
-	l1W := c.measureText(line1, 18)
-	l2W := c.measureText(line2, 16)
-	l3W := c.measureText(line3, 13)
-
-	c.drawText(line1, dlgX+(dlgW-l1W)/2, dlgY+14, 18, rl.White)
-	c.drawText(line2, dlgX+(dlgW-l2W)/2, dlgY+38, 16, red)
-	c.drawText(line3, dlgX+(dlgW-l3W)/2, dlgY+72, 13, rl.LightGray)
+	c.drawTextInRect(line1, dlgX, dlgY+14, dlgW, 18, rl.White)
+	c.drawTextInRect(line2, dlgX, dlgY+38, dlgW, 16, red)
+	c.drawTextInRect(line3, dlgX, dlgY+72, dlgW, 13, rl.LightGray)
 }
 
 // drawCharSelectModel renders the 3D character model inside the given screen rect.

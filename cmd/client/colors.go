@@ -38,11 +38,14 @@ var (
 	colorTooltipBg  = rl.Color{R: 0, G: 0, B: 0, A: 210}     // tooltip background
 
 	// Button and row colors
-	colorBtnBg    = rl.Color{R: 40, G: 38, B: 55, A: 255}  // button background
-	colorBtnHover = rl.Color{R: 60, G: 55, B: 75, A: 255}  // button hover
-	colorRowBg1   = rl.Color{R: 30, G: 28, B: 42, A: 255}  // alternating row bg 1
-	colorRowBg2   = rl.Color{R: 36, G: 34, B: 48, A: 255}  // alternating row bg 2
-	colorRowHover = rl.Color{R: 50, G: 45, B: 65, A: 255}  // row hover highlight
+	colorBtnBg       = rl.Color{R: 40, G: 38, B: 55, A: 255}  // button background
+	colorBtnHover    = rl.Color{R: 60, G: 55, B: 75, A: 255}  // button hover
+	colorBtnHoverDk  = rl.Color{R: 60, G: 55, B: 85, A: 255}  // button hover dark (charsel/charcreate)
+	colorSelectBg    = rl.Color{R: 50, G: 45, B: 70, A: 255}  // selected item background
+	colorRadioSelBg  = rl.Color{R: 40, G: 35, B: 55, A: 255}  // radio button selected bg
+	colorRowBg1      = rl.Color{R: 30, G: 28, B: 42, A: 255}  // alternating row bg 1
+	colorRowBg2      = rl.Color{R: 36, G: 34, B: 48, A: 255}  // alternating row bg 2
+	colorRowHover    = rl.Color{R: 50, G: 45, B: 65, A: 255}  // row hover highlight
 
 	// Border and separator colors
 	colorBorder    = rl.Color{R: 160, G: 140, B: 80, A: 255}  // panel border
@@ -86,4 +89,21 @@ func (c *Client) drawPanelTextured(x, y, w, h int32, frame ui.UIFrameParam, fill
 func (c *Client) drawCenteredText(text string, y, fontSize int32, color rl.Color) {
 	w := c.measureText(text, fontSize)
 	c.drawText(text, (screenWidth-w)/2, y, fontSize, color)
+}
+
+// drawTextInRect measures and draws text centered within a rectangle (x, width).
+func (c *Client) drawTextInRect(text string, x, y, width, fontSize int32, color rl.Color) {
+	w := c.measureText(text, fontSize)
+	c.drawText(text, x+(width-w)/2, y, fontSize, color)
+}
+
+// drawScrollIndicator draws a vertical scroll thumb for a list.
+func drawScrollIndicator(x, trackTop int32, trackH float32, scroll, total, visible int, color rl.Color) {
+	if total <= visible {
+		return
+	}
+	scrollPct := float32(scroll) / float32(total-visible)
+	thumbH := float32(20)
+	thumbY := float32(trackTop) + scrollPct*(trackH-thumbH)
+	rl.DrawRectangle(x, int32(thumbY), 4, int32(thumbH), color)
 }

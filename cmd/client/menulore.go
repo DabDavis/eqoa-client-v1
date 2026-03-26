@@ -128,40 +128,20 @@ func (c *Client) drawMenuLore(startY, contentH int32) {
 	if c.loreCategory < 0 {
 		c.drawText("Choose a topic:", menuXPos()+menuPad, startY+4, 12, dimGold)
 
-		rowH := int32(28)
-		mx := rl.GetMouseX()
-		my := rl.GetMouseY()
+		bx := menuXPos() + menuPad
+		bw := menuW - menuPad*2
 		for i, cat := range loreCategories {
-			ry := startY + 24 + int32(i)*rowH
-			bx := menuXPos() + menuPad
-			bw := menuW - menuPad*2
-
-			hover := mx >= bx && mx < bx+bw && my >= ry && my < ry+rowH
-			if hover {
-				rl.DrawRectangle(bx, ry, bw, rowH-2, rl.Color{R: 50, G: 45, B: 70, A: 255})
-			}
-			if hover && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
+			ry := startY + 24 + int32(i)*28
+			if c.uiHoverRow(bx, ry, bw, 26, cat, 14) {
 				c.loreCategory = i
 				c.menuScroll = 0
 			}
-			c.drawText(cat, bx+8, ry+6, 14, gold)
 		}
 		return
 	}
 
 	// Back button
-	backX := menuXPos() + menuPad
-	backW := int32(60)
-	backH := int32(20)
-	mx := rl.GetMouseX()
-	my := rl.GetMouseY()
-	backHover := mx >= backX && mx < backX+backW && my >= startY && my < startY+backH
-	backColor := dimGold
-	if backHover {
-		backColor = gold
-	}
-	c.drawText("< Back", backX, startY+2, 12, backColor)
-	if backHover && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
+	if c.uiButton(menuXPos()+menuPad, startY+2, "< Back", 12) {
 		c.loreCategory = -1
 		c.menuScroll = 0
 		return
@@ -169,8 +149,7 @@ func (c *Client) drawMenuLore(startY, contentH int32) {
 
 	// Category title
 	catTitle := loreCategories[c.loreCategory]
-	titleW := c.measureText(catTitle, 14)
-	c.drawText(catTitle, menuXPos()+(menuW-titleW)/2, startY+2, 14, gold)
+	c.drawTextInRect(catTitle, menuXPos(), startY+2, menuW, 14, gold)
 
 	// Get entries for selected category
 	var entries []loreEntry

@@ -281,9 +281,7 @@ func (c *Client) drawLoginScreen() {
 	rl.DrawLine(loginCloseX()+pad, loginCloseY+loginCloseSz-pad, loginCloseX()+loginCloseSz-pad, loginCloseY+pad, closeColor)
 
 	// Server name
-	sub := "Sandstorm Server"
-	subW := c.measureText(sub, 16)
-	c.drawText(sub, (screenWidth-subW)/2, loginSubY(), 16, gold)
+	c.drawCenteredText("Sandstorm Server", loginSubY(), 16, gold)
 
 	// Username label + field
 	c.drawText("Username", loginFieldX(), loginUserLblY(), 16, rl.LightGray)
@@ -307,9 +305,7 @@ func (c *Client) drawLoginScreen() {
 
 	// Status message (errors only -- hint removed since we have a button now)
 	if c.loginError != "" {
-		statusY := loginBtnY() + loginBtnH + 10
-		errW := c.measureText(c.loginError, 14)
-		c.drawText(c.loginError, (screenWidth-errW)/2, statusY, 14, rl.Color{R: 220, G: 60, B: 60, A: 255})
+		c.drawCenteredText(c.loginError, loginBtnY()+loginBtnH+10, 14, rl.Color{R: 220, G: 60, B: 60, A: 255})
 	}
 }
 

@@ -916,6 +916,7 @@ func (c *Client) drawMenuInventory(startY, contentH int32) {
 	}
 
 drawList:
+	hoveredItem := -1
 	for i := c.menuScroll; i < len(items); i++ {
 		row := i - c.menuScroll
 		y := startY + int32(row)*menuRowH
@@ -928,13 +929,16 @@ drawList:
 		rowW := listW / 2 // left half for carrying/bank (right half = detail)
 		isHover := mx >= listLeftX && mx < listLeftX+rowW &&
 			my >= y && my < y+menuRowH
+		if isHover {
+			hoveredItem = i
+		}
 
 		bg := rowBg1
 		if row%2 == 1 {
 			bg = rowBg2
 		}
 		if isSelected {
-			bg = rl.Color{R: 50, G: 45, B: 70, A: 255}
+			bg = colorSelectBg
 		}
 		if isHover {
 			bg = colorRowHover
@@ -1001,6 +1005,12 @@ drawList:
 			min(c.menuScroll+maxVisible, len(items)), len(items))
 		iw := c.measureText(indicator, 11)
 		c.drawText(indicator, menuXPos()+menuW-menuPad-iw, bottomY, 11, dim)
+	}
+
+	// Item tooltip on hover (drawn last so it's on top)
+	if !c.itemContextOpen && hoveredItem >= 0 && hoveredItem < len(items) {
+		pi := game.ParsedItem(items[hoveredItem])
+		c.uiItemTooltip(&pi, mx, my)
 	}
 }
 
@@ -1089,6 +1099,7 @@ func (c *Client) drawEquippedGrid(items []ParsedItem, leftX, startY, areaW, area
 	}
 
 	// ── Draw grid cells ──
+	hoveredIdx := -1
 	for i := 0; i < n; i++ {
 		col := i % gridCols
 		row := i / gridCols
@@ -1098,6 +1109,9 @@ func (c *Client) drawEquippedGrid(items []ParsedItem, leftX, startY, areaW, area
 		item := items[i]
 		isSelected := i == c.equipGridSel
 		isHover := mx >= cx && mx < cx+cellW && my >= cy && my < cy+cellH
+		if isHover {
+			hoveredIdx = i
+		}
 
 		if isHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 			c.equipGridSel = i
@@ -1124,7 +1138,7 @@ func (c *Client) drawEquippedGrid(items []ParsedItem, leftX, startY, areaW, area
 		}
 		rl.DrawRectangle(cx, cy, cellW, cellH, bg)
 
-		borderClr := rl.Color{R: 50, G: 45, B: 70, A: 255}
+		borderClr := colorSelectBg
 		if isSelected {
 			borderClr = gold
 		}
@@ -1175,6 +1189,12 @@ func (c *Client) drawEquippedGrid(items []ParsedItem, leftX, startY, areaW, area
 
 	if c.itemContextOpen {
 		c.drawItemContextMenu()
+	}
+
+	// Item tooltip on hover (drawn last so it's on top)
+	if !c.itemContextOpen && hoveredIdx >= 0 && hoveredIdx < n {
+		pi := game.ParsedItem(items[hoveredIdx])
+		c.uiItemTooltip(&pi, mx, my)
 	}
 }
 
@@ -2273,80 +2293,45 @@ func (c *Client) auctionDoSearch(gs *game.GameState) {
 
 func (c *Client) drawMenuGuild(startY, contentH int32) {
 	gs := c.engine.State
-	gold := colorGold
-	white := rl.White
-	gray := rl.Color{R: 180, G: 180, B: 180, A: 255}
+	px := menuXPos() + menuPad
+	listW := menuW - menuPad*2
+	guildGreen := rl.Color{R: 0, G: 200, B: 100, A: 255}
 
-	// Sub-tab bar: Roster / Chat
-	y := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Roster", "Chat"}, &c.guildSubTab)
+	y := c.uiTabBar(px, startY, []string{"Roster", "Chat"}, &c.guildSubTab)
 
-	switch c.guildSubTab {
-	case 0: // Roster — show guild members from GuildInfo (0x0468)
-		c.drawText("Guild Roster", menuXPos()+menuPad, y, 14, gold)
-		y += 20
-
-		// Show guild chat messages that have guild member info
-		guildMembers := 0
-		for _, msg := range gs.ChatLog {
-			if msg.Channel == game.ChatGuild {
-				guildMembers++
-			}
-		}
-
-		if guildMembers == 0 {
-			c.drawText("No guild info received yet.", menuXPos()+menuPad, y, 12, gray)
-		} else {
-			for _, msg := range gs.ChatLog {
-				if msg.Channel == game.ChatGuild {
-					if y > startY+contentH-20 {
-						break
-					}
-					c.drawText(msg.Text, menuXPos()+menuPad, y, 12, white)
-					y += 16
-				}
-			}
-		}
-
-	case 1: // Chat — guild chat log
-		c.drawText("Guild Chat", menuXPos()+menuPad, y, 14, gold)
-		y += 20
-
-		count := 0
-		for _, msg := range gs.ChatLog {
-			if msg.Channel == game.ChatGuild {
-				count++
-			}
-		}
-		if count == 0 {
-			c.drawText("No guild messages.", menuXPos()+menuPad, y, 12, gray)
-		} else {
-			// Show last N messages that fit
-			maxRows := int(contentH-40) / 16
-			start := count - maxRows
-			if start < 0 {
-				start = 0
-			}
-			idx := 0
-			for _, msg := range gs.ChatLog {
-				if msg.Channel != game.ChatGuild {
-					continue
-				}
-				if idx < start {
-					idx++
-					continue
-				}
-				if y > startY+contentH-20 {
-					break
-				}
-				col := rl.Color{R: 0, G: 200, B: 100, A: 255} // guild green
-				c.drawText(msg.Text, menuXPos()+menuPad, y, 12, col)
-				y += 16
-				idx++
-			}
+	// Collect guild messages
+	var guildMsgs []game.ChatMessage
+	for _, msg := range gs.ChatLog {
+		if msg.Channel == game.ChatGuild {
+			guildMsgs = append(guildMsgs, msg)
 		}
 	}
 
-	_ = white
+	switch c.guildSubTab {
+	case 0: // Roster
+		c.uiLabel(px, y, "Guild Roster", 14, colorGold)
+		y += 20
+		if len(guildMsgs) == 0 {
+			c.uiLabel(px, y, "No guild info received yet.", 12, colorDim)
+		} else {
+			c.uiScrollList(px, y, listW, contentH-(y-startY)-4, len(guildMsgs), &c.menuScroll, 16,
+				func(i int, x, ey, w int32, hover bool) {
+					c.drawText(guildMsgs[i].Text, x+4, ey+1, 12, colorWhite)
+				})
+		}
+
+	case 1: // Chat
+		c.uiLabel(px, y, "Guild Chat", 14, colorGold)
+		y += 20
+		if len(guildMsgs) == 0 {
+			c.uiLabel(px, y, "No guild messages.", 12, colorDim)
+		} else {
+			c.uiScrollList(px, y, listW, contentH-(y-startY)-4, len(guildMsgs), &c.menuScroll, 16,
+				func(i int, x, ey, w int32, hover bool) {
+					c.drawText(guildMsgs[i].Text, x+4, ey+1, 12, guildGreen)
+				})
+		}
+	}
 }
 
 func (c *Client) drawMenuSettings(startY, contentH int32) {
@@ -2365,23 +2350,20 @@ func (c *Client) drawMenuSettings(startY, contentH int32) {
 
 	sliderX := rowX + 8
 	sliderW := rowW - 16
-	sliderH := int32(16)
 
 	switch c.settingsSubTab {
 	case 0: // Graphics
 		c.drawSettingsGraphics(y, rowX, rowW, mx, my, clicked, gold, dim)
 	case 1: // Camera
-		c.drawSettingsCamera(y, sliderX, sliderW, sliderH, mx, my, gold, dim)
+		c.drawSettingsCamera(y, sliderX, sliderW)
 	case 2: // Audio
-		c.drawSettingsAudio(y, sliderX, sliderW, sliderH, rowX, rowW, mx, my, clicked, gold, dim)
+		c.drawSettingsAudio(y, sliderX, sliderW)
 	}
 }
 
 func (c *Client) drawSettingsGraphics(y, rowX, rowW, mx, my int32, clicked bool, gold, dim rl.Color) {
-	white := colorWhite
-	hoverBg := colorRowHover
-	rowH := int32(20)
 	px := menuXPos() + menuPad
+	rowH := int32(20)
 
 	// Block clicks while display confirmation pending or input delay active.
 	if c.displayConfirmPending || c.menuInputDelay > 0 {
@@ -2394,146 +2376,56 @@ func (c *Client) drawSettingsGraphics(y, rowX, rowW, mx, my int32, clicked bool,
 	}
 
 	// --- UI Theme ---
-	c.drawText("UI Theme", px, y, 14, gold)
-	y += 18
-	themeLabels := []string{"Modern", "Classic"}
-	for i, label := range themeLabels {
-		bx := px + int32(i)*90
-		isCurrent := int(c.uiTheme) == i
-		isHover := mx >= bx && mx < bx+85 && my >= y && my < y+rowH
-		clr := dim
-		if isCurrent {
-			clr = gold
-			rl.DrawRectangle(bx, y, 85, rowH, rl.Color{R: 40, G: 35, B: 55, A: 255})
-		} else if isHover {
-			clr = white
-			rl.DrawRectangle(bx, y, 85, rowH, hoverBg)
-		}
-		c.drawText(label, bx+4, y+3, 13, clr)
-		if isHover && clicked {
-			c.uiTheme = uiStyle(i)
-		}
+	themeIdx := int(c.uiTheme)
+	if c.uiRadioGroup(px, y, "UI Theme", []string{"Modern", "Classic"}, &themeIdx) {
+		c.uiTheme = uiStyle(themeIdx)
 	}
-	y += rowH + 8
+	y += 18 + rowH + 8
 
 	// --- Window Mode ---
-	c.drawText("Window Mode", px, y, 14, gold)
-	y += 18
-	for i, label := range windowModeLabels {
-		bx := px + int32(i)*90
-		isCurrent := c.windowMode == i
-		isHover := mx >= bx && mx < bx+85 && my >= y && my < y+rowH
-		clr := dim
-		if isCurrent {
-			clr = gold
-		} else if isHover {
-			clr = white
-		}
-		if isCurrent {
-			rl.DrawRectangle(bx, y, 85, rowH, rl.Color{R: 40, G: 35, B: 55, A: 255})
-		}
-		c.drawText(label, bx+4, y+3, 12, clr)
-		if clicked && isHover && !isCurrent {
-			c.setWindowMode(i)
-		}
+	if c.uiRadioGroup(px, y, "Window Mode", windowModeLabels[:], &c.windowMode) {
+		c.setWindowMode(c.windowMode)
 	}
-	y += rowH + 12
+	y += 18 + rowH + 12
 
 	// --- Resolution ---
 	c.drawText("Resolution", px, y, 14, gold)
 	y += 18
 	for i, preset := range resolutionPresets {
 		ry := y + int32(i)*rowH
-		isHover := mx >= rowX && mx < rowX+rowW && my >= ry && my < ry+rowH
 		isCurrent := screenWidth == preset.W && screenHeight == preset.H
-
-		if isHover {
-			rl.DrawRectangle(rowX, ry, rowW, rowH, hoverBg)
-		}
-
-		clr := white
-		if isCurrent {
-			clr = gold
-		} else if isHover {
-			clr = colorGoldHover
-		}
 		label := preset.Label
 		if isCurrent {
 			label = "> " + label
 		}
-		c.drawText(label, rowX+8, ry+3, 12, clr)
-
-		if clicked && isHover && !isCurrent {
+		if c.uiHoverRowSelected(rowX, ry, rowW, rowH, label, 12, isCurrent) && !isCurrent {
 			c.applyResolution(preset.W, preset.H)
 		}
 	}
 	y += int32(len(resolutionPresets))*rowH + 12
 
 	// --- VSync ---
-	vsLabel := "VSync: OFF"
-	if c.vsyncOn {
-		vsLabel = "VSync: ON"
-	}
-	isHover := mx >= px && mx < px+120 && my >= y && my < y+rowH
-	clr := white
-	if isHover {
-		clr = gold
-	}
-	c.drawText(vsLabel, px, y+3, 13, clr)
-	if clicked && isHover {
-		c.vsyncOn = !c.vsyncOn
+	if c.uiCheckbox(px, y+3, "VSync", &c.vsyncOn) {
 		c.applyVSync()
 	}
 	y += rowH + 8
 
 	// --- FPS Cap ---
-	c.drawText("FPS Cap", px, y, 14, gold)
-	y += 18
-	for i, label := range fpsCapLabels {
-		bw := int32(48)
-		if label == "Unlimited" {
-			bw = 65
-		}
-		bx := px
-		for j := 0; j < i; j++ {
-			if fpsCapLabels[j] == "Unlimited" {
-				bx += 68
-			} else {
-				bx += 51
-			}
-		}
-		isCurrent := c.fpsCap == fpsCapValues[i]
-		isHover := mx >= bx && mx < bx+bw && my >= y && my < y+rowH
-		clr := dim
-		if isCurrent {
-			clr = gold
-		} else if isHover {
-			clr = white
-		}
-		if isCurrent {
-			rl.DrawRectangle(bx, y, bw, rowH, rl.Color{R: 40, G: 35, B: 55, A: 255})
-		}
-		c.drawText(label, bx+4, y+3, 12, clr)
-		if clicked && isHover && !isCurrent {
-			c.fpsCap = fpsCapValues[i]
-			c.applyFPSCap()
+	fpsIdx := -1
+	for i, v := range fpsCapValues {
+		if c.fpsCap == v {
+			fpsIdx = i
+			break
 		}
 	}
-	y += rowH + 12
+	if c.uiRadioGroup(px, y, "FPS Cap", fpsCapLabels[:], &fpsIdx) {
+		c.fpsCap = fpsCapValues[fpsIdx]
+		c.applyFPSCap()
+	}
+	y += 18 + rowH + 12
 
 	// --- FPS Counter ---
-	fpsLabel := "FPS Counter: OFF"
-	if c.showFPS {
-		fpsLabel = "FPS Counter: ON"
-	}
-	isHover = mx >= px && mx < px+140 && my >= y && my < y+rowH
-	clr = white
-	if isHover {
-		clr = gold
-	}
-	c.drawText(fpsLabel, px, y+3, 13, clr)
-	if clicked && isHover {
-		c.showFPS = !c.showFPS
+	if c.uiCheckbox(px, y+3, "FPS Counter", &c.showFPS) {
 		c.saveDisplaySettings()
 	}
 	y += rowH + 12
@@ -2545,107 +2437,25 @@ func (c *Client) drawSettingsGraphics(y, rowX, rowW, mx, my int32, clicked bool,
 		px, y, 11, dim)
 }
 
-func (c *Client) drawSettingsCamera(y, sliderX, sliderW, sliderH, mx, my int32, gold, dim rl.Color) {
-	white := colorWhite
-	hoverBg := colorRowHover
-	rowX := menuXPos() + menuPad
-	rowW := menuW - menuPad*2
-	rowH := int32(20)
-	clicked := rl.IsMouseButtonPressed(rl.MouseButtonLeft)
+func (c *Client) drawSettingsCamera(y, sliderX, sliderW int32) {
+	x := menuXPos() + menuPad
 
-	// --- Camera Sensitivity slider ---
-	c.drawText("Camera Sensitivity", menuXPos()+menuPad, y, 14, gold)
-	y += 20
+	c.uiSliderFloat(sliderX, y+16, sliderW, &c.camSensitivity, 0.1, 3.0, "Camera Sensitivity",
+		fmt.Sprintf("%.0f%%", c.camSensitivity*100))
+	y += 48
 
-	rl.DrawRectangle(sliderX, y, sliderW, sliderH, colorRowBg2)
-	// Sensitivity range: 0.1 to 3.0
-	sensFrac := (c.camSensitivity - 0.1) / (3.0 - 0.1)
-	if sensFrac < 0 {
-		sensFrac = 0
-	}
-	if sensFrac > 1 {
-		sensFrac = 1
-	}
-	rl.DrawRectangle(sliderX, y, int32(float32(sliderW)*sensFrac), sliderH, gold)
-
-	if rl.IsMouseButtonDown(rl.MouseButtonLeft) &&
-		mx >= sliderX && mx <= sliderX+sliderW &&
-		my >= y-4 && my <= y+sliderH+4 {
-		newFrac := float32(mx-sliderX) / float32(sliderW)
-		if newFrac < 0 {
-			newFrac = 0
-		}
-		if newFrac > 1 {
-			newFrac = 1
-		}
-		c.camSensitivity = 0.1 + newFrac*(3.0-0.1)
-	}
-
-	y += sliderH + 4
-	c.drawText(fmt.Sprintf("%.0f%%", c.camSensitivity*100), menuXPos()+menuPad, y, 12, dim)
-	y += 24
-
-	// --- Max Camera Zoom slider ---
-	c.drawText("Max Camera Zoom", menuXPos()+menuPad, y, 14, gold)
-	y += 20
-
-	rl.DrawRectangle(sliderX, y, sliderW, sliderH, colorRowBg2)
-	frac := (c.camMaxDist - 2) / (300 - 2)
-	if frac < 0 {
-		frac = 0
-	}
-	if frac > 1 {
-		frac = 1
-	}
-	rl.DrawRectangle(sliderX, y, int32(float32(sliderW)*frac), sliderH, gold)
-
-	if rl.IsMouseButtonDown(rl.MouseButtonLeft) &&
-		mx >= sliderX && mx <= sliderX+sliderW &&
-		my >= y-4 && my <= y+sliderH+4 {
-		newFrac := float32(mx-sliderX) / float32(sliderW)
-		if newFrac < 0 {
-			newFrac = 0
-		}
-		if newFrac > 1 {
-			newFrac = 1
-		}
-		c.camMaxDist = 2 + newFrac*(300-2)
+	if c.uiSliderFloat(sliderX, y+16, sliderW, &c.camMaxDist, 2, 300, "Max Camera Zoom",
+		fmt.Sprintf("%.0f units", c.camMaxDist)) {
 		if c.camDist > c.camMaxDist {
 			c.camDist = c.camMaxDist
 		}
 	}
+	y += 48
 
-	y += sliderH + 4
-	c.drawText(fmt.Sprintf("%.0f units (max 300)", c.camMaxDist), menuXPos()+menuPad, y, 12, dim)
-	y += 24
+	c.uiCheckbox(x, y, "Invert Pitch", &c.invertPitch)
+	y += 28
 
-	// --- Invert Pitch toggle ---
-	invertLabel := "Invert Pitch: OFF"
-	if c.invertPitch {
-		invertLabel = "Invert Pitch: ON"
-	}
-	invertHover := mx >= rowX && mx < rowX+rowW && my >= y && my < y+rowH
-	invertClr := white
-	if invertHover {
-		invertClr = colorGoldHover
-		rl.DrawRectangle(rowX, y, rowW, rowH, hoverBg)
-	}
-	c.drawText(invertLabel, rowX+8, y+3, 13, invertClr)
-	if clicked && invertHover {
-		c.invertPitch = !c.invertPitch
-	}
-	y += rowH + 4
-
-	// --- Reset to Defaults button ---
-	resetLabel := "[Reset to Defaults]"
-	resetHover := mx >= rowX && mx < rowX+rowW && my >= y && my < y+rowH
-	resetClr := white
-	if resetHover {
-		resetClr = colorGoldHover
-		rl.DrawRectangle(rowX, y, rowW, rowH, hoverBg)
-	}
-	c.drawText(resetLabel, rowX+8, y+3, 13, resetClr)
-	if clicked && resetHover {
+	if c.uiButton(x, y, "Reset to Defaults", 13) {
 		c.camSensitivity = 1.0
 		c.camMaxDist = 8
 		c.invertPitch = false
@@ -2663,47 +2473,35 @@ func (c *Client) drawSettingsCamera(y, sliderX, sliderW, sliderH, mx, my int32, 
 	}
 }
 
-func (c *Client) drawSettingsAudio(y, sliderX, sliderW, sliderH, rowX, rowW, mx, my int32, clicked bool, gold, dim rl.Color) {
-	white := colorWhite
-	hoverBg := colorRowHover
-	rowH := int32(20)
+func (c *Client) drawSettingsAudio(y, sliderX, sliderW int32) {
+	x := menuXPos() + menuPad
 
-	// Master Volume
-	y = c.drawVolumeSlider("Master Volume", sliderX, sliderW, sliderH, y, mx, my, gold, dim,
-		c.masterVolume, func(f float32) { c.masterVolume = f; rl.SetMasterVolume(f) })
-
-	// SFX Volume
-	y = c.drawVolumeSlider("Sound Effects", sliderX, sliderW, sliderH, y, mx, my, gold, dim,
-		c.sfxVolume, func(f float32) {
-			c.sfxVolume = f
-			if c.audioSys != nil {
-				c.audioSys.SetSFXVolume(f)
-			}
-		})
-
-	// BGM Volume
-	y = c.drawVolumeSlider("Background Music", sliderX, sliderW, sliderH, y, mx, my, gold, dim,
-		c.bgmVolume, func(f float32) {
-			c.bgmVolume = f
-			if c.audioSys != nil {
-				c.audioSys.SetBGMVolume(f)
-			}
-		})
-
-	// Mute All toggle
-	muteLabel := "[ ] Mute All"
-	if c.masterVolume == 0 {
-		muteLabel = "[X] Mute All"
+	if c.uiSliderFloat(sliderX, y+16, sliderW, &c.masterVolume, 0, 1, "Master Volume",
+		fmt.Sprintf("%.0f%%", c.masterVolume*100)) {
+		rl.SetMasterVolume(c.masterVolume)
 	}
-	muteHover := mx >= rowX && mx < rowX+rowW && my >= y && my < y+rowH
-	muteClr := white
-	if muteHover {
-		muteClr = colorGoldHover
-		rl.DrawRectangle(rowX, y, rowW, rowH, hoverBg)
+	y += 48
+
+	if c.uiSliderFloat(sliderX, y+16, sliderW, &c.sfxVolume, 0, 1, "Sound Effects",
+		fmt.Sprintf("%.0f%%", c.sfxVolume*100)) {
+		if c.audioSys != nil {
+			c.audioSys.SetSFXVolume(c.sfxVolume)
+		}
 	}
-	c.drawText(muteLabel, rowX+8, y+3, 13, muteClr)
-	if clicked && muteHover {
-		if c.masterVolume > 0 {
+	y += 48
+
+	if c.uiSliderFloat(sliderX, y+16, sliderW, &c.bgmVolume, 0, 1, "Background Music",
+		fmt.Sprintf("%.0f%%", c.bgmVolume*100)) {
+		if c.audioSys != nil {
+			c.audioSys.SetBGMVolume(c.bgmVolume)
+		}
+	}
+	y += 48
+
+	// Mute All — uses checkbox appearance but toggles master volume
+	muted := c.masterVolume == 0
+	if c.uiCheckbox(x, y, "Mute All", &muted) {
+		if muted {
 			c.prevMasterVolume = c.masterVolume
 			c.masterVolume = 0
 			rl.SetMasterVolume(0)
@@ -2716,7 +2514,6 @@ func (c *Client) drawSettingsAudio(y, sliderX, sliderW, sliderH, rowX, rowW, mx,
 		}
 	}
 
-	// Save audio settings on mouse release
 	if rl.IsMouseButtonReleased(rl.MouseButtonLeft) {
 		cfg := loadLoginConfig()
 		cfg.MasterVolume = c.masterVolume
@@ -2724,30 +2521,6 @@ func (c *Client) drawSettingsAudio(y, sliderX, sliderW, sliderH, rowX, rowW, mx,
 		cfg.BGMVolume = c.bgmVolume
 		saveLoginConfig(cfg)
 	}
-}
-
-// drawVolumeSlider draws a labeled volume slider and returns the next Y position.
-func (c *Client) drawVolumeSlider(label string, sliderX, sliderW, sliderH, y, mx, my int32, gold, dim rl.Color, value float32, setter func(float32)) int32 {
-	c.drawText(label, sliderX, y, 12, dim)
-	y += 14
-	rl.DrawRectangle(sliderX, y, sliderW, sliderH, colorRowBg2)
-	rl.DrawRectangle(sliderX, y, int32(float32(sliderW)*value), sliderH, gold)
-	if rl.IsMouseButtonDown(rl.MouseButtonLeft) &&
-		mx >= sliderX && mx <= sliderX+sliderW &&
-		my >= y-4 && my <= y+sliderH+4 {
-		f := float32(mx-sliderX) / float32(sliderW)
-		if f < 0 {
-			f = 0
-		}
-		if f > 1 {
-			f = 1
-		}
-		setter(f)
-	}
-	y += sliderH + 2
-	c.drawText(fmt.Sprintf("%.0f%%", value*100), sliderX, y, 12, dim)
-	y += 18
-	return y
 }
 
 // applyResolution changes the window size.
@@ -3690,6 +3463,7 @@ func (c *Client) drawMerchantWindow() {
 		c.drawText("No items available", px+merchPad+4, y+4, 13, colorDim)
 	}
 
+	merchHovered := -1
 	for i := c.merchantScroll; i < len(gs.MerchantItems); i++ {
 		row := i - c.merchantScroll
 		ry := listTop + int32(row)*merchRowH
@@ -3700,6 +3474,9 @@ func (c *Client) drawMerchantWindow() {
 		rowX := px + merchPad
 		rowW := merchW - merchPad*2
 		isHover := mx >= rowX && mx < rowX+rowW && my >= ry && my < ry+merchRowH
+		if isHover {
+			merchHovered = i
+		}
 		isSelected := gs.MerchantSelected == i
 
 		// Row background
@@ -3708,7 +3485,7 @@ func (c *Client) drawMerchantWindow() {
 			bg = colorRowBg2
 		}
 		if isSelected {
-			bg = rl.Color{R: 50, G: 45, B: 70, A: 255}
+			bg = colorSelectBg
 		}
 		if isHover {
 			bg = colorRowHover
@@ -3816,6 +3593,11 @@ func (c *Client) drawMerchantWindow() {
 			len(gs.MerchantItems))
 		siw := c.measureText(scrollInfo, 11)
 		c.drawText(scrollInfo, px+(merchW-siw)/2, py+merchH-14, 11, colorDim)
+	}
+
+	// Item tooltip on hover
+	if merchHovered >= 0 && merchHovered < len(gs.MerchantItems) {
+		c.uiItemTooltip(&gs.MerchantItems[merchHovered], mx, my)
 	}
 }
 
@@ -4243,6 +4025,7 @@ func (c *Client) drawBlacksmithWindow() {
 		c.drawText("All items in good condition", px+pad+4, y+4, 14, colorDim)
 	}
 
+	bsHovered := -1
 	for i := c.blacksmithScroll; i < len(items); i++ {
 		row := i - c.blacksmithScroll
 		ry := listTop + int32(row)*rowH
@@ -4255,13 +4038,16 @@ func (c *Client) drawBlacksmithWindow() {
 		rowX := px + pad
 		rowW := panelW - pad*2
 		isHover := mx >= rowX && mx < rowX+rowW && my >= ry && my < ry+rowH
+		if isHover {
+			bsHovered = i
+		}
 
 		bg := colorRowBg1
 		if row%2 == 1 {
 			bg = colorRowBg2
 		}
 		if isSelected {
-			bg = rl.Color{R: 50, G: 45, B: 70, A: 255}
+			bg = colorSelectBg
 		}
 		if isHover {
 			bg = colorRowHover
@@ -4335,6 +4121,12 @@ func (c *Client) drawBlacksmithWindow() {
 		c.engine.SendCloseBlacksmith()
 		c.blacksmithScroll = 0
 		c.blacksmithSel = -1
+	}
+
+	// Item tooltip on hover
+	if bsHovered >= 0 && bsHovered < len(items) {
+		pi := game.ParsedItem(items[bsHovered])
+		c.uiItemTooltip(&pi, mx, my)
 	}
 }
 

@@ -215,6 +215,51 @@ func (c *Client) uiSliderInt(x, y, w int32, val *int, min, max int) bool {
 	return changed
 }
 
+// uiSliderFloat draws a horizontal slider for a float32 value. Returns true if changed.
+// uiSliderFloat draws a labeled float slider. displayVal is shown to the right of the slider.
+func (c *Client) uiSliderFloat(x, y, w int32, val *float32, min, max float32, label, displayVal string) bool {
+	h := int32(16)
+	mx, my := rl.GetMouseX(), rl.GetMouseY()
+	changed := false
+
+	// Label
+	c.drawText(label, x, y-16, 14, colorGold)
+
+	// Track
+	trackY := y + h/2 - 2
+	rl.DrawRectangle(x, trackY, w, 4, rl.Color{R: 30, G: 30, B: 50, A: 255})
+
+	// Fill
+	frac := (*val - min) / (max - min)
+	if frac < 0 { frac = 0 }
+	if frac > 1 { frac = 1 }
+	rl.DrawRectangle(x, trackY, int32(frac*float32(w)), 4, colorGold)
+
+	// Thumb
+	thumbX := x + int32(frac*float32(w-8))
+	thumbColor := colorDim
+	hover := mx >= x && mx < x+w && my >= y && my < y+h
+	if hover { thumbColor = colorGold }
+	rl.DrawRectangle(thumbX, y, 8, h, thumbColor)
+
+	// Drag
+	if hover && rl.IsMouseButtonDown(rl.MouseButtonLeft) {
+		newFrac := float32(mx-x) / float32(w)
+		if newFrac < 0 { newFrac = 0 }
+		if newFrac > 1 { newFrac = 1 }
+		newVal := min + newFrac*(max-min)
+		if newVal != *val {
+			*val = newVal
+			changed = true
+		}
+	}
+
+	// Value label
+	c.drawText(displayVal, x+w+4, y+1, 11, colorWhite)
+
+	return changed
+}
+
 // --- Scroll List ---
 
 // ScrollListRow is a callback to draw one row of a scroll list.
@@ -757,4 +802,90 @@ func (c *Client) uiItemTooltip(item *game.ParsedItem, screenX, screenY int32) {
 			textOffsetX = 0
 		}
 	}
+}
+
+// --- Radio Group ---
+
+// uiRadioGroup draws a horizontal row of labeled options. Returns true if selection changed.
+// selected is a pointer to the current index (0-based). Labels are drawn side-by-side.
+func (c *Client) uiRadioGroup(x, y int32, label string, labels []string, selected *int) bool {
+	mx, my := rl.GetMouseX(), rl.GetMouseY()
+	clicked := rl.IsMouseButtonPressed(rl.MouseButtonLeft)
+	changed := false
+
+	// Section label
+	if label != "" {
+		c.drawText(label, x, y, 14, colorGold)
+		y += 18
+	}
+
+	btnH := int32(20)
+	bx := x
+	for i, lbl := range labels {
+		btnW := c.measureText(lbl, 12) + 12
+		isCurrent := *selected == i
+		hover := mx >= bx && mx < bx+btnW && my >= y && my < y+btnH
+
+		if isCurrent {
+			rl.DrawRectangle(bx, y, btnW, btnH, colorRadioSelBg)
+			c.drawText(lbl, bx+6, y+3, 12, colorGold)
+		} else if hover {
+			rl.DrawRectangle(bx, y, btnW, btnH, colorRowHover)
+			c.drawText(lbl, bx+6, y+3, 12, colorWhite)
+		} else {
+			c.drawText(lbl, bx+6, y+3, 12, colorDim)
+		}
+
+		if hover && clicked && !isCurrent {
+			*selected = i
+			changed = true
+		}
+		bx += btnW + 4
+	}
+
+	return changed
+}
+
+// uiRadioGroupY is like uiRadioGroup but returns the Y position after the widget
+// for easy vertical stacking. The changed bool is returned via pointer.
+func (c *Client) uiRadioGroupY(x, y int32, label string, labels []string, selected *int) int32 {
+	c.uiRadioGroup(x, y, label, labels, selected)
+	h := int32(20)
+	if label != "" {
+		h += 18
+	}
+	return y + h + 8
+}
+
+// --- Hover Row ---
+
+// uiHoverRow draws a clickable text row with hover highlight. Returns true if clicked.
+func (c *Client) uiHoverRow(x, y, w, h int32, text string, fontSize int32) bool {
+	mx, my := rl.GetMouseX(), rl.GetMouseY()
+	hover := mx >= x && mx < x+w && my >= y && my < y+h
+	clr := colorWhite
+	if hover {
+		rl.DrawRectangle(x, y, w, h, colorRowHover)
+		clr = colorGoldHover
+	}
+	c.drawText(text, x+8, y+(h-fontSize)/2, fontSize, clr)
+	return hover && rl.IsMouseButtonPressed(rl.MouseButtonLeft)
+}
+
+// uiHoverRowSelected is like uiHoverRow but highlights if selected.
+func (c *Client) uiHoverRowSelected(x, y, w, h int32, text string, fontSize int32, selected bool) bool {
+	mx, my := rl.GetMouseX(), rl.GetMouseY()
+	hover := mx >= x && mx < x+w && my >= y && my < y+h
+	clr := colorWhite
+	if selected {
+		clr = colorGold
+	}
+	if hover {
+		rl.DrawRectangle(x, y, w, h, colorRowHover)
+		if !selected {
+			clr = colorGoldHover
+		}
+	}
+	c.drawText(text, x+8, y+(h-fontSize)/2, fontSize, clr)
+	return hover && rl.IsMouseButtonPressed(rl.MouseButtonLeft)
 }

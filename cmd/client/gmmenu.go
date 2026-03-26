@@ -1052,9 +1052,7 @@ func (c *Client) drawGMMenu() {
 
 	// Title with category breadcrumb
 	title := gmCategoryName(c.gmCategory) + "  (F11)"
-	titleW := c.measureText(title, 16)
-	c.drawText(title, int32(menuX)+(int32(menuW)-titleW)/2, int32(menuY)+6, 16,
-		colorGoldBright)
+	c.drawTextInRect(title, int32(menuX), int32(menuY)+6, int32(menuW), 16, colorGoldBright)
 
 	// Current position
 	p := c.engine.State.Player
@@ -1398,15 +1396,9 @@ func (c *Client) drawGMZoneList(menuX, menuY, menuW, menuH float32, sepY int32) 
 	}
 
 	// Scroll indicator
-	if len(proxies.Zones) > maxVisible {
-		total := len(proxies.Zones)
-		scrollPct := float32(c.gmMenuScroll) / float32(total-maxVisible)
-		trackH := menuH - float32(listY-int32(menuY)) - 10
-		thumbH := float32(20)
-		thumbY := float32(listY) + scrollPct*(trackH-thumbH)
-		rl.DrawRectangle(int32(menuX+menuW)-6, int32(thumbY), 4, int32(thumbH),
-			colorGmFaint)
-	}
+	drawScrollIndicator(int32(menuX+menuW)-6, listY,
+		menuH-float32(listY-int32(menuY))-10,
+		c.gmMenuScroll, len(proxies.Zones), maxVisible, colorGmFaint)
 }
 
 // drawGMBookmarkList draws the saved teleport locations.
@@ -1471,15 +1463,9 @@ func (c *Client) drawGMBookmarkList(menuX, menuY, menuW, menuH float32, sepY int
 	}
 
 	// Scroll indicator
-	if len(gmSavedLocations) > maxVisible {
-		total := len(gmSavedLocations)
-		scrollPct := float32(c.gmMenuScroll) / float32(total-maxVisible)
-		trackH := menuH - float32(listY-int32(menuY)) - 10
-		thumbH := float32(20)
-		thumbY := float32(listY) + scrollPct*(trackH-thumbH)
-		rl.DrawRectangle(int32(menuX+menuW)-6, int32(thumbY), 4, int32(thumbH),
-			colorGmFaint)
-	}
+	drawScrollIndicator(int32(menuX+menuW)-6, listY,
+		menuH-float32(listY-int32(menuY))-10,
+		c.gmMenuScroll, len(gmSavedLocations), maxVisible, colorGmFaint)
 }
 
 // handleGMWorldMapList handles the world map zone list sub-view.
@@ -1560,15 +1546,9 @@ func (c *Client) drawGMWorldMapList(menuX, menuY, menuW, menuH float32, sepY int
 	}
 
 	// Scroll indicator
-	if len(gmWorldMapZones) > maxVisible {
-		total := len(gmWorldMapZones)
-		scrollPct := float32(c.gmMenuScroll) / float32(total-maxVisible)
-		trackH := menuH - float32(listY-int32(menuY)) - 10
-		thumbH := float32(20)
-		thumbY := float32(listY) + scrollPct*(trackH-thumbH)
-		rl.DrawRectangle(int32(menuX+menuW)-6, int32(thumbY), 4, int32(thumbH),
-			colorGmFaint)
-	}
+	drawScrollIndicator(int32(menuX+menuW)-6, listY,
+		menuH-float32(listY-int32(menuY))-10,
+		c.gmMenuScroll, len(gmWorldMapZones), maxVisible, colorGmFaint)
 }
 
 // drawGMEntityList draws the nearby entity list for Goto Player/Entity.
@@ -1646,15 +1626,9 @@ func (c *Client) drawGMEntityList(menuX, menuY, menuW, menuH float32, sepY int32
 	}
 
 	// Scroll indicator
-	if len(entities) > maxVisible {
-		total := len(entities)
-		scrollPct := float32(c.gmMenuScroll) / float32(total-maxVisible)
-		trackH := menuH - float32(listY-int32(menuY)) - 10
-		thumbH := float32(20)
-		thumbY := float32(listY) + scrollPct*(trackH-thumbH)
-		rl.DrawRectangle(int32(menuX+menuW)-6, int32(thumbY), 4, int32(thumbH),
-			colorGmFaint)
-	}
+	drawScrollIndicator(int32(menuX+menuW)-6, listY,
+		menuH-float32(listY-int32(menuY))-10,
+		c.gmMenuScroll, len(entities), maxVisible, colorGmFaint)
 }
 
 // drawGMDisplayPos renders the persistent position HUD when enabled.

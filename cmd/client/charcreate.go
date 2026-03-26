@@ -637,14 +637,11 @@ func (c *Client) drawCharCreate() {
 	if c.charCreate.step < len(stepNames) {
 		title = stepNames[c.charCreate.step]
 	}
-	titleW := c.measureText(title, 18)
-	c.drawText(title, csListX+(csListW-titleW)/2, panelY+8, 18, gold)
+	c.drawTextInRect(title, csListX, panelY+8, csListW, 18, gold)
 
 	// Step indicator — above Back/Next buttons
 	_, btnY, _, _ := c.ccBackBtnRect()
-	stepText := fmt.Sprintf("Step %d of 5", c.charCreate.step+1)
-	stepW := c.measureText(stepText, 10)
-	c.drawText(stepText, csListX+(csListW-stepW)/2, btnY-16, 10, dimGold)
+	c.drawTextInRect(fmt.Sprintf("Step %d of 5", c.charCreate.step+1), csListX, btnY-16, csListW, 10, dimGold)
 
 	// Dispatch to step-specific drawing
 	switch c.charCreate.step {
@@ -663,62 +660,18 @@ func (c *Client) drawCharCreate() {
 	// City toggle for Humans (step 0) — drawn below model viewport
 	if c.charCreate.step == 0 && c.charCreate.selIdx == 0 {
 		modelX := csModelPanelX
-		modelW := screenWidth - modelX - 15
 		modelBottom := panelY + panelH
 
-		cityBtnW := (modelW - 20) / 2
-		cityBtnH := int32(28)
-		cityY := modelBottom - cityBtnH - 8
-		eastX := modelX + 5
-		westX := eastX + cityBtnW + 10
+		cityY := modelBottom - 28 - 8
 
-		ht := c.charCreate.humType
-		if ht == 0 {
-			ht = 1
+		// Map humType (1=East, 2=West) to 0-indexed radio
+		cityIdx := c.charCreate.humType - 1
+		if cityIdx < 0 {
+			cityIdx = 0
 		}
-
-		eastBg := colorGmBtnBg
-		westBg := colorGmBtnBg
-		eastText := dimGold
-		westText := dimGold
-		if ht == 1 {
-			eastBg = rl.Color{R: 60, G: 55, B: 85, A: 255}
-			eastText = gold
-		} else {
-			westBg = rl.Color{R: 60, G: 55, B: 85, A: 255}
-			westText = gold
-		}
-
-		// Label
-		labelW := c.measureText("Starting City", 11)
-		c.drawText("Starting City", modelX+(modelW-labelW)/2, cityY-14, 11, dimGold)
-
-		rl.DrawRectangle(eastX-1, cityY-1, cityBtnW+2, cityBtnH+2, rl.Color{R: 60, G: 60, B: 80, A: 200})
-		rl.DrawRectangle(eastX, cityY, cityBtnW, cityBtnH, eastBg)
-		eW := c.measureText("Freeport", 14)
-		c.drawText("Freeport", eastX+(cityBtnW-eW)/2, cityY+6, 14, eastText)
-
-		rl.DrawRectangle(westX-1, cityY-1, cityBtnW+2, cityBtnH+2, rl.Color{R: 60, G: 60, B: 80, A: 200})
-		rl.DrawRectangle(westX, cityY, cityBtnW, cityBtnH, westBg)
-		wW := c.measureText("Qeynos", 14)
-		c.drawText("Qeynos", westX+(cityBtnW-wW)/2, cityY+6, 14, westText)
-
-		// Click handling
-		mx := int32(rl.GetMouseX())
-		my := int32(rl.GetMouseY())
-		if rl.IsMouseButtonPressed(rl.MouseLeftButton) {
-			if mx >= eastX && mx <= eastX+cityBtnW && my >= cityY && my <= cityY+cityBtnH {
-				if c.charCreate.humType != 1 {
-					c.charCreate.humType = 1
-					c.playCharSelectBGM(0)
-				}
-			}
-			if mx >= westX && mx <= westX+cityBtnW && my >= cityY && my <= cityY+cityBtnH {
-				if c.charCreate.humType != 2 {
-					c.charCreate.humType = 2
-					c.playCharSelectBGM(0)
-				}
-			}
+		if c.uiRadioGroup(modelX+5, cityY, "Starting City", []string{"Freeport", "Qeynos"}, &cityIdx) {
+			c.charCreate.humType = cityIdx + 1
+			c.playCharSelectBGM(0)
 		}
 	}
 
@@ -769,7 +722,7 @@ func (c *Client) drawWizardBtn(x, y, w, h int32, label string, enabled, hover bo
 	border := rl.Color{R: 60, G: 60, B: 80, A: 255}
 	textColor := rl.Color{R: 160, G: 150, B: 120, A: 255}
 	if hover {
-		bg = rl.Color{R: 60, G: 55, B: 85, A: 255}
+		bg = colorBtnHoverDk
 		border = gold
 		textColor = rl.Color{R: 255, G: 245, B: 180, A: 255}
 	} else if enabled {
@@ -777,40 +730,14 @@ func (c *Client) drawWizardBtn(x, y, w, h int32, label string, enabled, hover bo
 	}
 	rl.DrawRectangle(x-1, y-1, w+2, h+2, border)
 	rl.DrawRectangle(x, y, w, h, bg)
-	lw := c.measureText(label, 16)
-	c.drawText(label, x+(w-lw)/2, y+7, 16, textColor)
+	c.drawTextInRect(label, x, y+7, w, 16, textColor)
 }
 
 // drawCharCreateRace draws step 0: race grid + gender toggle + city toggle for Human.
 func (c *Client) drawCharCreateRace() {
-	gold := colorGoldWarm
-	dimGold := rl.Color{R: 140, G: 120, B: 80, A: 255}
-
 	// Gender toggle
 	genderY := int32(86)
-	maleX := csListX
-	femaleX := csListX + 70
-	btnW := int32(60)
-	btnH := int32(22)
-
-	maleBg := colorGmBtnBg
-	femaleBg := colorGmBtnBg
-	maleText := dimGold
-	femaleText := dimGold
-	if c.charCreate.gender == 0 {
-		maleBg = rl.Color{R: 60, G: 55, B: 85, A: 255}
-		maleText = gold
-	} else {
-		femaleBg = rl.Color{R: 60, G: 55, B: 85, A: 255}
-		femaleText = gold
-	}
-	rl.DrawRectangle(maleX, genderY, btnW, btnH, maleBg)
-	rl.DrawRectangle(femaleX, genderY, btnW, btnH, femaleBg)
-	mW := c.measureText("Male", 12)
-	c.drawText("Male", maleX+(btnW-mW)/2, genderY+5, 12, maleText)
-	fW := c.measureText("Female", 12)
-	c.drawText("Female", femaleX+(btnW-fW)/2, genderY+5, 12, femaleText)
-
+	c.uiRadioGroup(csListX, genderY, "", []string{"Male", "Female"}, &c.charCreate.gender)
 	tabHint := c.measureText("TAB=Gender", 10)
 	c.drawText("TAB=Gender", csListX+csListW-tabHint, genderY+6, 10, colorHintGray)
 
@@ -829,7 +756,7 @@ func (c *Client) drawCharCreateRace() {
 		selected := i == c.charCreate.selIdx
 		textColor := rl.Color{R: 200, G: 190, B: 140, A: 255}
 		if selected {
-			rl.DrawRectangle(bx, by, colW-2, rowH-2, rl.Color{R: 50, G: 45, B: 70, A: 255})
+			rl.DrawRectangle(bx, by, colW-2, rowH-2, colorSelectBg)
 			textColor = rl.Color{R: 255, G: 245, B: 180, A: 255}
 		}
 		c.drawText(name, bx+4, by+5, 14, textColor)
@@ -879,7 +806,7 @@ func (c *Client) drawCharCreateClass() {
 		selected := i == c.charCreate.selIdx
 		textColor := rl.Color{R: 200, G: 190, B: 140, A: 255}
 		if selected {
-			rl.DrawRectangle(bx, by, colW-2, rowH-2, rl.Color{R: 50, G: 45, B: 70, A: 255})
+			rl.DrawRectangle(bx, by, colW-2, rowH-2, colorSelectBg)
 			textColor = rl.Color{R: 255, G: 245, B: 180, A: 255}
 		}
 		c.drawText(name, bx+4, by+5, 14, textColor)
@@ -914,7 +841,7 @@ func (c *Client) drawCharCreateAppearance() {
 		selected := i == c.charCreate.selIdx
 		textColor := rl.Color{R: 200, G: 190, B: 140, A: 255}
 		if selected {
-			rl.DrawRectangle(csListX, by, csListW, rowH-2, rl.Color{R: 50, G: 45, B: 70, A: 255})
+			rl.DrawRectangle(csListX, by, csListW, rowH-2, colorSelectBg)
 			textColor = rl.Color{R: 255, G: 245, B: 180, A: 255}
 		}
 		arrowColor := colorHintGray
@@ -940,7 +867,7 @@ func (c *Client) drawCharCreateStats() {
 		selected := i == c.charCreate.selIdx
 		textColor := rl.Color{R: 200, G: 190, B: 140, A: 255}
 		if selected {
-			rl.DrawRectangle(csListX, by, csListW, rowH-2, rl.Color{R: 50, G: 45, B: 70, A: 255})
+			rl.DrawRectangle(csListX, by, csListW, rowH-2, colorSelectBg)
 			textColor = rl.Color{R: 255, G: 245, B: 180, A: 255}
 		}
 

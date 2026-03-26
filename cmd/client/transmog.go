@@ -249,8 +249,7 @@ func (c *Client) drawTransmogPanel(x, y, w, h int32, mx, my int32) {
 
 	// Title
 	titleColor := rl.Color{R: 220, G: 200, B: 120, A: 240}
-	titleW := c.measureText("Transmog", 14)
-	c.drawText("Transmog", x+(w-titleW)/2, y+2, 14, titleColor)
+	c.drawTextInRect("Transmog", x, y+2, w, 14, titleColor)
 
 	listY := y + 22
 	for i, slot := range slots {
