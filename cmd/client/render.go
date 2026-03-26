@@ -713,8 +713,8 @@ func (c *Client) drawWorld() {
 		}
 	}
 
-	// --- VIInspectionWND: mouse hover tooltip ---
-	if hoverEnt != nil {
+	// --- VIInspectionWND: mouse hover tooltip (no click needed) ---
+	if hoverEnt != nil && !rl.IsMouseButtonDown(rl.MouseButtonLeft) {
 		c.drawInspectionWnd(hoverEnt, mousePos)
 	}
 
