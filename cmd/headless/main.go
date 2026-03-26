@@ -702,6 +702,28 @@ func handleCommand(engine *game.Engine, line string) {
 		fmt.Printf("InteractItem: slot=%d name=%q equipLoc=%d\n", slot, item.Name, item.EquipLocation)
 		engine.SendInteractItem(slot)
 
+	case "weaponbar", "wb":
+		// Equipment hotbar swap: PS2 sends PrepareItem (0x000A) with slot + action byte
+		if len(parts) < 3 {
+			fmt.Println("Usage: weaponbar <invSlot> <action>")
+			fmt.Println("  action 0 = unequip to hotbar")
+			fmt.Println("  action 2 = equip from hotbar")
+			fmt.Println("  action 3 = swap hotbar slot")
+			return
+		}
+		slot, err := strconv.Atoi(parts[1])
+		if err != nil {
+			fmt.Printf("Invalid slot: %v\n", err)
+			return
+		}
+		action, err := strconv.Atoi(parts[2])
+		if err != nil || action < 0 || action > 3 {
+			fmt.Printf("Invalid action: %v (0-3)\n", err)
+			return
+		}
+		engine.SendPrepareItem(slot, byte(action))
+		fmt.Printf("PrepareItem: slot=%d action=%d\n", slot, action)
+
 	case "spells":
 		gs := engine.State
 		if len(gs.ParsedSpells) == 0 {

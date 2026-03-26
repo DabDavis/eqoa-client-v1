@@ -1045,6 +1045,22 @@ func (e *Engine) SendUnequipItem(invSlot int) {
 	e.SendInteractItem(invSlot)
 }
 
+// SendPrepareItem sends opcode 0x000A — equipment hotbar swap.
+// PS2 pcap: invSlot(uint32 LE) + action(uint8) = 5 bytes.
+// Action: 0=unequip to hotbar, 2=equip from hotbar, 3=swap hotbar slot.
+func (e *Engine) SendPrepareItem(invSlot int, action byte) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 5)
+	binary.LittleEndian.PutUint32(data[0:4], uint32(invSlot))
+	data[4] = action
+	if !e.State.Conn.QueueReliable(protocol.OpcodePrepareItem, data) {
+		log.Printf("WARNING: PrepareItem send window full")
+	}
+	log.Printf("Sent PrepareItem: slot=%d action=%d", invSlot, action)
+}
+
 // SendBlacksmithOpen sends opcode 0x0061 — open blacksmith menu.
 func (e *Engine) SendBlacksmithOpen(npcData uint32) {
 	if e.State.Conn == nil {

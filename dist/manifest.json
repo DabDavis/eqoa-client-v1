@@ -1,9 +1,9 @@
 {
-  "version": "20260325-a93fecc",
+  "version": "20260326-fe468d9",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "d729422b8efcecac962e55d9c7080504d113bbe4060b6929216b08998e352319",
+  "linux_sha256": "c95fa2da03df2b032674be1ee9c222ec618f1ba23303f0f64e2448eadddee963",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "9a96375eeeabe4627cbe5adc985a90b89235593cb1899de56e97c81015fb6244",
-  "changelog": "- Headless: add TCP command port (7778) for agent control\n- Headless: live combat monitor + statediff in tick loop\n- Add state channel byte-diff monitor for combat RE\n- Fix infinite swing: revert to DI-driven swings, keep PS2 FX hash\n- Wire combatAttackFXHash from PS2 func_00CBE0A8 into spell FX"
+  "windows_sha256": "59d2a33d5de73a06a506866883117af695f05923bedc11f4525d7cfc2f8f03ab",
+  "changelog": "- Parse weapon AttackType from state channel bytes 91-92\n- State channel RE: decode all 162 bytes, monitor entity diffs\n- Add --cmd-port flag for multiple headless instances\n- Fix headless attack: set CombatEngaged for 0x40 byte 36\n- Add CastingCombat RAW hex dump for wire format debugging"
 }
