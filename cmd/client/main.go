@@ -251,6 +251,7 @@ type Client struct {
 	equipGridSel int  // 0-7 cursor position in equipment grid (Equipped tab)
 	charSubTab   int  // 0=Stats, 1=Spells, 2=CM
 	socialSubTab   int // 0=Who, 1=Group, 2=LFG
+	guildSubTab    int // 0=Roster, 1=Chat
 	settingsSubTab int // 0=Camera, 1=Audio
 	menuStickLatched bool // right stick sub-tab latch (fires once per deflection)
 	whoRequested   bool // true after first who list request sent

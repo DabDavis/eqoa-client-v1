@@ -131,8 +131,8 @@ func (c *Client) handleInWorldInput() {
 			{rl.KeyM, 2, 2},  // Ctrl+M: Character > Class Mastery
 			{rl.KeyN, 3, -1}, // Ctrl+N: Nearby
 			{rl.KeyW, 4, -1}, // Ctrl+W: Who List
-			{rl.KeyG, 5, -1}, // Ctrl+G: Group
-			{rl.KeyP, 7, -1}, // Ctrl+P: Settings
+			{rl.KeyG, 5, -1}, // Ctrl+G: Guild
+			{rl.KeyP, 6, -1}, // Ctrl+P: Settings (was 5, now 6)
 		}
 		for _, sc := range shortcuts {
 			if rl.IsKeyPressed(sc.key) {

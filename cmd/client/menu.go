@@ -163,7 +163,7 @@ func (c *Client) handleMenuInput() {
 
 	// Controller: L2/R2 = main tabs, L1/R1 = sub-tabs, D-pad = content navigation.
 	const numTabs = 8
-	mainMenuItems := 9 // Resume, Inventory, Character, Nearby, Social, Settings, Music, Exit
+	mainMenuItems := 10 // Resume, Inventory, Character, Nearby, Social, Guild, Settings, Music, Lore, Exit
 
 	gpL2 := gpAvailable() && gpPressed(rl.GamepadButtonLeftTrigger2)
 	gpR2 := gpAvailable() && gpPressed(rl.GamepadButtonRightTrigger2)
@@ -204,7 +204,10 @@ func (c *Client) handleMenuInput() {
 		case 4: // Social: Who / Group / LFG
 			c.socialSubTab = (c.socialSubTab + dir + 3) % 3
 			c.menuScroll = 0
-		case 5: // Settings: Graphics / Camera / Audio
+		case 5: // Guild: Roster / Chat
+			c.guildSubTab = (c.guildSubTab + dir + 2) % 2
+			c.menuScroll = 0
+		case 6: // Settings: Graphics / Camera / Audio
 			c.settingsSubTab = (c.settingsSubTab + dir + 3) % 3
 			c.menuScroll = 0
 		}
@@ -266,20 +269,24 @@ func (c *Client) handleMenuInput() {
 				c.menuTab = 4
 				c.menuRow = 0
 				c.menuScroll = 0
-			case 5: // Settings
+			case 5: // Guild
 				c.menuTab = 5
 				c.menuRow = 0
 				c.menuScroll = 0
-				c.menuInputDelay = 3
-			case 6: // Music
+			case 6: // Settings
 				c.menuTab = 6
 				c.menuRow = 0
 				c.menuScroll = 0
-			case 7: // Lore
+				c.menuInputDelay = 3
+			case 7: // Music
 				c.menuTab = 7
 				c.menuRow = 0
 				c.menuScroll = 0
-			case 8: // Exit Game
+			case 8: // Lore
+				c.menuTab = 8
+				c.menuRow = 0
+				c.menuScroll = 0
+			case 9: // Exit Game
 				c.closeMenu()
 				c.disconnectAndReturnToLogin()
 			}
@@ -326,7 +333,7 @@ func (c *Client) handleMenuInput() {
 		// Tab bar clicks — must match scrolling wheel rendering logic
 		tabY := menuYPos() + menuHdrH
 		if my >= tabY && my < tabY+menuTabH {
-			tabs := []string{"Menu", "Inventory", "Character", "Nearby", "Social", "Settings", "Music", "Lore"}
+			tabs := []string{"Menu", "Inventory", "Character", "Nearby", "Social", "Guild", "Settings", "Music", "Lore"}
 			const tabGapC = int32(4)
 			const arrowWC = int32(16)
 			tabWidthsC := make([]int32, len(tabs))
@@ -445,20 +452,24 @@ func (c *Client) handleMenuInput() {
 				c.menuTab = 4
 				c.menuRow = 0
 				c.menuScroll = 0
-			case 5: // Settings
+			case 5: // Guild
 				c.menuTab = 5
 				c.menuRow = 0
 				c.menuScroll = 0
-				c.menuInputDelay = 3
-			case 6: // Music
+			case 6: // Settings
 				c.menuTab = 6
 				c.menuRow = 0
 				c.menuScroll = 0
-			case 7: // Lore
+				c.menuInputDelay = 3
+			case 7: // Music
 				c.menuTab = 7
 				c.menuRow = 0
 				c.menuScroll = 0
-			case 8: // Exit Game
+			case 8: // Lore
+				c.menuTab = 8
+				c.menuRow = 0
+				c.menuScroll = 0
+			case 9: // Exit Game
 				c.closeMenu()
 				c.disconnectAndReturnToLogin()
 			}
@@ -645,10 +656,12 @@ func (c *Client) drawMenu() {
 	case 4:
 		c.drawMenuSocial(contentY, contentH)
 	case 5:
-		c.drawMenuSettings(contentY, contentH)
+		c.drawMenuGuild(contentY, contentH)
 	case 6:
-		c.drawMenuMusic(contentY, contentH)
+		c.drawMenuSettings(contentY, contentH)
 	case 7:
+		c.drawMenuMusic(contentY, contentH)
+	case 8:
 		c.drawMenuLore(contentY, contentH)
 	}
 
@@ -672,7 +685,7 @@ func (c *Client) drawMenu() {
 func (c *Client) drawMenuMain(startY int32) {
 	mx := rl.GetMouseX()
 	my := rl.GetMouseY()
-	items := []string{"Resume", "Inventory", "Character", "Nearby", "Social", "Settings", "Music", "Lore", "Exit Game"}
+	items := []string{"Resume", "Inventory", "Character", "Nearby", "Social", "Guild", "Settings", "Music", "Lore", "Exit Game"}
 	white := colorWhiteFull
 	hover := colorGoldHover
 	exitClr := rl.Color{R: 200, G: 100, B: 100, A: 255}
@@ -2310,6 +2323,94 @@ func (c *Client) drawSubTabs(labels []string, active int, y int32, onClick func(
 		c.drawText(label, stx+8, y+4, 13, clr)
 		stx += tw + 4
 	}
+}
+
+func (c *Client) drawMenuGuild(startY, contentH int32) {
+	gs := c.engine.State
+	gold := colorGold
+	white := rl.White
+	gray := rl.Color{R: 180, G: 180, B: 180, A: 255}
+
+	// Sub-tab bar: Roster / Chat
+	subTabs := []string{"Roster", "Chat"}
+	subY := startY
+	for i, label := range subTabs {
+		x := menuXPos() + menuPad + int32(i)*80
+		col := gray
+		if i == c.guildSubTab {
+			col = gold
+		}
+		c.drawText(label, x, subY, 14, col)
+	}
+	y := subY + 22
+
+	switch c.guildSubTab {
+	case 0: // Roster — show guild members from GuildInfo (0x0468)
+		c.drawText("Guild Roster", menuXPos()+menuPad, y, 14, gold)
+		y += 20
+
+		// Show guild chat messages that have guild member info
+		guildMembers := 0
+		for _, msg := range gs.ChatLog {
+			if msg.Channel == game.ChatGuild {
+				guildMembers++
+			}
+		}
+
+		if guildMembers == 0 {
+			c.drawText("No guild info received yet.", menuXPos()+menuPad, y, 12, gray)
+		} else {
+			for _, msg := range gs.ChatLog {
+				if msg.Channel == game.ChatGuild {
+					if y > startY+contentH-20 {
+						break
+					}
+					c.drawText(msg.Text, menuXPos()+menuPad, y, 12, white)
+					y += 16
+				}
+			}
+		}
+
+	case 1: // Chat — guild chat log
+		c.drawText("Guild Chat", menuXPos()+menuPad, y, 14, gold)
+		y += 20
+
+		count := 0
+		for _, msg := range gs.ChatLog {
+			if msg.Channel == game.ChatGuild {
+				count++
+			}
+		}
+		if count == 0 {
+			c.drawText("No guild messages.", menuXPos()+menuPad, y, 12, gray)
+		} else {
+			// Show last N messages that fit
+			maxRows := int(contentH-40) / 16
+			start := count - maxRows
+			if start < 0 {
+				start = 0
+			}
+			idx := 0
+			for _, msg := range gs.ChatLog {
+				if msg.Channel != game.ChatGuild {
+					continue
+				}
+				if idx < start {
+					idx++
+					continue
+				}
+				if y > startY+contentH-20 {
+					break
+				}
+				col := rl.Color{R: 0, G: 200, B: 100, A: 255} // guild green
+				c.drawText(msg.Text, menuXPos()+menuPad, y, 12, col)
+				y += 16
+				idx++
+			}
+		}
+	}
+
+	_ = white
 }
 
 func (c *Client) drawMenuSettings(startY, contentH int32) {
