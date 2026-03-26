@@ -1712,6 +1712,8 @@ func (gs *GameState) handleColoredChat(msg *protocol.Message) {
 func (gs *GameState) handleClientMessage(msg *protocol.Message) {
 	data := msg.Data()
 	// Wire format: opcode(2) + int32(charCount) + UTF-16LE(chars)
+	// On Sandstorm, 0x0A7A is used for guild chat messages.
+	// Text includes "SenderName: message".
 	if len(data) < 6 {
 		return
 	}
@@ -1720,12 +1722,8 @@ func (gs *GameState) handleClientMessage(msg *protocol.Message) {
 		return
 	}
 
-	log.Printf("ClientMessage: %s", text)
-	gs.ChatLog = append(gs.ChatLog, ChatMessage{
-		Text:    text,
-		Channel: ChatSay,
-		ColorR:  255, ColorG: 255, ColorB: 255,
-	})
+	log.Printf("ClientMessage[guild]: %s", text)
+	gs.addChatMessage(fmt.Sprintf("[Guild] %s", text), ChatGuild)
 }
 
 func (gs *GameState) handleErrorMessage(msg *protocol.Message) {

@@ -1,9 +1,9 @@
 {
-  "version": "20260326-483193c",
+  "version": "20260326-e1e0fdb",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "e0ba460ab62befbc6a49c7921198128b58ddbf1ffdef73c7d29cad0c3d2b9d9c",
+  "linux_sha256": "57204f3db9d0295ad479750b843134d0933cc7fdaa9f333a95d2d80ab7120afe",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "14c48934835e3f19c65922da878da2cc5b7c493273f191268ab66294438849c9",
-  "changelog": "- Apply pcap findings: combat state, facing float, PrepareItem, AdjustItemHP\n- Add equipment hotbar swap via PrepareItem (0x000A)\n- Parse weapon AttackType from state channel bytes 91-92\n- State channel RE: decode all 162 bytes, monitor entity diffs\n- Add --cmd-port flag for multiple headless instances"
+  "windows_sha256": "ab0524e36eac25a1f11604e81bf4d41381df47210e7a8c5db78671625985ea60",
+  "changelog": "- Implement guild chat and guild functions\n- Apply pcap findings: combat state, facing float, PrepareItem, AdjustItemHP\n- Add equipment hotbar swap via PrepareItem (0x000A)\n- Parse weapon AttackType from state channel bytes 91-92\n- State channel RE: decode all 162 bytes, monitor entity diffs"
 }
