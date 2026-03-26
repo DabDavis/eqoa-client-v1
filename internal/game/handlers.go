@@ -1677,7 +1677,8 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 		return
 	}
 	payload := data[2:] // skip 2-byte opcode prefix
-	log.Printf("AuctionStuff: payloadLen=%d hex=%X", len(payload), payload[:min(32, len(payload))])
+	hexLen := min(200, len(payload))
+	log.Printf("AuctionStuff: payloadLen=%d hex=%X", len(payload), payload[:hexLen])
 
 	// Small ack packet (<=7 bytes after opcode): status response
 	if len(payload) <= 7 {
@@ -1701,40 +1702,81 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 	for i := 0; i < itemCount; i++ {
 		var ai AuctionItem
 
-		// PS2 func_00BBD9E8: zigzag(listingID/sellerCharID) then spell_row_read (parseSingleItem)
+		// Format: zigzag(listingID) + zigzag(stack) + zigzag(unk) + zigzag(unk)
+		// + zigzag(currentBid) + zigzag(buyoutPrice) + zigzag(itemID)
+		// + uint32(sellerNameLen) + ASCII(seller) + parseSingleItem
 		listingID, _ := reader.Read7BitEncodedInt64()
 		_ = listingID
+		auctionStack, _ := reader.Read7BitEncodedInt64()
+		_ = auctionStack
+		reader.Read7BitEncodedInt64() // unk
+		reader.Read7BitEncodedInt64() // unk
+		ai.CurrentBid, _ = reader.Read7BitEncodedInt64()
+		ai.BuyoutPrice, _ = reader.Read7BitEncodedInt64()
+		auctionItemID, _ := reader.Read7BitEncodedInt64()
+		_ = auctionItemID
 
-		// Item data: same format as MemoryDump items (23 zigzag + name + desc + stats)
-		item, err := parseSingleItem(reader)
-		if err != nil {
-			log.Printf("AuctionStuff: parseSingleItem failed at item %d (remaining=%d): %v", i, reader.Remaining(), err)
-			break
-		}
-		ai.Item = item
-
-		// After item: seller name as uint32(len) + ASCII
+		// Seller name: uint32 length + ASCII bytes
 		sellerLen, err := reader.ReadUint32()
 		if err != nil || sellerLen > 200 {
-			log.Printf("AuctionStuff: bad seller name len %d at item %d", sellerLen, i)
+			log.Printf("AuctionStuff: bad seller name len %d at item %d (remaining=%d)", sellerLen, i, reader.Remaining())
 			break
 		}
 		if sellerLen > 0 {
-			nameBytes := make([]byte, sellerLen)
-			for j := uint32(0); j < sellerLen; j++ {
-				b, err := reader.ReadByte()
-				if err != nil {
-					log.Printf("AuctionStuff: read seller name failed at item %d", i)
-					break
-				}
-				nameBytes[j] = b
+			nameBytes, err := reader.ReadBytes(int(sellerLen))
+			if err != nil {
+				log.Printf("AuctionStuff: read seller name failed at item %d", i)
+				break
 			}
 			ai.Seller = string(nameBytes)
 		}
 
-		// Auction-specific trailing fields
-		ai.CurrentBid, _ = reader.Read7BitEncodedInt64()
-		ai.BuyoutPrice, _ = reader.Read7BitEncodedInt64()
+		// Item body: 23 zigzag fields (func_00CBACE8) + name + desc + stats
+		// Same as parseSingleItem but WITHOUT the leading stack/hp/charges/equip/location/key
+		// (those are in the auction header above).
+		ai.Item.ItemID, _ = reader.Read7BitEncodedInt64()
+		ai.Item.ItemCost, _ = reader.Read7BitEncodedInt64()
+		ai.Item.Unk1, _ = reader.Read7BitEncodedInt64()
+		ai.Item.ItemIcon, _ = reader.Read7BitEncodedInt64()
+		ai.Item.Unk2, _ = reader.Read7BitEncodedInt64()
+		ai.Item.Slot, _ = reader.Read7BitEncodedInt64()
+		ai.Item.Unk3, _ = reader.Read7BitEncodedInt64()
+		ai.Item.NoTrade, _ = reader.Read7BitEncodedInt64()
+		ai.Item.NoRent, _ = reader.Read7BitEncodedInt64()
+		ai.Item.Unk4, _ = reader.Read7BitEncodedInt64()
+		ai.Item.AttackType, _ = reader.Read7BitEncodedInt64()
+		ai.Item.WeaponDamage, _ = reader.Read7BitEncodedInt64()
+		ai.Item.Unk5, _ = reader.Read7BitEncodedInt64()
+		ai.Item.LevelReq, _ = reader.Read7BitEncodedInt64()
+		ai.Item.MaxStack, _ = reader.Read7BitEncodedInt64()
+		ai.Item.MaxHP, _ = reader.Read7BitEncodedInt64()
+		ai.Item.Duration, _ = reader.Read7BitEncodedInt64()
+		ai.Item.ClassUse, _ = reader.Read7BitEncodedInt64()
+		ai.Item.RaceUse, _ = reader.Read7BitEncodedInt64()
+		ai.Item.ProcAnim, _ = reader.Read7BitEncodedInt64()
+		ai.Item.IsLore, _ = reader.Read7BitEncodedInt64()
+		ai.Item.Unk6, _ = reader.Read7BitEncodedInt64()
+		ai.Item.IsCraft, _ = reader.Read7BitEncodedInt64()
+
+		// Name (uint32 charCount + UTF-16)
+		nameLen, err := reader.ReadInt32()
+		if err == nil && nameLen > 0 && nameLen < 200 {
+			ai.Item.Name, _ = reader.ReadStringUnicode(int(nameLen))
+		}
+		// Description
+		descLen, err := reader.ReadInt32()
+		if err == nil && descLen > 0 && descLen < 500 {
+			ai.Item.Desc, _ = reader.ReadStringUnicode(int(descLen))
+		}
+		// Stats
+		statSize, _ := reader.Read7BitEncodedInt64()
+		ai.Item.Stats = make(map[int]int64)
+		for j := int64(0); j < statSize; j++ {
+			idx, _ := reader.Read7BitEncodedInt64()
+			val, e := reader.Read7BitEncodedInt64()
+			if e != nil { break }
+			ai.Item.Stats[int(idx)] = val
+		}
 
 		items = append(items, ai)
 		log.Printf("AuctionItem[%d]: seller=%q name=%q bid=%d buyout=%d",
