@@ -56,13 +56,15 @@ func (c *Client) handleCharSelectInput() {
 		return
 	}
 
-	// Escape or Triangle: dismiss delete confirm only (no disconnect)
+	// Escape or Triangle: dismiss delete confirm or disconnect
 	gpTriangle := gpAvailable() && gpPressed(rl.GamepadButtonRightFaceUp)
 	if rl.IsKeyPressed(rl.KeyEscape) || gpTriangle {
 		if c.deleteConfirmActive {
 			c.deleteConfirmActive = false
 			return
 		}
+		c.disconnectAndReturnToLogin()
+		return
 	}
 
 	// Delete confirmation dialog input
