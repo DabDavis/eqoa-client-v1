@@ -2,10 +2,13 @@ package main
 
 import (
 	"fmt"
+	"math"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 
 	"github.com/eqoa/client/internal/game"
+	"github.com/eqoa/client/internal/gfx"
+	"github.com/eqoa/client/internal/models"
 )
 
 // =============================================================================
@@ -323,4 +326,91 @@ func CharPreviewFromEntity(e *game.Entity) CharPreviewData {
 		LegsTint: e.LegsTint, BootsTint: e.BootsTint, HelmTint: e.HelmTint, RobeTint: e.RobeTint,
 		HairColor: e.HairColor, HairLength: e.HairLength, HairStyle: e.HairStyle, FaceOption: e.FaceOption,
 	}
+}
+
+// ToEquipmentState converts CharPreviewData to EquipmentState for the model renderer.
+func (d *CharPreviewData) ToEquipmentState() *models.EquipmentState {
+	return &models.EquipmentState{
+		Chest: d.Chest, Bracer: d.Bracer, Gloves: d.Gloves,
+		Legs: d.Legs, Boots: d.Boots, Helm: d.Helm, Robe: d.Robe,
+		ChestTint: d.ChestTint, BracerTint: d.BracerTint, GlovesTint: d.GlovesTint,
+		LegsTint: d.LegsTint, BootsTint: d.BootsTint, HelmTint: d.HelmTint, RobeTint: d.RobeTint,
+		HairColor: d.HairColor, HairLength: d.HairLength, HairStyle: d.HairStyle, FaceOption: d.FaceOption,
+		Race: d.Race,
+	}
+}
+
+// uiCharPreview renders a slowly-rotating 3D character model into a render texture
+// and draws it at the given screen position. Works with any CharPreviewData source.
+func (c *Client) uiCharPreview(x, y, w, h int32, data CharPreviewData, rotation *float32) {
+	if c.modelMgr == nil || data.ModelID == 0 {
+		return
+	}
+
+	// Allocate render texture once
+	if !c.equipPreviewInit {
+		c.equipPreviewTex = rl.LoadRenderTexture(equipPreviewW, equipPreviewH)
+		c.equipPreviewInit = true
+	}
+
+	// Auto-rotate
+	dt := rl.GetFrameTime()
+	*rotation += dt * 0.5
+
+	// Equipment state
+	equip := data.ToEquipmentState()
+
+	// Per-race camera
+	type raceCam struct {
+		dist, eyeY, targetY float32
+	}
+	raceCams := [10]raceCam{
+		{4.5, 2.0, 1.1}, {4.5, 2.0, 1.1}, {4.5, 2.0, 1.1}, // HUM, ELF, DELF
+		{4.0, 1.6, 0.8}, {4.0, 1.6, 0.8},                   // GNO, DWF
+		{5.5, 2.8, 1.5}, {5.0, 2.4, 1.3},                   // TRL, BAR
+		{4.0, 1.6, 0.8}, {4.5, 2.0, 1.1}, {5.5, 2.8, 1.5}, // HLF, ERU, OGR
+	}
+	rc := raceCams[0]
+	if int(data.Race) < len(raceCams) {
+		rc = raceCams[data.Race]
+	}
+
+	facing := float32(math.Mod(float64(*rotation), 2*math.Pi))
+	cosF := float32(math.Cos(float64(facing)))
+	sinF := float32(math.Sin(float64(facing)))
+	yOffset := rc.targetY * -0.2
+
+	cam := rl.Camera3D{
+		Position:   rl.Vector3{X: sinF * rc.dist, Y: rc.eyeY + yOffset, Z: cosF * rc.dist},
+		Target:     rl.Vector3{X: 0, Y: rc.targetY + yOffset, Z: 0},
+		Up:         rl.Vector3{X: 0, Y: 1, Z: 0},
+		Fovy:       30,
+		Projection: rl.CameraPerspective,
+	}
+
+	rl.BeginTextureMode(c.equipPreviewTex)
+	rl.ClearBackground(rl.Color{R: 0, G: 0, B: 0, A: 0})
+	gfx.ClearDepth()
+	rl.BeginMode3D(cam)
+
+	entityID := uint32(0xFFFD0000)
+	scale := data.Scale
+	if scale == 0 {
+		scale = 1.0
+	}
+	modelID := int32(data.ModelID)
+	c.modelMgr.DrawEntity(modelID, 0, 0, 0, 0, scale, equip, entityID, 0, 0, dt, false, 1.0)
+
+	if c.modelMgr.ModelIsHumanoid(modelID) {
+		c.modelMgr.DrawWeapon(int32(data.PrimaryWeapon), modelID, 0, 0, 0, 0, models.WeaponSlotPrimary)
+		c.modelMgr.DrawWeapon(int32(data.SecondaryWeapon), modelID, 0, 0, 0, 0, models.WeaponSlotSecondary)
+		c.modelMgr.DrawWeapon(int32(data.Shield), modelID, 0, 0, 0, 0, models.WeaponSlotShield)
+	}
+
+	rl.EndMode3D()
+	rl.EndTextureMode()
+
+	src := rl.Rectangle{Width: float32(equipPreviewW), Height: -float32(equipPreviewH)}
+	dst := rl.Rectangle{X: float32(x), Y: float32(y), Width: float32(w), Height: float32(h)}
+	rl.DrawTexturePro(c.equipPreviewTex.Texture, src, dst, rl.Vector2{}, 0, rl.White)
 }

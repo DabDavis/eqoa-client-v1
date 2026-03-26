@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -11,7 +10,6 @@ import (
 
 	"github.com/eqoa/client/internal/game"
 	"github.com/eqoa/client/internal/gfx"
-	"github.com/eqoa/client/internal/models"
 	"github.com/eqoa/client/internal/ui"
 )
 
@@ -731,104 +729,16 @@ const (
 	equipPreviewH = int32(300)
 )
 
-// drawEquipPreview renders a slowly-rotating 3D character model preview
-// into a RenderTexture2D and draws it at the given screen position.
-// The model shows the player's current equipment state.
+// drawEquipPreview renders the player's 3D character model preview.
+// Delegates to uiCharPreview widget. Transmog overrides are applied
+// inside uiCharPreview via the EquipmentState (same as before).
 func (c *Client) drawEquipPreview(x, y, w, h int32) {
 	gs := c.engine.State
-	if gs == nil || c.modelMgr == nil {
+	if gs == nil {
 		return
 	}
-	p := &gs.Player
-	modelID := int32(p.ModelID)
-	if modelID == 0 {
-		return
-	}
-
-	// Allocate render texture once.
-	if !c.equipPreviewInit {
-		c.equipPreviewTex = rl.LoadRenderTexture(equipPreviewW, equipPreviewH)
-		c.equipPreviewInit = true
-	}
-
-	dt := rl.GetFrameTime()
-	c.equipPreviewRot += dt * 0.5
-
-	// Build equipment state from current player.
-	equip := entityEquipment(&gs.Player, c.modelMgr)
-	c.applyTransmog(equip)
-
-	// Per-race camera parameters (same as charselect).
-	type raceCam struct {
-		dist, eyeY, targetY float32
-	}
-	raceCams := [10]raceCam{
-		{4.5, 2.0, 1.1}, // HUM
-		{4.5, 2.0, 1.1}, // ELF
-		{4.5, 2.0, 1.1}, // DELF
-		{4.0, 1.6, 0.8}, // GNO
-		{4.0, 1.6, 0.8}, // DWF
-		{5.5, 2.8, 1.5}, // TRL
-		{5.0, 2.4, 1.3}, // BAR
-		{4.0, 1.6, 0.8}, // HLF
-		{4.5, 2.0, 1.1}, // ERU
-		{5.5, 2.8, 1.5}, // OGR
-	}
-	rc := raceCams[0]
-	if p.Race >= 0 && int(p.Race) < len(raceCams) {
-		rc = raceCams[p.Race]
-	}
-
-	// Camera orbits around origin at the preview rotation angle.
-	facing := float32(math.Mod(float64(c.equipPreviewRot), 2*math.Pi))
-	cosF := float32(math.Cos(float64(facing)))
-	sinF := float32(math.Sin(float64(facing)))
-
-	// Raise to center model higher in tall preview panel.
-	yOffset := rc.targetY * -0.2
-	cam := rl.Camera3D{
-		Position:   rl.Vector3{X: sinF * rc.dist, Y: rc.eyeY + yOffset, Z: cosF * rc.dist},
-		Target:     rl.Vector3{X: 0, Y: rc.targetY + yOffset, Z: 0},
-		Up:         rl.Vector3{X: 0, Y: 1, Z: 0},
-		Fovy:       30,
-		Projection: rl.CameraPerspective,
-	}
-
-	// Render to texture.
-	rl.BeginTextureMode(c.equipPreviewTex)
-	rl.ClearBackground(rl.Color{R: 0, G: 0, B: 0, A: 0})
-	gfx.ClearDepth()
-	rl.BeginMode3D(cam)
-
-	// Use a unique entity ID for animation state (won't collide with real entities).
-	entityID := uint32(0xFFFD0000)
-	c.modelMgr.DrawEntity(modelID, 0, 0, 0, 0, 1.0, equip, entityID, 0, 0, dt, false, 1.0)
-
-	// Draw weapons if humanoid (with transmog overrides).
-	if c.modelMgr.ModelIsHumanoid(modelID) {
-		pri, sec, sh := c.applyTransmogWeapons(p.PrimaryWeapon, p.SecondaryWeapon, p.Shield)
-		c.modelMgr.DrawWeapon(int32(pri), modelID, 0, 0, 0, 0, models.WeaponSlotPrimary)
-		c.modelMgr.DrawWeapon(int32(sec), modelID, 0, 0, 0, 0, models.WeaponSlotSecondary)
-		c.modelMgr.DrawWeapon(int32(sh), modelID, 0, 0, 0, 0, models.WeaponSlotShield)
-	}
-
-	rl.EndMode3D()
-	rl.EndTextureMode()
-
-	// Draw the render texture to screen. Render textures are Y-flipped.
-	src := rl.Rectangle{
-		X:      0,
-		Y:      0,
-		Width:  float32(equipPreviewW),
-		Height: -float32(equipPreviewH), // flip Y
-	}
-	dst := rl.Rectangle{
-		X:      float32(x),
-		Y:      float32(y),
-		Width:  float32(w),
-		Height: float32(h),
-	}
-	rl.DrawTexturePro(c.equipPreviewTex.Texture, src, dst, rl.Vector2{}, 0, rl.White)
+	preview := CharPreviewFromPlayer(&gs.Player)
+	c.uiCharPreview(x, y, w, h, preview, &c.equipPreviewRot)
 }
 
 func (c *Client) drawMenuInventory(startY, contentH int32) {
