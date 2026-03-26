@@ -313,8 +313,10 @@ type GameState struct {
 	SampleHeightFunc func(x, z, refY float32) (float32, bool)
 
 	// Target response from server (opcode 0x0010)
-	TargetConColor  byte // 0=red,1=yellow,2=white,3=dkblue,4=ltblue,5=green
-	TargetFaceColor byte // 0=hostile,2=neutral,4=friendly,5=ally
+	TargetConColor  byte   // 0=red,1=yellow,2=white,3=dkblue,4=ltblue,5=green
+	TargetFaceColor byte   // 0=hostile,2=neutral,4=friendly,5=ally
+	TargetGuildName string // guild name of targeted player (UTF-16LE from ClassicTargetInfo)
+	TargetTitle     string // title of targeted player
 
 	// Parsed MemoryDump data (populated on world entry)
 	ParsedItems          []ParsedItem
@@ -1937,15 +1939,33 @@ func (gs *GameState) handleDisbandGroup(msg *protocol.Message) {
 
 func (gs *GameState) handleClassicTargetInfo(msg *protocol.Message) {
 	data := msg.Data()
-	// Wire format: opcode(2) + faceColor(1) + conColor(1) + byte(1) + zeros(256) = 261 bytes
+	// Wire format (from PS2 decompilation of func_00BD9D60 + pcap verification):
+	//   opcode(2) + faceColor(1) + conColor(1) + guildFlag(1) + title_utf16(128) + guild_utf16(128) + guildID(4)
+	//   Total: 2 + 1 + 1 + 1 + 128 + 128 + 4 = 264 bytes
 	if len(data) < 5 {
 		log.Printf("ClassicTargetInfo: short data (%d bytes)", len(data))
 		return
 	}
 	gs.TargetFaceColor = data[2]
 	gs.TargetConColor = data[3]
-	log.Printf("ClassicTargetInfo: faceColor=%d conColor=%d", gs.TargetFaceColor, gs.TargetConColor)
+
+	// Parse guild/title if present (guildFlag at byte 4)
+	gs.TargetGuildName = ""
+	gs.TargetTitle = ""
+	if len(data) >= 2+3+128+128 { // opcode + 3 flags + title + guild
+		guildFlag := data[4]
+		if guildFlag != 0 {
+			// Title: bytes 5-132 (64 UTF-16LE wchars = 128 bytes)
+			gs.TargetTitle = decodeUTF16LE(data[5:133])
+			// Guild: bytes 133-260 (64 UTF-16LE wchars = 128 bytes)
+			gs.TargetGuildName = decodeUTF16LE(data[133:261])
+		}
+	}
+
+	log.Printf("ClassicTargetInfo: faceColor=%d conColor=%d guild=%q title=%q",
+		gs.TargetFaceColor, gs.TargetConColor, gs.TargetGuildName, gs.TargetTitle)
 }
+
 
 // decodePlayerState decodes channel 0 (player self) state data.
 func (gs *GameState) decodePlayerState(data []byte) {

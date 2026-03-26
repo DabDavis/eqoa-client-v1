@@ -201,6 +201,7 @@ type Client struct {
 	inspectOpen bool            // true when inspect window is visible
 	inspectItem *game.ParsedItem // item being inspected (nil = closed)
 
+
 	// Dialogue cursor for gamepad/keyboard navigation
 	dialogueCursor int // highlighted option index (-1 = none)
 

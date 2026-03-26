@@ -114,34 +114,71 @@ func equipLocName(loc int64) string {
 }
 
 // drawInspectionWnd renders the VIInspectionWND popup near the mouse cursor.
-// Shows entity name, level, and class/type in a small bordered box.
-func (c *Client) drawInspectionWnd(name string, level, race, class byte, isPlayer bool, nameColor byte, mousePos rl.Vector2) {
-	const fontSize = int32(14)
+// Shows entity name, level, race/class (players) or NPC type, matching PS2 VIWndInspect.
+func (c *Client) drawInspectionWnd(ent *game.Entity, mousePos rl.Vector2) {
+	const nameFontSz = int32(14)
+	const infoFontSz = int32(12)
 	const pad = int32(6)
 
+	// Build lines: name, info, optional NPC type
+	type inspLine struct {
+		text  string
+		color rl.Color
+		size  int32
+	}
+	var lines []inspLine
+
 	// Line 1: name
-	nameLine := name
-	// Line 2: level + class/race (players) or level (NPCs)
-	var infoLine string
-	if isPlayer {
-		infoLine = fmt.Sprintf("Lv %d %s %s", level, raceName(int(race)), className(int(class)))
+	nameClr := nameColorFromByte(ent.NameColor)
+	lines = append(lines, inspLine{ent.Name, nameClr, nameFontSz})
+
+	// Line 2: level + race/class (player) or level (NPC)
+	if ent.IsPlayer {
+		lines = append(lines, inspLine{
+			fmt.Sprintf("Lv %d  %s %s", ent.Level, raceName(int(ent.Race)), className(int(ent.Class))),
+			colorWhite, infoFontSz,
+		})
 	} else {
-		infoLine = fmt.Sprintf("Lv %d", level)
+		lines = append(lines, inspLine{
+			fmt.Sprintf("Lv %d", ent.Level),
+			colorWhite, infoFontSz,
+		})
+		// NPC sub-type
+		if label := npcTypeLabel(ent.NPCType); label != "" {
+			lines = append(lines, inspLine{label, colorDim, infoFontSz})
+		}
 	}
 
-	nameW := c.measureText(nameLine, fontSize)
-	infoW := c.measureText(infoLine, fontSize)
-	boxW := nameW
-	if infoW > boxW {
-		boxW = infoW
+	// Guild name (from ClassicTargetInfo 0x0010 — only for targeted entity)
+	if c.engine != nil && c.engine.State != nil {
+		gs := c.engine.State
+		if ent.ObjectID == c.targetObjectID && gs.TargetGuildName != "" {
+			lines = append(lines, inspLine{
+				fmt.Sprintf("<%s>", gs.TargetGuildName),
+				rl.Color{R: 100, G: 200, B: 200, A: 255}, infoFontSz,
+			})
+		}
+
+		// Con color hint
+		conClr, conLabel := conColor(ent.Level, gs.Player.Level)
+		lines = append(lines, inspLine{conLabel, conClr, infoFontSz})
 	}
-	boxW += pad * 2
-	boxH := fontSize*2 + pad*3
+
+	// Compute dimensions
+	maxW := int32(0)
+	for _, l := range lines {
+		w := c.measureText(l.text, l.size)
+		if w > maxW {
+			maxW = w
+		}
+	}
+	boxW := maxW + pad*2
+	lineH := nameFontSz + pad/2
+	boxH := int32(len(lines))*lineH + pad*2
 
 	// Position tooltip offset from mouse cursor
 	tx := int32(mousePos.X) + 16
 	ty := int32(mousePos.Y) - boxH - 4
-	// Clamp to screen
 	sw := int32(rl.GetScreenWidth())
 	sh := int32(rl.GetScreenHeight())
 	if tx+boxW > sw {
@@ -157,11 +194,48 @@ func (c *Client) drawInspectionWnd(name string, level, race, class byte, isPlaye
 	// Background + border
 	c.drawPanelTextured(tx-1, ty-1, boxW+2, boxH+2, ui.FrameLine, ui.FillBlack)
 
-	// Name (colored by type)
-	nameClr := nameColorFromByte(nameColor)
-	c.drawText(nameLine, tx+pad, ty+pad, fontSize, nameClr)
-	// Info line (white)
-	c.drawText(infoLine, tx+pad, ty+pad+fontSize+pad/2, fontSize, rl.Color{R: 200, G: 200, B: 200, A: 255})
+	// Draw lines
+	y := ty + pad
+	for _, l := range lines {
+		c.drawText(l.text, tx+pad, y, l.size, l.color)
+		y += lineH
+	}
+}
+
+// npcTypeLabel returns a display label for NPCType values.
+func npcTypeLabel(npcType uint16) string {
+	switch {
+	case npcType&0x0100 != 0:
+		return "Merchant"
+	case npcType == 0x8006:
+		return "Quest"
+	case npcType == 0x8008:
+		return "Guild"
+	case npcType == 0x800C:
+		return "Banker"
+	default:
+		return ""
+	}
+}
+
+// conColor returns the PS2-style consider color and label for a target level vs player level.
+// Matches server con byte: 0=red, 1=yellow, 2=white, 3=dkblue, 4=ltblue, 5=green.
+func conColor(targetLvl, playerLvl byte) (rl.Color, string) {
+	diff := int(targetLvl) - int(playerLvl)
+	switch {
+	case diff >= 6:
+		return rl.Color{R: 255, G: 50, B: 50, A: 255}, "Red"
+	case diff >= 3:
+		return rl.Color{R: 255, G: 255, B: 50, A: 255}, "Yellow"
+	case diff >= -2:
+		return rl.Color{R: 255, G: 255, B: 255, A: 255}, "White"
+	case diff >= -5:
+		return rl.Color{R: 150, G: 200, B: 255, A: 255}, "Light Blue"
+	case diff >= -9:
+		return rl.Color{R: 100, G: 100, B: 255, A: 255}, "Blue"
+	default:
+		return rl.Color{R: 50, G: 255, B: 50, A: 255}, "Green"
+	}
 }
 
 // drawText draws text using the client's custom font (Liberation Sans).

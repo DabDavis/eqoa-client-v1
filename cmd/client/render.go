@@ -645,15 +645,7 @@ func (c *Client) drawWorld() {
 
 	// Mouse hover detection for inspection tooltip (VIInspectionWND).
 	mousePos := rl.GetMousePosition()
-	type hoverInfo struct {
-		Name      string
-		Level     byte
-		Race      byte
-		Class     byte
-		IsPlayer  bool
-		NameColor byte
-	}
-	var hoverEnt *hoverInfo
+	var hoverEnt *game.Entity
 	var hoverDistSq float32 = 40 * 40 // max 40px from entity center to trigger
 
 	// Draw nameplates for visible entities (already frustum-culled).
@@ -697,10 +689,7 @@ func (c *Client) drawWorld() {
 		d2 := mdx*mdx + mdy*mdy
 		if d2 < hoverDistSq {
 			hoverDistSq = d2
-			hoverEnt = &hoverInfo{
-				Name: ent.Name, Level: ent.Level, Race: ent.Race,
-				Class: ent.Class, IsPlayer: ent.IsPlayer, NameColor: ent.NameColor,
-			}
+			hoverEnt = ent
 		}
 	}
 
@@ -726,12 +715,13 @@ func (c *Client) drawWorld() {
 
 	// --- VIInspectionWND: mouse hover tooltip ---
 	if hoverEnt != nil {
-		c.drawInspectionWnd(hoverEnt.Name, hoverEnt.Level, hoverEnt.Race, hoverEnt.Class, hoverEnt.IsPlayer, hoverEnt.NameColor, mousePos)
+		c.drawInspectionWnd(hoverEnt, mousePos)
 	}
 
-	// --- Target tooltip for player entities ---
-	if c.targetObjectID != 0 {
-		if ent, ok := gs.Entities[c.targetObjectID]; ok && ent.IsPlayer {
+	// --- Target inspect tooltip (Square held on controller) ---
+	squareHeld := gpAvailable() && rl.IsGamepadButtonDown(0, rl.GamepadButtonRightFaceLeft)
+	if c.targetObjectID != 0 && squareHeld {
+		if ent, ok := gs.Entities[c.targetObjectID]; ok {
 			height := c.modelHeight(ent.ModelID, 1.8)
 			scale := ent.Scale
 			if scale <= 0 {
@@ -739,8 +729,7 @@ func (c *Client) drawWorld() {
 			}
 			worldPos := rl.Vector3{X: ent.X, Y: ent.Y + height*scale + 0.3, Z: ent.Z}
 			sp := rl.GetWorldToScreen(worldPos, camera)
-			// Draw tooltip below nameplate
-			c.drawInspectionWnd(ent.Name, ent.Level, ent.Race, ent.Class, true, ent.NameColor, rl.Vector2{X: sp.X, Y: sp.Y + 10})
+			c.drawInspectionWnd(ent, rl.Vector2{X: sp.X, Y: sp.Y + 10})
 		}
 	}
 

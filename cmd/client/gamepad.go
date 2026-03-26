@@ -223,8 +223,9 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 			gs.DialogueOptions = nil
 			c.dialogueCursor = 0
 		} else if c.targetObjectID != 0 {
-			c.engine.SendInteract(c.targetObjectID)
 			if ent, ok := c.engine.State.Entities[c.targetObjectID]; ok && ent.IsNPC {
+				// NPC target: interact
+				c.engine.SendInteract(c.targetObjectID)
 				if ent.NPCType&0x0100 != 0 || strings.HasPrefix(ent.Name, "Merchant") {
 					c.engine.State.MerchantName = ent.Name
 					c.engine.SendMerchantDiag(c.targetObjectID)
