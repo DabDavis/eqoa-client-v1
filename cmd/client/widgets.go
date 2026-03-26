@@ -414,3 +414,282 @@ func (c *Client) uiCharPreview(x, y, w, h int32, data CharPreviewData, rotation 
 	dst := rl.Rectangle{X: float32(x), Y: float32(y), Width: float32(w), Height: float32(h)}
 	rl.DrawTexturePro(c.equipPreviewTex.Texture, src, dst, rl.Vector2{}, 0, rl.White)
 }
+
+// =============================================================================
+// Tab Bar
+// =============================================================================
+
+// uiTabBar draws a row of clickable sub-tab labels with underline on active.
+// Returns the new Y position after the tab bar.
+func (c *Client) uiTabBar(x, y int32, labels []string, activeTab *int) int32 {
+	tabH := int32(22)
+	tx := x
+	mx, my := rl.GetMouseX(), rl.GetMouseY()
+	for i, label := range labels {
+		tw := c.measureText(label, 13) + 16
+		clr := colorGoldDim
+		if i == *activeTab {
+			clr = colorGold
+			rl.DrawRectangle(tx, y+tabH-2, tw, 2, colorGold)
+		}
+		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && mx >= tx && mx < tx+tw && my >= y && my < y+tabH {
+			*activeTab = i
+		}
+		c.drawText(label, tx+8, y+4, 13, clr)
+		tx += tw + 4
+	}
+	return y + tabH + 4
+}
+
+// =============================================================================
+// Checkbox Group
+// =============================================================================
+
+// uiCheckboxGroup draws a grid of checkboxes. cols = number of columns.
+// Returns Y position after the group.
+func (c *Client) uiCheckboxGroup(x, y int32, labels []string, checked []bool, cols int) int32 {
+	if len(labels) != len(checked) {
+		return y
+	}
+	colW := int32(80)
+	rowH := int32(18)
+	for i, label := range labels {
+		col := i % cols
+		row := i / cols
+		cx := x + int32(col)*colW
+		cy := y + int32(row)*rowH
+		c.uiCheckbox(cx, cy, label, &checked[i])
+	}
+	rows := (len(labels) + cols - 1) / cols
+	return y + int32(rows)*rowH + 4
+}
+
+// uiCheckboxGroupBitmask draws checkboxes backed by a uint64 bitmask.
+// Each label index corresponds to a bit. Returns Y after group.
+func (c *Client) uiCheckboxGroupBitmask(x, y int32, labels []string, mask *uint64, cols int) int32 {
+	colW := int32(80)
+	rowH := int32(18)
+	for i, label := range labels {
+		col := i % cols
+		row := i / cols
+		cx := x + int32(col)*colW
+		cy := y + int32(row)*rowH
+
+		checked := *mask&(1<<uint(i)) != 0
+		if c.uiCheckbox(cx, cy, label, &checked) {
+			if checked {
+				*mask |= 1 << uint(i)
+			} else {
+				*mask &^= 1 << uint(i)
+			}
+		}
+	}
+	rows := (len(labels) + cols - 1) / cols
+	return y + int32(rows)*rowH + 4
+}
+
+// =============================================================================
+// Item Tooltip
+// =============================================================================
+
+// tooltipStatNames maps stat indices to display names for item tooltips.
+// (statNames is already defined in charcreate.go for the stat panel)
+var tooltipStatNames = map[int]string{
+	0: "STR", 1: "STA", 2: "AGI", 3: "DEX", 4: "WIS", 5: "INT", 6: "CHA",
+	7: "HP", 8: "HP Max", 9: "Power", 10: "Power Max",
+	11: "PoT", 12: "HoT", 13: "AC",
+	14: "AC Total", 23: "Poison Resist", 24: "Disease Resist",
+	25: "Fire Resist", 26: "Cold Resist", 27: "Lightning Resist", 28: "Arcane Resist",
+}
+
+// Slot name lookup.
+var slotNames = map[int64]string{
+	0: "Helm", 1: "Gloves", 2: "Earring", 3: "Earring",
+	4: "Necklace", 5: "Chest", 7: "Bracers", 8: "Ring",
+	9: "Ring", 10: "Belt", 11: "Boots", 12: "Primary",
+	13: "Shield", 14: "Secondary", 15: "Two-Hand",
+	17: "Face", 19: "Gloves", 20: "Cloak", 21: "Robe",
+}
+
+// Attack type names.
+var atkTypeNames = map[int64]string{
+	1: "1H Slash", 2: "2H Slash", 3: "1H Blunt", 4: "2H Blunt",
+	5: "Hand-to-Hand", 6: "Pierce", 7: "Bow", 8: "Throwing",
+	9: "Crossbow", 10: "Focus", 11: "Dagger",
+}
+
+// uiItemTooltip draws a floating tooltip popup for an item at the given position.
+// Typically called when hovering over an item row in inventory/auction.
+func (c *Client) uiItemTooltip(item *game.ParsedItem, screenX, screenY int32) {
+	if item == nil || item.Name == "" {
+		return
+	}
+
+	// Check for item icon
+	hasIcon := false
+	var iconTex rl.Texture2D
+	if item.ItemIcon != 0 {
+		iconTex, hasIcon = c.getItemIcon(item.ItemIcon)
+	}
+	iconSize := int32(40)
+
+	// Build tooltip lines
+	lines := []struct {
+		text  string
+		color rl.Color
+	}{
+		{item.Name, colorGold},
+	}
+
+	// Slot + level
+	slotStr := ""
+	if sn, ok := slotNames[item.Slot]; ok {
+		slotStr = sn
+	}
+	if item.LevelReq > 0 {
+		if slotStr != "" {
+			slotStr += fmt.Sprintf("  Lv %d", item.LevelReq)
+		} else {
+			slotStr = fmt.Sprintf("Level %d", item.LevelReq)
+		}
+	}
+	if slotStr != "" {
+		lines = append(lines, struct {
+			text  string
+			color rl.Color
+		}{slotStr, colorDim})
+	}
+
+	// Weapon info
+	if item.WeaponDamage > 0 {
+		atkName := ""
+		if an, ok := atkTypeNames[item.AttackType]; ok {
+			atkName = an + "  "
+		}
+		lines = append(lines, struct {
+			text  string
+			color rl.Color
+		}{fmt.Sprintf("%sDmg: %d", atkName, item.WeaponDamage), colorWhite})
+	}
+
+	// Stats
+	if len(item.Stats) > 0 {
+		lines = append(lines, struct {
+			text  string
+			color rl.Color
+		}{"", colorDim}) // spacer
+		for idx, val := range item.Stats {
+			name := fmt.Sprintf("Stat %d", idx)
+			if sn, ok := tooltipStatNames[idx]; ok {
+				name = sn
+			}
+			statColor := rl.Color{R: 100, G: 200, B: 100, A: 255}
+			if val < 0 {
+				statColor = rl.Color{R: 200, G: 100, B: 100, A: 255}
+			}
+			lines = append(lines, struct {
+				text  string
+				color rl.Color
+			}{fmt.Sprintf("%s: %+d", name, val), statColor})
+		}
+	}
+
+	// Description
+	if item.Desc != "" {
+		lines = append(lines, struct {
+			text  string
+			color rl.Color
+		}{"", colorDim})
+		// Word-wrap description at ~35 chars
+		desc := item.Desc
+		for len(desc) > 35 {
+			cut := 35
+			for cut > 20 && desc[cut] != ' ' {
+				cut--
+			}
+			if cut <= 20 {
+				cut = 35
+			}
+			lines = append(lines, struct {
+				text  string
+				color rl.Color
+			}{desc[:cut], rl.Color{R: 170, G: 170, B: 140, A: 255}})
+			desc = desc[cut:]
+			if len(desc) > 0 && desc[0] == ' ' {
+				desc = desc[1:]
+			}
+		}
+		if desc != "" {
+			lines = append(lines, struct {
+				text  string
+				color rl.Color
+			}{desc, rl.Color{R: 170, G: 170, B: 140, A: 255}})
+		}
+	}
+
+	// Cost
+	if item.ItemCost > 0 {
+		lines = append(lines, struct {
+			text  string
+			color rl.Color
+		}{fmt.Sprintf("Value: %s", formatTunar(item.ItemCost)), colorDim})
+	}
+
+	// Compute tooltip dimensions
+	lineH := int32(15)
+	padX := int32(8)
+	padY := int32(6)
+	iconPad := int32(0)
+	if hasIcon {
+		iconPad = iconSize + 6
+	}
+	maxW := int32(0)
+	for _, l := range lines {
+		tw := c.measureText(l.text, 11)
+		if tw > maxW {
+			maxW = tw
+		}
+	}
+	ttW := maxW + padX*2 + iconPad
+	ttH := int32(len(lines))*lineH + padY*2
+	if hasIcon && ttH < iconSize+padY*2 {
+		ttH = iconSize + padY*2
+	}
+
+	// Position: prefer right of cursor, clamp to screen
+	tx := screenX + 16
+	ty := screenY
+	if tx+ttW > screenWidth-10 {
+		tx = screenX - ttW - 8
+	}
+	if ty+ttH > screenHeight-10 {
+		ty = screenHeight - ttH - 10
+	}
+
+	// Draw tooltip background + border
+	rl.DrawRectangle(tx-1, ty-1, ttW+2, ttH+2, rl.Color{R: 60, G: 55, B: 40, A: 255})
+	rl.DrawRectangle(tx, ty, ttW, ttH, rl.Color{R: 15, G: 15, B: 22, A: 245})
+
+	// Draw icon (top-left corner)
+	textOffsetX := int32(0)
+	if hasIcon {
+		rl.DrawTexturePro(iconTex,
+			rl.Rectangle{Width: float32(iconTex.Width), Height: float32(iconTex.Height)},
+			rl.Rectangle{X: float32(tx + padX), Y: float32(ty + padY), Width: float32(iconSize), Height: float32(iconSize)},
+			rl.Vector2{}, 0, rl.White)
+		textOffsetX = iconPad
+	}
+
+	// Draw lines
+	ly := ty + padY
+	for _, l := range lines {
+		if l.text != "" {
+			c.drawText(l.text, tx+padX+textOffsetX, ly, 11, l.color)
+		}
+		ly += lineH
+		// After first 3 lines (name + slot + weapon), text goes full width
+		if ly > ty+padY+3*lineH {
+			textOffsetX = 0
+		}
+	}
+}

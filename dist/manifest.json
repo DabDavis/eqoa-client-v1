@@ -1,9 +1,9 @@
 {
-  "version": "20260326-9851dc5",
+  "version": "20260326-8dcc2c4",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "594f29ad432a194f32e5a149ffc9204e06d7f29f9a9d3b9331351b5fa823370b",
+  "linux_sha256": "18e7e91f022831db0f396ca0632c4df90aace5644291cd553f8337d7d0f25e6f",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "2477503b873c163464fda9af34048fc6cdcdc88a2d826ea59992ece0dfa5513a",
-  "changelog": "- Widget: CharPreviewData struct for reusable 3D character preview\n- Add UI widget system: Button, TextInput, Slider, ScrollList, Checkbox\n- Session end: auction working, UI widget system planned\n- Auction: two-column UI with search filters\n- Auction: auto-fetch all pages, remove chat spam, fix Search All"
+  "windows_sha256": "3b645703e60524bbd2dae211c9c6a3f241a9bfeb114c4c391a100fbd8a301d58",
+  "changelog": "- Refactor drawEquipPreview → uiCharPreview widget\n- Widget: CharPreviewData struct for reusable 3D character preview\n- Add UI widget system: Button, TextInput, Slider, ScrollList, Checkbox\n- Session end: auction working, UI widget system planned\n- Auction: two-column UI with search filters"
 }
