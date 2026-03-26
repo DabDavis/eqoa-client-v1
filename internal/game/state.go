@@ -1406,6 +1406,10 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 		return
 	}
 	log.Printf("MemoryDump: pos=%d spellCount=%d", reader.Position(), spellCount)
+	if spellCount < 0 || spellCount > 500 {
+		log.Printf("MemoryDump: spells: bad count %d, skipping", spellCount)
+		return
+	}
 
 	gs.ParsedSpells = nil
 	for i := int64(0); i < spellCount; i++ {
