@@ -417,8 +417,11 @@ func (c *Client) drawCharacterSelect() {
 		c.drawDeleteConfirm(gs.Characters[c.charSelectIdx].Name)
 	}
 
-	// ESC hint top-left of screen
-	c.drawText("ESC - Back", 10, 10, 12, colorHintGray)
+	// Back arrow + mute button (top-left)
+	if c.uiBackArrow(6, 6) {
+		c.disconnectAndReturnToLogin()
+	}
+	c.uiMuteButton(6, 38)
 }
 
 // enterAppearanceEdit starts the appearance editor for the selected character.

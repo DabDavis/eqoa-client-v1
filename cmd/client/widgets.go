@@ -905,14 +905,34 @@ func (c *Client) uiMuteButton(x, y int32) {
 	rl.DrawRectangle(x, y, sz, sz, bg)
 
 	muted := c.masterVolume == 0
-	if muted {
-		c.drawText("M", x+6, y+4, 14, rl.Color{R: 200, G: 80, B: 80, A: 255})
-	} else {
-		clr := colorDim
-		if hover {
-			clr = colorWhite
+
+	// Try to draw bard spell icon (anthem); fall back to text
+	iconDrawn := false
+	if tex, ok := c.getSpellIcon(202); ok {
+		src := rl.Rectangle{Width: float32(tex.Width), Height: float32(tex.Height)}
+		dst := rl.Rectangle{X: float32(x + 2), Y: float32(y + 2), Width: float32(sz - 4), Height: float32(sz - 4)}
+		tint := rl.White
+		if muted {
+			tint = rl.Color{R: 255, G: 80, B: 80, A: 200}
 		}
-		c.drawText("S", x+6, y+4, 14, clr)
+		rl.DrawTexturePro(tex, src, dst, rl.Vector2{}, 0, tint)
+		iconDrawn = true
+	}
+	if !iconDrawn {
+		if muted {
+			c.drawText("M", x+6, y+4, 14, rl.Color{R: 200, G: 80, B: 80, A: 255})
+		} else {
+			clr := colorDim
+			if hover {
+				clr = colorWhite
+			}
+			c.drawText("S", x+6, y+4, 14, clr)
+		}
+	}
+	if muted && iconDrawn {
+		// Draw X over icon when muted
+		rl.DrawLine(x+4, y+4, x+sz-4, y+sz-4, rl.Color{R: 255, G: 60, B: 60, A: 255})
+		rl.DrawLine(x+4, y+sz-4, x+sz-4, y+4, rl.Color{R: 255, G: 60, B: 60, A: 255})
 	}
 
 	if hover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {

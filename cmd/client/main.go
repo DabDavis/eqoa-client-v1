@@ -669,7 +669,9 @@ func main() {
 			if client.titleScr != nil && client.titleScr.loaded && !client.titleShown {
 				client.titleShown = true
 				for !rl.WindowShouldClose() {
-					if anyKeyPressed() {
+					// Skip "any key" if clicking in mute button area (top-left 30x30)
+					muteArea := rl.IsMouseButtonPressed(0) && rl.GetMouseX() < 32 && rl.GetMouseY() < 32
+					if !muteArea && anyKeyPressed() {
 						break
 					}
 					client.audioSys.UpdateBGM()
