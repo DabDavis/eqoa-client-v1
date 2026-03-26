@@ -3214,6 +3214,7 @@ func (gs *GameState) handleCooldownTimer(msg *protocol.Message) {
 func (gs *GameState) handleCastingCombat(msg *protocol.Message) {
 	data := msg.Data()
 	payload := data[2:] // skip opcode
+	log.Printf("CastingCombat RAW: playerObjID=0x%08X payload=%X", gs.PlayerObjectID, payload)
 
 	// PS2 wire format (0x00BD1F10 → func_00BD3738):
 	//   casterObjID(uint32) + targetObjID(uint32) + extraCount(uint8)
