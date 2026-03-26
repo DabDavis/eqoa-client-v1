@@ -1189,6 +1189,7 @@ func handleCommand(engine *game.Engine, line string) {
 			fmt.Println("No target. Use: target <objectID>")
 			return
 		}
+		engine.CombatEngaged = true // set byte 36 in 0x40 packet (auto-attack flag)
 		engine.SendAttack(lastTargetID)
 		engine.ForcePositionFlush() // send 0x40 (with new facing + target) + attack in one packet
 		fmt.Printf("Attacking objectID %d\n", lastTargetID)
