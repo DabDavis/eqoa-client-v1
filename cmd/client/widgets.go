@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"sort"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 
@@ -626,7 +627,14 @@ func (c *Client) uiItemTooltip(item *game.ParsedItem, screenX, screenY int32) {
 			text  string
 			color rl.Color
 		}{"", colorDim}) // spacer
-		for idx, val := range item.Stats {
+		// Sort stat keys for stable display order
+		statKeys := make([]int, 0, len(item.Stats))
+		for k := range item.Stats {
+			statKeys = append(statKeys, k)
+		}
+		sort.Ints(statKeys)
+		for _, idx := range statKeys {
+			val := item.Stats[idx]
 			name := fmt.Sprintf("Stat %d", idx)
 			if sn, ok := tooltipStatNames[idx]; ok {
 				name = sn
