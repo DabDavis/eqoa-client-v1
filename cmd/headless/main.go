@@ -1716,7 +1716,7 @@ func handleCommand(engine *game.Engine, line string) {
 		// auction [seq] — search auction house
 		// PS2 sequence: sub=0x08 (open), then sub=0x07 (search)
 		// The sequence byte increments with each request
-		seq := byte(0x10) // starting sequence
+		seq := byte(0x04) // PS2 starts at seq=4
 		if len(parts) >= 2 {
 			p, err := strconv.Atoi(parts[1])
 			if err == nil && p >= 0 && p < 256 {
@@ -1726,29 +1726,17 @@ func handleCommand(engine *game.Engine, line string) {
 		// PS2 sequence: 0x1101/sub=4 (open) → 0x1101/sub=6 (category=All)
 		// → 0x1205/sub=0x08 (browse acks) → 0x1205/sub=0x07 (search)
 
-		// Step 1: Open auction board (0x1101 sub=4)
-		initData := []byte{0x08, 0xe0, 0x90, 0x03, 0xbc, 0x14, 0xee, 0xac, 0x03, 0xd4, 0x9b, 0x03}
-		engine.SendAuctionInit(4, initData)
-		time.Sleep(300 * time.Millisecond)
-
-		// Step 2: Select category "All" (0x1101 sub=6, category=0)
-		engine.SendAuctionInit(6, []byte{0x00, 0x00, 0x00, 0x00})
-		time.Sleep(300 * time.Millisecond)
-
-		// Step 3: Browse request (0x1205 sub=0x08)
-		engine.SendAuctionRequest(0x08, 0x06, nil)
-		time.Sleep(300 * time.Millisecond)
-
-		// Step 4: Search all items (sub=0x07, empty filter)
+		// PS2 sends 0x1205 sub=0x07 directly (no init needed)
+		// Exact bytes from PS2 pcap (confirmed working, returns items):
+		// 07 10 01 01 00 00 00 00 00 00 00 00 00 FF×8 02 64 00 FE A7 D6 B9 07 03 01 01
 		searchFilter := []byte{
 			0x01, 0x01,                                     // flags
-			0x00, 0x00, 0x00, 0x00,                         // name filter len (0)
-			0x00, 0x00, 0x00, 0x00, 0x00,                   // padding
-			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // class/race mask (all)
-			0x02, 0x64,                                     // level range (2-100)
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // filterType=0 + empty blobs
+			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // class mask (all)
+			0x02, 0x64,                                     // level 2-100
 			0x00,                                           // unk
 			0xFE, 0xA7, 0xD6, 0xB9, 0x07,                  // max price (zigzag)
-			0x03, 0x01, 0x01,                               // sort/page
+			0x03, 0x01, 0x01,                               // sort col, dir, page
 		}
 		engine.SendAuctionRequest(0x07, seq, searchFilter)
 		fmt.Printf("Auction search requested (seq %d). Results will appear shortly.\n", seq)
