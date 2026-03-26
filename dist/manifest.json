@@ -1,9 +1,9 @@
 {
-  "version": "20260326-506c933",
+  "version": "20260326-8c82faa",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "bbeb90a63a468eaa925227ed0dca3a14d3da369217c4213f386de1829f403c9f",
+  "linux_sha256": "7a6ce3bea4dc4645f4fe7f58ac291cf2090f4c79410d140fbf1114831f1c4e41",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "bb972a51496837691849246df8dbe9541b154956f0f6b9cd4ff56b650d242d1e",
-  "changelog": "- Updater: convert to widget system\n- Login screen: convert to widget system\n- Fix tooltip stat dancing: sort map keys for stable order\n- Wire item tooltip to auction hover — shows stats, icon, description\n- UI Theme toggle: Modern (rounded/shadows/gradients) vs Classic"
+  "windows_sha256": "a603a7b1ef98000d5c6178b05a50b697663799661dfda95a6ec3170b850e6a31",
+  "changelog": "- Replace all 5 inline sub-tab drawings with uiTabBar widget\n- Updater: convert to widget system\n- Login screen: convert to widget system\n- Fix tooltip stat dancing: sort map keys for stable order\n- Wire item tooltip to auction hover — shows stats, icon, description"
 }

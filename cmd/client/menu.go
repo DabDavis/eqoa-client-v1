@@ -1892,43 +1892,22 @@ func (c *Client) drawMenuWho(startY, contentH int32) {
 		return
 	}
 
-	// Header
-	c.drawText(fmt.Sprintf("Players Online: %d", len(gs.WhoList)), menuXPos()+menuPad, y, 14, gold)
+	// Header + buttons
+	c.uiLabel(menuXPos()+menuPad, y, fmt.Sprintf("Players Online: %d", len(gs.WhoList)), 14, gold)
 
-	// Refresh + Sort buttons (right-aligned)
-	mx, my := rl.GetMouseX(), rl.GetMouseY()
-
+	rightX := menuXPos() + menuW - menuPad
 	sortLabel := "[A-Z]"
 	if c.whoSortByLevel {
 		sortLabel = "[Level]"
 	}
 	sw := c.measureText(sortLabel, 13)
-	sx := menuXPos() + menuW - menuPad - sw
-
-	refreshStr := "[Refresh]"
-	rw := c.measureText(refreshStr, 13)
-	rx := sx - rw - 8
-
-	isSortHover := mx >= sx && mx < sx+sw && my >= y && my < y+lineH
-	sClr := dim
-	if isSortHover {
-		sClr = gold
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			c.whoSortByLevel = !c.whoSortByLevel
-			c.menuScroll = 0
-		}
+	if c.uiButton(rightX-sw, y, sortLabel, 13) {
+		c.whoSortByLevel = !c.whoSortByLevel
+		c.menuScroll = 0
 	}
-	c.drawText(sortLabel, sx, y, 13, sClr)
-
-	isRefreshHover := mx >= rx && mx < rx+rw && my >= y && my < y+lineH
-	rClr := dim
-	if isRefreshHover {
-		rClr = gold
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			c.engine.SendWhoList()
-		}
+	if c.uiButton(rightX-sw-c.measureText("[Refresh]", 13)-8, y, "[Refresh]", 13) {
+		c.engine.SendWhoList()
 	}
-	c.drawText(refreshStr, rx, y, 13, rClr)
 	y += lineH + 4
 
 	// Sort entries
@@ -1937,7 +1916,7 @@ func (c *Client) drawMenuWho(startY, contentH int32) {
 	if c.whoSortByLevel {
 		sort.Slice(entries, func(i, j int) bool {
 			if entries[i].Level != entries[j].Level {
-				return entries[i].Level > entries[j].Level // highest first
+				return entries[i].Level > entries[j].Level
 			}
 			return entries[i].Name < entries[j].Name
 		})
@@ -1945,39 +1924,18 @@ func (c *Client) drawMenuWho(startY, contentH int32) {
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	}
 
-	// Scrollable list
-	listTop := y
+	// Scrollable who list
 	listH := contentH - (y - startY) - 4
-	maxVisible := int(listH / lineH)
-	if c.menuScroll > len(entries)-maxVisible {
-		c.menuScroll = len(entries) - maxVisible
-	}
-	if c.menuScroll < 0 {
-		c.menuScroll = 0
-	}
-
-	for i := c.menuScroll; i < len(entries) && int32(i-c.menuScroll)*lineH < listH; i++ {
-		ey := listTop + int32(i-c.menuScroll)*lineH
-		e := entries[i]
-
-		if i%2 == 0 {
-			rl.DrawRectangle(menuXPos()+menuPad, ey, menuW-menuPad*2, lineH, colorRowBg1)
-		}
-
-		c.drawText(e.Name, menuXPos()+menuPad+4, ey+2, 13, colorPlayerName)
-
-		// Race/Class/Level on right
-		info := fmt.Sprintf("Lv %d %s %s", e.Level, raceName(int(e.Race)), className(int(e.Class)))
-		iw := c.measureText(info, 12)
-		c.drawText(info, menuXPos()+menuW-menuPad-iw-4, ey+2, 12, white)
-	}
-
-	// Scroll indicator
-	if len(entries) > maxVisible {
-		indicator := fmt.Sprintf("%d-%d of %d", c.menuScroll+1, min(c.menuScroll+maxVisible, len(entries)), len(entries))
-		iw := c.measureText(indicator, 11)
-		c.drawText(indicator, menuXPos()+menuW-menuPad-iw, listTop+listH+2, 11, dim)
-	}
+	px := menuXPos() + menuPad
+	listW := menuW - menuPad*2
+	c.uiScrollList(px, y, listW, listH, len(entries), &c.menuScroll, lineH,
+		func(i int, x, ey, w int32, hover bool) {
+			e := entries[i]
+			c.drawText(e.Name, x+4, ey+2, 13, colorPlayerName)
+			info := fmt.Sprintf("Lv %d %s %s", e.Level, raceName(int(e.Race)), className(int(e.Class)))
+			iw := c.measureText(info, 12)
+			c.drawText(info, x+w-iw-4, ey+2, 12, white)
+		})
 }
 
 // --- Settings Tab ---
@@ -2079,12 +2037,10 @@ func (c *Client) drawMenuLFG(startY, contentH int32) {
 		return
 	}
 
-	gold := colorGold
 	white := colorWhite
-	dim := colorDim
 	lineH := int32(18)
-	mx, my := rl.GetMouseX(), rl.GetMouseY()
-
+	px := menuXPos() + menuPad
+	listW := menuW - menuPad*2
 	y := startY
 
 	// LFG toggle button
@@ -2092,27 +2048,17 @@ func (c *Client) drawMenuLFG(startY, contentH int32) {
 	if gs.LFGRegistered {
 		regLabel = "[Unregister LFG]"
 	}
-	rw := c.measureText(regLabel, 13)
-	rx := menuXPos() + menuPad
-	isRegHover := mx >= rx && mx < rx+rw && my >= y && my < y+lineH
-	isRegSelected := c.menuRow == 0
-	regClr := dim
-	if isRegHover || isRegSelected {
-		regClr = gold
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			c.engine.SendLFGToggle(!gs.LFGRegistered)
-		}
+	if c.uiButton(px, y, regLabel, 13) {
+		c.engine.SendLFGToggle(!gs.LFGRegistered)
 	}
-	c.drawText(regLabel, rx, y, 13, regClr)
 	y += lineH + 4
 
 	if len(gs.LFGList) == 0 {
-		c.drawText("No players in LFG list.", menuXPos()+menuPad, y, 14, dim)
+		c.uiLabel(px, y, "No players in LFG list.", 14, colorDim)
 		return
 	}
 
-	// Header
-	c.drawText(fmt.Sprintf("Players LFG: %d", len(gs.LFGList)), menuXPos()+menuPad, y, 14, gold)
+	c.uiLabel(px, y, fmt.Sprintf("Players LFG: %d", len(gs.LFGList)), 14, colorGold)
 	y += lineH + 4
 
 	// Sort by level descending
@@ -2125,37 +2071,19 @@ func (c *Client) drawMenuLFG(startY, contentH int32) {
 		return entries[i].Name < entries[j].Name
 	})
 
-	// Scrollable list
-	listTop := y
 	listH := contentH - (y - startY) - 4
-	maxVisible := int(listH / lineH)
-	if c.menuScroll > len(entries)-maxVisible {
-		c.menuScroll = len(entries) - maxVisible
-	}
-	if c.menuScroll < 0 {
-		c.menuScroll = 0
-	}
-
-	for i := c.menuScroll; i < len(entries) && int32(i-c.menuScroll)*lineH < listH; i++ {
-		ey := listTop + int32(i-c.menuScroll)*lineH
-		e := entries[i]
-
-		if i%2 == 0 {
-			rl.DrawRectangle(menuXPos()+menuPad, ey, menuW-menuPad*2, lineH, colorRowBg1)
-		}
-
-		// Name (with guild if present)
-		nameStr := e.Name
-		if e.GuildName != "" {
-			nameStr = fmt.Sprintf("%s <%s>", e.Name, e.GuildName)
-		}
-		c.drawText(nameStr, menuXPos()+menuPad+4, ey+2, 13, colorPlayerName)
-
-		// Level/Class on right
-		info := fmt.Sprintf("Lv %d %s", e.Level, className(int(e.Class)))
-		iw := c.measureText(info, 12)
-		c.drawText(info, menuXPos()+menuW-menuPad-iw-4, ey+3, 12, white)
-	}
+	c.uiScrollList(px, y, listW, listH, len(entries), &c.menuScroll, lineH,
+		func(i int, x, ey, w int32, hover bool) {
+			e := entries[i]
+			nameStr := e.Name
+			if e.GuildName != "" {
+				nameStr = fmt.Sprintf("%s <%s>", e.Name, e.GuildName)
+			}
+			c.drawText(nameStr, x+4, ey+2, 13, colorPlayerName)
+			info := fmt.Sprintf("Lv %d %s", e.Level, className(int(e.Class)))
+			iw := c.measureText(info, 12)
+			c.drawText(info, x+w-iw-4, ey+3, 12, white)
+		})
 }
 
 func (c *Client) drawMenuAuction(startY, contentH int32) {
