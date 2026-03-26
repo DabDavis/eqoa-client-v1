@@ -1723,13 +1723,23 @@ func handleCommand(engine *game.Engine, line string) {
 				seq = byte(p)
 			}
 		}
-		// PS2 sequence from pcap: 0x08(6), 0x08(10), 0x07(16)
-		// Step 1: Open auction categories
+		// PS2 sequence: 0x1101/sub=4 (open) → 0x1101/sub=6 (category=All)
+		// → 0x1205/sub=0x08 (browse acks) → 0x1205/sub=0x07 (search)
+
+		// Step 1: Open auction board (0x1101 sub=4)
+		initData := []byte{0x08, 0xe0, 0x90, 0x03, 0xbc, 0x14, 0xee, 0xac, 0x03, 0xd4, 0x9b, 0x03}
+		engine.SendAuctionInit(4, initData)
+		time.Sleep(300 * time.Millisecond)
+
+		// Step 2: Select category "All" (0x1101 sub=6, category=0)
+		engine.SendAuctionInit(6, []byte{0x00, 0x00, 0x00, 0x00})
+		time.Sleep(300 * time.Millisecond)
+
+		// Step 3: Browse request (0x1205 sub=0x08)
 		engine.SendAuctionRequest(0x08, 0x06, nil)
 		time.Sleep(300 * time.Millisecond)
-		engine.SendAuctionRequest(0x08, 0x0A, nil)
-		time.Sleep(300 * time.Millisecond)
-		// Step 2: Search all items (sub=0x07, empty filter)
+
+		// Step 4: Search all items (sub=0x07, empty filter)
 		searchFilter := []byte{
 			0x01, 0x01,                                     // flags
 			0x00, 0x00, 0x00, 0x00,                         // name filter len (0)

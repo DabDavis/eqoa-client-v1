@@ -1330,6 +1330,22 @@ func (e *Engine) SendAuctionRequest(sub byte, page byte, extra []byte) {
 	log.Printf("Sent AuctionRequest sub=0x%02X page=%d extraLen=%d", sub, page, len(extra))
 }
 
+// SendAuctionInit sends opcode 0x1101 — auction board init/navigation.
+// PS2 pcap: sub=4 opens auction, sub=6 selects category.
+func (e *Engine) SendAuctionInit(sub byte, extra []byte) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 5+len(extra))
+	data[0] = sub
+	binary.LittleEndian.PutUint32(data[1:5], 0) // unk1 = 0
+	copy(data[5:], extra)
+	if !e.State.Conn.QueueReliable(0x1101, data) {
+		log.Printf("WARNING: AuctionInit send window full")
+	}
+	log.Printf("Sent AuctionInit sub=%d extraLen=%d", sub, len(extra))
+}
+
 // SendLFGToggle toggles the player's LFG registration by sending "lfg" or "lfg off" in chat.
 // Sandstorm uses chat commands for LFG, not a dedicated opcode.
 func (e *Engine) SendLFGToggle(register bool) {
