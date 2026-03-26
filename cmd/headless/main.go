@@ -1713,35 +1713,42 @@ func handleCommand(engine *game.Engine, line string) {
 		}
 
 	case "auction":
-		// auction [seq] — search auction house
-		// PS2 sequence: sub=0x08 (open), then sub=0x07 (search)
-		// The sequence byte increments with each request
-		seq := byte(0x04) // PS2 starts at seq=4
+		// Step 1: Init auction session (0x1101 sub=4) to get session ID
+		gs := engine.State
+		if gs.AuctionSessionID == 0 {
+			initData := []byte{0x08, 0xe0, 0x90, 0x03, 0xbc, 0x14, 0xee, 0xac, 0x03, 0xd4, 0x9b, 0x03}
+			engine.SendAuctionInit(4, initData)
+			time.Sleep(1 * time.Second)
+			// Select category All
+			engine.SendAuctionInit(6, []byte{0x00, 0x00, 0x00, 0x00})
+			time.Sleep(1 * time.Second)
+		}
+
+		// Use session ID from 0x1102 response, or fallback to 0x04
+		seq := gs.AuctionSessionID
+		if seq == 0 {
+			seq = 0x04
+		}
 		if len(parts) >= 2 {
 			p, err := strconv.Atoi(parts[1])
 			if err == nil && p >= 0 && p < 256 {
 				seq = byte(p)
 			}
 		}
-		// PS2 sequence: 0x1101/sub=4 (open) → 0x1101/sub=6 (category=All)
-		// → 0x1205/sub=0x08 (browse acks) → 0x1205/sub=0x07 (search)
 
-		// PS2 sends 0x1205 sub=0x07 directly (no init needed)
-		// Exact bytes from PS2 pcap (confirmed working, returns items):
-		// 07 10 01 01 00 00 00 00 00 00 00 00 00 FF×8 02 64 00 FE A7 D6 B9 07 03 01 01
+		// Step 2: Search all items
 		searchFilter := []byte{
-			0x01, 0x01,                                     // flags
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // filterType=0 + empty blobs
-			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // class mask (all)
-			0x02, 0x64,                                     // level 2-100
-			0x00,                                           // unk
-			0xFE, 0xA7, 0xD6, 0xB9, 0x07,                  // max price (zigzag)
-			0x03, 0x01, 0x01,                               // sort col, dir, page
+			0x01, 0x01,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+			0x02, 0x64,
+			0x00,
+			0xFE, 0xA7, 0xD6, 0xB9, 0x07,
+			0x03, 0x01, 0x01,
 		}
 		engine.SendAuctionRequest(0x07, seq, searchFilter)
-		fmt.Printf("Auction search requested (seq %d). Results will appear shortly.\n", seq)
+		fmt.Printf("Auction search (sessionID=%d seq=%d). Waiting...\n", gs.AuctionSessionID, seq)
 		// Print any cached results
-		gs := engine.State
 		if len(gs.AuctionItems) > 0 {
 			fmt.Printf("=== Auction Listings (%d) ===\n", len(gs.AuctionItems))
 			for i, ai := range gs.AuctionItems {

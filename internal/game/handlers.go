@@ -1119,18 +1119,39 @@ func (gs *GameState) handleWhoListFiltered(msg *protocol.Message) {
 	gs.handleWhoListResponse(msg)
 }
 
-// handleIgnoreListResult handles opcode 0x1102 — ignore list display.
+// handleIgnoreListResult handles opcode 0x1102 — dual purpose:
+// 1. Ignore list display (when no auction session active)
+// 2. Auction init response (sub=0x0C open ack, sub=0x0F category ack)
+// The first byte after opcode determines the sub-type.
 func (gs *GameState) handleIgnoreListResult(msg *protocol.Message) {
 	data := msg.Data()
-	log.Printf("IgnoreListResult: dataLen=%d", len(data))
-
-	// Extract names from data
-	strs := extractUTF16Strings(data)
-	gs.IgnoreList = gs.IgnoreList[:0]
-	for _, s := range strs {
-		gs.IgnoreList = append(gs.IgnoreList, s)
+	if len(data) < 3 {
+		return
 	}
-	log.Printf("IgnoreListResult: %d entries", len(gs.IgnoreList))
+	payload := data[2:] // skip opcode
+	sub := payload[0]
+
+	log.Printf("0x1102: sub=0x%02X payloadLen=%d hex=%X", sub, len(payload), payload)
+
+	switch {
+	case sub == 0x0C:
+		// Auction open response — contains session/request ID
+		if len(payload) >= 2 {
+			gs.AuctionSessionID = payload[1]
+			log.Printf("AuctionOpen: sessionID=%d (byte[1]=0x%02X)", gs.AuctionSessionID, gs.AuctionSessionID)
+		}
+	case sub == 0x0F:
+		// Auction category ack
+		log.Printf("AuctionCategoryAck: payload=%X", payload)
+	default:
+		// Ignore list
+		strs := extractUTF16Strings(data)
+		gs.IgnoreList = gs.IgnoreList[:0]
+		for _, s := range strs {
+			gs.IgnoreList = append(gs.IgnoreList, s)
+		}
+		log.Printf("IgnoreListResult: %d entries", len(gs.IgnoreList))
+	}
 }
 
 // =============================================================================

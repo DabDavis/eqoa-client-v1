@@ -392,7 +392,8 @@ type GameState struct {
 	WhoList []WhoEntry
 
 	// Auction house (from opcode 0x1206)
-	AuctionItems []AuctionItem
+	AuctionItems     []AuctionItem
+	AuctionSessionID byte // from 0x1102 sub=0x0C response — used as seq in 0x1205
 
 	// PS2 Hotkey Menu (parsed from MemoryDump)
 	Hotkeys []HotkeyEntry // tree-structured hotkey entries (25 default)
