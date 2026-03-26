@@ -2321,104 +2321,183 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	green := rl.Color{R: 100, G: 220, B: 100, A: 255}
 	lineH := int32(18)
 	mx, my := rl.GetMouseX(), rl.GetMouseY()
-	leftX := menuXPos() + menuPad
-	rightX := menuXPos() + menuW - menuPad
+	panelLeft := menuXPos() + menuPad
+	panelRight := menuXPos() + menuW - menuPad
+	filterW := int32(140) // left column width
+	dividerX := panelLeft + filterW + 6
+	resultLeft := dividerX + 4
 
+	// === LEFT COLUMN: Search Filters ===
 	y := startY
+	filterBg := rl.Color{R: 20, G: 20, B: 32, A: 255}
+	rl.DrawRectangle(panelLeft-2, y, filterW+4, contentH, filterBg)
 
-	// === Top bar: Search + Load All + item count ===
-	searchLabel := "[Search All]"
-	sw := c.measureText(searchLabel, 13)
-	isSearchHover := mx >= leftX && mx < leftX+sw && my >= y && my < y+lineH
-	searchClr := dim
-	if isSearchHover {
-		searchClr = cyan
+	c.drawText("Search", panelLeft, y+2, 13, gold)
+	y += lineH + 4
+
+	// Name filter input box
+	c.drawText("Name:", panelLeft, y+2, 11, dim)
+	y += lineH
+	boxBg := rl.Color{R: 12, G: 12, B: 20, A: 255}
+	boxBorder := rl.Color{R: 50, G: 50, B: 70, A: 255}
+	if c.auctionSearchFocus {
+		boxBorder = cyan
 	}
-	if isSearchHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-		gs.AuctionItems = nil
-		gs.AuctionLastListing = 0
-		gs.AuctionSeq = 0
-		seq := gs.AuctionSessionID
-		if seq == 0 { seq = 0x04 }
-		filter := []byte{
-			0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-			0x02, 0x64, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01,
+	rl.DrawRectangle(panelLeft, y, filterW, lineH, boxBg)
+	rl.DrawRectangleLines(panelLeft, y, filterW, lineH, boxBorder)
+
+	// Click to focus
+	if mx >= panelLeft && mx < panelLeft+filterW && my >= y && my < y+lineH {
+		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			c.auctionSearchFocus = true
 		}
-		c.engine.SendAuctionRequest(0x07, seq, filter)
-		c.auctionRequested = true
-		c.auctionFetchAll = true
-		c.menuScroll = 0
 	}
-	c.drawText(searchLabel, leftX, y, 13, searchClr)
 
-	// Load More button (next page) — show whenever we have a cursor from previous page
+	// Text input when focused
+	if c.auctionSearchFocus {
+		key := rl.GetCharPressed()
+		for key > 0 {
+			if key >= 32 && key < 127 && len(c.auctionSearchName) < 20 {
+				c.auctionSearchName += string(rune(key))
+			}
+			key = rl.GetCharPressed()
+		}
+		if rl.IsKeyPressed(rl.KeyBackspace) && len(c.auctionSearchName) > 0 {
+			c.auctionSearchName = c.auctionSearchName[:len(c.auctionSearchName)-1]
+		}
+		if rl.IsKeyPressed(rl.KeyEnter) || rl.IsKeyPressed(rl.KeyEscape) {
+			c.auctionSearchFocus = false
+		}
+	}
+
+	displayText := c.auctionSearchName
+	if displayText == "" {
+		displayText = "(all)"
+	}
+	if c.auctionSearchFocus {
+		displayText += "_"
+	}
+	c.drawText(displayText, panelLeft+3, y+3, 11, white)
+	y += lineH + 6
+
+	// Level range
+	c.drawText("Level:", panelLeft, y+2, 11, dim)
+	y += lineH
+	if c.auctionLevelMin == 0 { c.auctionLevelMin = 1 }
+	if c.auctionLevelMax == 0 { c.auctionLevelMax = 60 }
+	lvlStr := fmt.Sprintf("%d - %d", c.auctionLevelMin, c.auctionLevelMax)
+	c.drawText(lvlStr, panelLeft+3, y+2, 11, white)
+	// - / + buttons for min
+	minMinusX := panelLeft + 50
+	if mx >= minMinusX && mx < minMinusX+14 && my >= y && my < y+lineH && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		if c.auctionLevelMin > 1 { c.auctionLevelMin -= 5 }
+		if c.auctionLevelMin < 1 { c.auctionLevelMin = 1 }
+	}
+	if mx >= minMinusX+16 && mx < minMinusX+30 && my >= y && my < y+lineH && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		if c.auctionLevelMin < 60 { c.auctionLevelMin += 5 }
+	}
+	// - / + for max
+	maxMinusX := panelLeft + 90
+	if mx >= maxMinusX && mx < maxMinusX+14 && my >= y && my < y+lineH && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		if c.auctionLevelMax > 1 { c.auctionLevelMax -= 5 }
+	}
+	if mx >= maxMinusX+16 && mx < maxMinusX+30 && my >= y && my < y+lineH && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		if c.auctionLevelMax < 60 { c.auctionLevelMax += 5 }
+		if c.auctionLevelMax > 60 { c.auctionLevelMax = 60 }
+	}
+	y += lineH + 8
+
+	// Search button
+	searchLabel := "[Search]"
+	sw := c.measureText(searchLabel, 13)
+	isSearchHover := mx >= panelLeft && mx < panelLeft+sw && my >= y && my < y+lineH
+	searchClr := dim
+	if isSearchHover { searchClr = cyan }
+	if isSearchHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		c.auctionDoSearch(gs)
+	}
+	c.drawText(searchLabel, panelLeft, y, 13, searchClr)
+
+	// Search All button
+	allLabel := "[All]"
+	aw := c.measureText(allLabel, 13)
+	allX := panelLeft + sw + 8
+	isAllHover := mx >= allX && mx < allX+aw && my >= y && my < y+lineH
+	allClr := dim
+	if isAllHover { allClr = cyan }
+	if isAllHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		c.auctionSearchName = ""
+		c.auctionLevelMin = 1
+		c.auctionLevelMax = 60
+		c.auctionDoSearch(gs)
+		c.auctionFetchAll = true
+	}
+	c.drawText(allLabel, allX, y, 13, allClr)
+	y += lineH + 6
+
+	// Item count
+	if len(gs.AuctionItems) > 0 {
+		c.drawText(fmt.Sprintf("%d items", len(gs.AuctionItems)), panelLeft, y, 11, dim)
+		y += lineH
+	}
+
+	// Load More
 	if gs.AuctionLastListing != 0 {
-		moreLabel := "[Load More]"
-		mw := c.measureText(moreLabel, 13)
-		moreX := leftX + sw + 12
-		isMoreHover := mx >= moreX && mx < moreX+mw && my >= y && my < y+lineH
+		moreLabel := "[More]"
+		mw := c.measureText(moreLabel, 12)
+		isMoreHover := mx >= panelLeft && mx < panelLeft+mw && my >= y && my < y+lineH
 		moreClr := dim
 		if isMoreHover { moreClr = cyan }
 		if isMoreHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 			c.engine.SendAuctionNextPage()
 		}
-		c.drawText(moreLabel, moreX, y, 13, moreClr)
+		c.drawText(moreLabel, panelLeft, y, 12, moreClr)
 	}
 
-	// Item count (right-aligned)
-	if len(gs.AuctionItems) > 0 {
-		countStr := fmt.Sprintf("%d items", len(gs.AuctionItems))
-		cw := c.measureText(countStr, 12)
-		c.drawText(countStr, rightX-cw, y+2, 12, dim)
-	}
+	// === DIVIDER ===
+	rl.DrawRectangle(dividerX, startY, 1, contentH, rl.Color{R: 40, G: 40, B: 60, A: 255})
 
-	y += lineH + 2
+	// === RIGHT COLUMN: Results ===
+	y = startY
+	resultW := panelRight - resultLeft
 
 	// Auto-request on first open
 	if !c.auctionRequested {
-		seq := gs.AuctionSessionID
-		if seq == 0 { seq = 0x04 }
-		filter := []byte{
-			0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-			0x02, 0x64, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01,
-		}
-		c.engine.SendAuctionRequest(0x07, seq, filter)
-		c.auctionRequested = true
+		c.auctionDoSearch(gs)
+		c.auctionFetchAll = true
 	}
 
-	// Auto-fetch all pages when Search All is active
+	// Auto-fetch all pages
 	if c.auctionFetchAll && gs.AuctionLastListing != 0 && time.Since(c.auctionLastFetch) > 1500*time.Millisecond {
 		c.engine.SendAuctionNextPage()
 		c.auctionLastFetch = time.Now()
 		if len(gs.AuctionItems) > 500 {
-			c.auctionFetchAll = false // safety cap
+			c.auctionFetchAll = false
 		}
 	}
 
 	if len(gs.AuctionItems) == 0 {
-		c.drawText("Loading auction listings...", leftX, y+20, 14, dim)
+		c.drawText("Loading...", resultLeft, y+20, 14, dim)
 		return
 	}
 
-	// === Column headers ===
-	nameCol := leftX
-	lvlCol := leftX + menuW*40/100
-	sellerCol := leftX + menuW*48/100
-	bidCol := leftX + menuW*68/100
-	buyoutCol := leftX + menuW*84/100
+	// Column headers
+	nameCol := resultLeft
+	lvlCol := resultLeft + resultW*42/100
+	sellerCol := resultLeft + resultW*50/100
+	bidCol := resultLeft + resultW*70/100
+	buyoutCol := resultLeft + resultW*86/100
 
 	headerBg := rl.Color{R: 25, G: 25, B: 40, A: 255}
-	rl.DrawRectangle(leftX-2, y, menuW-menuPad*2+4, lineH, headerBg)
-	c.drawText("Item", nameCol, y+2, 12, gold)
-	c.drawText("Lv", lvlCol, y+2, 12, gold)
-	c.drawText("Seller", sellerCol, y+2, 12, gold)
-	c.drawText("Bid", bidCol, y+2, 12, gold)
-	c.drawText("Buyout", buyoutCol, y+2, 12, gold)
+	rl.DrawRectangle(resultLeft-2, y, resultW+4, lineH, headerBg)
+	c.drawText("Item", nameCol, y+2, 11, gold)
+	c.drawText("Lv", lvlCol, y+2, 11, gold)
+	c.drawText("Seller", sellerCol, y+2, 11, gold)
+	c.drawText("Bid", bidCol, y+2, 11, gold)
+	c.drawText("Buyout", buyoutCol, y+2, 11, gold)
 	y += lineH + 1
 
-	// === Scrollable item list ===
+	// Scrollable results
 	listTop := y
 	listH := contentH - (y - startY) - 4
 	maxVisible := int(listH / lineH)
@@ -2439,49 +2518,85 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 		ey := listTop + int32(i-c.menuScroll)*lineH
 		ai := gs.AuctionItems[i]
 
-		// Row background
 		bg := rowBg1
 		if i%2 == 1 { bg = rowBg2 }
-		isRowHover := mx >= leftX && mx < rightX && my >= ey && my < ey+lineH
+		isRowHover := mx >= resultLeft && mx < panelRight && my >= ey && my < ey+lineH
 		if isRowHover { bg = hoverBg }
-		rl.DrawRectangle(leftX-2, ey, menuW-menuPad*2+4, lineH, bg)
+		rl.DrawRectangle(resultLeft-2, ey, resultW+4, lineH, bg)
 
 		// Item name (color by level)
 		nameClr := white
 		if ai.Item.LevelReq >= 45 {
-			nameClr = rl.Color{R: 255, G: 200, B: 50, A: 255} // epic gold
+			nameClr = rl.Color{R: 255, G: 200, B: 50, A: 255}
 		} else if ai.Item.LevelReq >= 30 {
-			nameClr = rl.Color{R: 100, G: 180, B: 255, A: 255} // rare blue
+			nameClr = rl.Color{R: 100, G: 180, B: 255, A: 255}
 		}
-		c.drawText(ai.Item.Name, nameCol, ey+2, 12, nameClr)
+		c.drawText(ai.Item.Name, nameCol, ey+2, 11, nameClr)
 
-		// Level
 		if ai.Item.LevelReq > 0 {
-			c.drawText(fmt.Sprintf("%d", ai.Item.LevelReq), lvlCol, ey+2, 11, dim)
+			c.drawText(fmt.Sprintf("%d", ai.Item.LevelReq), lvlCol, ey+2, 10, dim)
 		}
-
-		// Seller
-		c.drawText(ai.Seller, sellerCol, ey+2, 11, dim)
-
-		// Bid (format with K suffix for readability)
-		c.drawText(formatTunar(ai.CurrentBid), bidCol, ey+2, 11, green)
-
-		// Buyout
+		c.drawText(ai.Seller, sellerCol, ey+2, 10, dim)
+		c.drawText(formatTunar(ai.CurrentBid), bidCol, ey+2, 10, green)
 		if ai.BuyoutPrice > 0 {
-			c.drawText(formatTunar(ai.BuyoutPrice), buyoutCol, ey+2, 11, gold)
+			c.drawText(formatTunar(ai.BuyoutPrice), buyoutCol, ey+2, 10, gold)
 		} else {
-			c.drawText("-", buyoutCol, ey+2, 11, dim)
+			c.drawText("-", buyoutCol, ey+2, 10, dim)
 		}
 	}
 
-	// Scrollbar indicator
+	// Scrollbar
 	if totalItems > maxVisible && maxVisible > 0 {
 		scrollFrac := float32(c.menuScroll) / float32(totalItems-maxVisible)
 		barH := listH * int32(maxVisible) / int32(totalItems)
 		if barH < 10 { barH = 10 }
 		barY := listTop + int32(scrollFrac*float32(listH-barH))
-		rl.DrawRectangle(rightX-2, barY, 3, barH, rl.Color{R: 60, G: 60, B: 80, A: 200})
+		rl.DrawRectangle(panelRight-2, barY, 3, barH, rl.Color{R: 60, G: 60, B: 80, A: 200})
 	}
+}
+
+// auctionDoSearch sends an auction search with current filter settings.
+func (c *Client) auctionDoSearch(gs *game.GameState) {
+	gs.AuctionItems = nil
+	gs.AuctionLastListing = 0
+	gs.AuctionSeq = 0
+	seq := gs.AuctionSessionID
+	if seq == 0 { seq = 0x04 }
+
+	// Build search filter matching PS2 format
+	var filter []byte
+	filter = append(filter, 0x01, 0x01) // flags
+
+	// Name/type filter
+	searchName := c.auctionSearchName
+	if searchName == "" {
+		// No filter: 9 zero bytes
+		filter = append(filter, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+	} else {
+		// Type filter: uint32(charCount) + UTF-16LE(name)
+		filter = append(filter, 0x00, 0x00, 0x00, 0x00) // nameLen = 0 (no name filter)
+		runes := []rune(searchName)
+		lenBytes := make([]byte, 4)
+		lenBytes[0] = byte(len(runes))
+		filter = append(filter, lenBytes...)
+		for _, r := range runes {
+			filter = append(filter, byte(r), byte(r>>8))
+		}
+	}
+
+	// Class mask (all classes)
+	filter = append(filter, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+
+	// Level range
+	filter = append(filter, byte(c.auctionLevelMin), byte(c.auctionLevelMax))
+
+	// Unk + max price + sort
+	filter = append(filter, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01)
+
+	c.engine.SendAuctionRequest(0x07, seq, filter)
+	c.auctionRequested = true
+	c.auctionFetchAll = false
+	c.menuScroll = 0
 }
 
 // formatTunar is defined below (shared with merchant/repair UI)

@@ -257,9 +257,13 @@ type Client struct {
 	whoRequested      bool // true after first who list request sent
 	whoSortByLevel    bool // false=alphabetical, true=by level
 	auctionRequested  bool      // true after first auction browse sent
-	auctionFetchAll   bool      // auto-fetch all pages
-	auctionLastFetch  time.Time // throttle for auto-fetch
-	auctionPage       int       // current page for UI
+	auctionFetchAll    bool      // auto-fetch all pages
+	auctionLastFetch   time.Time // throttle for auto-fetch
+	auctionPage        int       // current page for UI
+	auctionSearchName  string    // filter: item name search text
+	auctionSearchFocus bool      // text input active
+	auctionLevelMin    int       // filter: min level (0=any)
+	auctionLevelMax    int       // filter: max level (100=any)
 
 	// Group tab state
 	groupInviteInput  string // text input for invite-by-name
