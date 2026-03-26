@@ -1374,10 +1374,16 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 	log.Printf("MemoryDump: pos=%d bankCount=%d", reader.Position(), bankCount)
 
 	for i := int64(0); i < bankCount; i++ {
+		prePos := reader.Position()
 		item, err := parseSingleItem(reader)
 		if err != nil {
-			log.Printf("MemoryDump: bank item %d parse error: %v (remaining=%d)", i, err, reader.Remaining())
+			log.Printf("MemoryDump: bank item %d parse error: %v (remaining=%d pos=%d)", i, err, reader.Remaining(), reader.Position())
 			return
+		}
+		postPos := reader.Position()
+		if i >= bankCount-3 || i < 3 {
+			log.Printf("MemoryDump: bank[%d] %q size=%d pos=%d→%d stats=%d",
+				i, item.Name, postPos-prePos, prePos, postPos, len(item.Stats))
 		}
 		item.InvSlot = len(gs.ParsedItems)
 		gs.ParsedItems = append(gs.ParsedItems, item)
@@ -1391,10 +1397,30 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 	//   byte 1: unknown (0x00)
 	//   byte 2: flag byte (0x01)
 	//   byte 3: unknown (0x00)
-	reader.ReadByte() // PS2: possibly effect count (zigzag 0)
-	reader.ReadByte() // PS2: possibly ignore count (zigzag 0)
-	reader.ReadByte() // PS2: flag byte (1 = has abilities)
-	reader.ReadByte() // PS2: unknown
+	// ─── Section D: Buffs + Flag + Spells ──────────────────────────────
+	// Sandstorm format (verified via Dolph [00 00 01 00] and McGregor [00 02 ...]):
+	//   byte(unk0) + zigzag(buffCount) + [buff rows] + byte(flag) + byte(unk1)
+	// Then spells follow.
+	unk0, _ := reader.ReadByte() // always 0x00
+	buffCount, _ := reader.Read7BitEncodedInt64()
+	log.Printf("MemoryDump: pos=%d unk0=%02X buffCount=%d remaining=%d",
+		reader.Position(), unk0, buffCount, reader.Remaining())
+	if buffCount > 0 && buffCount < 200 {
+		for i := int64(0); i < buffCount; i++ {
+			// Each buff row: try reading zigzag fields until we figure out the format.
+			// PS2 func_00CA6848: 2 key zigzag + 3 data zigzag + 1 flag byte = 6 reads per buff.
+			reader.Read7BitEncodedInt64() // key1
+			reader.Read7BitEncodedInt64() // key2
+			reader.Read7BitEncodedInt64() // field1
+			reader.Read7BitEncodedInt64() // field2
+			reader.Read7BitEncodedInt64() // field3
+			reader.ReadByte()             // flag
+			log.Printf("MemoryDump: skipped buff[%d] pos=%d", i, reader.Position())
+		}
+	}
+	flagByte, _ := reader.ReadByte()
+	unk1, _ := reader.ReadByte()
+	log.Printf("MemoryDump: pos=%d flagByte=%02X unk1=%02X before spells", reader.Position(), flagByte, unk1)
 
 	// ─── Section 8: Abilities/Spells (CHARACTER_ABILITIES) ──────────────
 	// PS2: ReadSpellTable (zigzag count + N × ReadSpellRow)
