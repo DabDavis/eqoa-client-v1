@@ -1597,16 +1597,13 @@ func (gs *GameState) parseCMDetail(payload []byte) {
 
 // decodeUTF16LE decodes a UTF-16LE byte slice to a Go string.
 func decodeUTF16LE(b []byte) string {
-	if len(b)%2 != 0 {
-		return ""
-	}
-	runes := make([]uint16, len(b)/2)
-	for i := 0; i < len(b)/2; i++ {
-		runes[i] = binary.LittleEndian.Uint16(b[i*2 : i*2+2])
-	}
-	result := make([]rune, len(runes))
-	for i, r := range runes {
-		result[i] = rune(r)
+	var result []rune
+	for i := 0; i+1 < len(b); i += 2 {
+		c := binary.LittleEndian.Uint16(b[i : i+2])
+		if c == 0 {
+			break
+		}
+		result = append(result, rune(c))
 	}
 	return string(result)
 }
