@@ -1,9 +1,9 @@
 {
-  "version": "20260326-d31fccb",
+  "version": "20260326-400c3ee",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "73726b3fbd29993e713b819dfab3076082c48c2ff6415efed5fcd5c1b5659b3d",
+  "linux_sha256": "8aa3bcb22a44306c242d50d595e986cd06a02ca8b5796785a48cee391c3e7fb1",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "7544acbdaabd852a333234e9ff37dc009b8ddcad9c2c3018cfb5aebacec231f0",
-  "changelog": "- Auction: auto-fetch all pages, remove chat spam, fix Search All\n- Auction: show total parsed count, not /40\n- Auction: pagination working (60 items across 3 pages confirmed)\n- Auction UI: elegant redesign with proper protocol\n- Auction pagination: cursor-based next page, auto-fetch all pages"
+  "windows_sha256": "9ec3e1ba758b85cf76f38dcfc29037f76a08f499fe3bcccdd449e28e39018406",
+  "changelog": "- Auction: two-column UI with search filters\n- Auction: auto-fetch all pages, remove chat spam, fix Search All\n- Auction: show total parsed count, not /40\n- Auction: pagination working (60 items across 3 pages confirmed)\n- Auction UI: elegant redesign with proper protocol"
 }
