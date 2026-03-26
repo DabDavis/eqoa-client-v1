@@ -1,9 +1,9 @@
 {
-  "version": "20260326-240e1cd",
+  "version": "20260326-3498ee0",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "afc8175f06cb52162f91ca4e6a216abecac14bcc7710d0ac9f04f703457c56f6",
+  "linux_sha256": "40260a6f0fb6d1ed46b1424531f66f0f80dc6a88958f585612794278f3e1d6c0",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "9e0cc7a69706ccf92866a8e6ab134493c5fdc21dca8b4d9b186c7380101e1f71",
-  "changelog": "- Auction UI: elegant redesign with proper protocol\n- Auction pagination: cursor-based next page, auto-fetch all pages\n- Auction: itemCount=total results, parse until data exhausted\n- Auction items parsing WORKING! 40 items per page decoded\n- Auction RE: DSP row format decompiled, blob_read difference identified"
+  "windows_sha256": "08c72e9fc1fbf7dc4b7fcbf0b19af000f1af035e58aef9be0f9ecd1c96395cc8",
+  "changelog": "- Auction: pagination working (60 items across 3 pages confirmed)\n- Auction UI: elegant redesign with proper protocol\n- Auction pagination: cursor-based next page, auto-fetch all pages\n- Auction: itemCount=total results, parse until data exhausted\n- Auction items parsing WORKING! 40 items per page decoded"
 }

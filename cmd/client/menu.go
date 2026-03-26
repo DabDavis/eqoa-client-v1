@@ -2363,8 +2363,8 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	}
 
 	// Item count (right-aligned)
-	if gs.AuctionTotalCount > 0 {
-		countStr := fmt.Sprintf("%d/%d items", len(gs.AuctionItems), gs.AuctionTotalCount)
+	if len(gs.AuctionItems) > 0 {
+		countStr := fmt.Sprintf("%d items", len(gs.AuctionItems))
 		cw := c.measureText(countStr, 12)
 		c.drawText(countStr, rightX-cw, y+2, 12, dim)
 	}
