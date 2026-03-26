@@ -112,7 +112,7 @@ func (c *Client) handleLoginInput() {
 			c.loginFocus = 1
 		case mx >= loginFieldX() && mx <= loginFieldX()+loginCheckSz+100 && my >= loginCheckY() && my <= loginCheckY()+loginCheckSz:
 			c.loginFocus = 2
-			c.loginRemember = !c.loginRemember
+			// Toggle handled by uiCheckbox in drawLoginScreen
 		case mx >= loginFieldX() && mx <= loginFieldX()+loginFieldW && my >= loginBtnY() && my <= loginBtnY()+loginBtnH:
 			if len(c.loginUser) > 0 && len(c.loginPass) > 0 {
 				c.attemptLogin()
