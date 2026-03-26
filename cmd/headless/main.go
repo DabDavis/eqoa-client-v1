@@ -35,6 +35,7 @@ func main() {
 	autoConnect := flag.Bool("auto-connect", true, "Auto-connect to first game server")
 	autoSelect := flag.Int("auto-select", 0, "Auto-select character N (1-indexed, 0=disabled)")
 	assetsDir := flag.String("assets", "", "Assets directory for SPELLFX.CSF/ESF (optional)")
+	cmdPortFlag := flag.Int("cmd-port", 7778, "TCP command port for agent control")
 	flag.Parse()
 
 	// Resolve named server presets
@@ -123,7 +124,7 @@ func main() {
 
 	// TCP command port: allows agents to send commands via `nc localhost 7778`
 	// while the headless runs in the background. Each connection is a session.
-	cmdPort := 7778
+	cmdPort := *cmdPortFlag
 	go func() {
 		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cmdPort))
 		if err != nil {
