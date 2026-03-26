@@ -252,7 +252,8 @@ const (
 	OpcodeWhoListFiltered GameOpcode = 0x0F02 // Filtered who results (server)
 	OpcodeIgnoreList      GameOpcode = 0x1005 // Ignore List
 	OpcodeIgnoreListResult GameOpcode = 0x1102 // Ignore list display (server)
-	OpcodeAuctionStuff  GameOpcode = 0x1206 // Auction Item
+	OpcodeAuctionRequest GameOpcode = 0x1205 // Auction Request (client)
+	OpcodeAuctionStuff   GameOpcode = 0x1206 // Auction Item (server)
 	OpcodeBankUI        GameOpcode = 0x124D // Bank UI
 	OpcodeRemoveBankItem GameOpcode = 0x1250 // Withdraw Bank
 	OpcodeAddBankItem   GameOpcode = 0x1251 // Add Bank Item
@@ -333,7 +334,7 @@ var opcodeNames = map[GameOpcode]string{
 	0x0C01: "ClientShout", 0x0D41: "MailDelivery",
 	0x0E01: "WhoList", 0x0E02: "WhoListResponse",
 	0x0F02: "WhoListFiltered", 0x1005: "IgnoreList", 0x1102: "IgnoreListResult",
-	0x1206: "AuctionStuff", 0x124D: "BankUI", 0x1250: "RemoveBankItem",
+	0x1205: "AuctionRequest", 0x1206: "AuctionStuff", 0x124D: "BankUI", 0x1250: "RemoveBankItem",
 	0x1251: "AddBankItem", 0x1253: "ConfirmBankTunar",
 	0x1254: "BankItem", 0x1255: "DepositBankTunar",
 	0x1401: "ClassMastery", 0x1402: "ClassMasteryServer",

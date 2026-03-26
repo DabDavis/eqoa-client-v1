@@ -391,6 +391,9 @@ type GameState struct {
 	// Who list (from opcode 0x0E02)
 	WhoList []WhoEntry
 
+	// Auction house (from opcode 0x1206)
+	AuctionItems []AuctionItem
+
 	// PS2 Hotkey Menu (parsed from MemoryDump)
 	Hotkeys []HotkeyEntry // tree-structured hotkey entries (25 default)
 
@@ -4153,6 +4156,14 @@ func parseSingleItem(reader *buffer.Reader) (ParsedItem, error) {
 	}
 
 	return item, nil
+}
+
+// AuctionItem holds a single auction house listing parsed from opcode 0x1206.
+type AuctionItem struct {
+	Seller      string     // seller character name (ASCII)
+	Item        ParsedItem // item data (same format as MemoryDump items)
+	CurrentBid  int64      // current bid in tunar
+	BuyoutPrice int64      // buyout price in tunar (0 = no buyout)
 }
 
 // parseSingleSpell reads one spell entry from the MemoryDump.

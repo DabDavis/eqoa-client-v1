@@ -201,8 +201,8 @@ func (c *Client) handleMenuInput() {
 		case 2: // Character: Stats / Spells / CM
 			c.charSubTab = (c.charSubTab + dir + 3) % 3
 			c.menuScroll = 0
-		case 4: // Social: Who / Group / LFG
-			c.socialSubTab = (c.socialSubTab + dir + 3) % 3
+		case 4: // Social: Who / Group / LFG / Auction
+			c.socialSubTab = (c.socialSubTab + dir + 4) % 4
 			c.menuScroll = 0
 		case 5: // Guild: Roster / Chat
 			c.guildSubTab = (c.guildSubTab + dir + 2) % 2
@@ -1984,8 +1984,8 @@ func (c *Client) drawMenuSocial(startY, contentH int32) {
 	gold := colorGold
 	dimGold := colorGoldDim
 
-	// Sub-tab bar: Who / Group / LFG
-	subTabs := []string{"Who", "Group", "LFG"}
+	// Sub-tab bar: Who / Group / LFG / Auction
+	subTabs := []string{"Who", "Group", "LFG", "Auction"}
 	stx := menuXPos() + menuPad
 	mx, my := rl.GetMouseX(), rl.GetMouseY()
 	subTabH := int32(22)
@@ -2013,6 +2013,8 @@ func (c *Client) drawMenuSocial(startY, contentH int32) {
 		c.drawMenuGroup(innerY, innerH)
 	case 2:
 		c.drawMenuLFG(innerY, innerH)
+	case 3:
+		c.drawMenuAuction(innerY, innerH)
 	}
 }
 
@@ -2302,6 +2304,140 @@ func (c *Client) drawMenuLFG(startY, contentH int32) {
 		info := fmt.Sprintf("Lv %d %s", e.Level, className(int(e.Class)))
 		iw := c.measureText(info, 12)
 		c.drawText(info, menuXPos()+menuW-menuPad-iw-4, ey+3, 12, white)
+	}
+}
+
+func (c *Client) drawMenuAuction(startY, contentH int32) {
+	gs := c.engine.State
+	if gs == nil {
+		return
+	}
+
+	gold := colorGold
+	white := colorWhite
+	dim := colorDim
+	lineH := int32(18)
+	mx, my := rl.GetMouseX(), rl.GetMouseY()
+
+	y := startY
+
+	// Browse / Refresh button
+	browseLabel := "[Browse Auction]"
+	bw := c.measureText(browseLabel, 13)
+	bx := menuXPos() + menuPad
+	isBrowseHover := mx >= bx && mx < bx+bw && my >= y && my < y+lineH
+	browseClr := dim
+	if isBrowseHover {
+		browseClr = gold
+		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			c.engine.SendAuctionRequest(0x01, c.auctionPage, nil)
+			c.auctionRequested = true
+		}
+	}
+	c.drawText(browseLabel, bx, y, 13, browseClr)
+
+	// Page navigation (right-aligned)
+	pageStr := fmt.Sprintf("Page %d", c.auctionPage+1)
+	pw := c.measureText(pageStr, 12)
+	px := menuXPos() + menuW - menuPad - pw
+	c.drawText(pageStr, px, y+2, 12, dim)
+
+	// Prev / Next buttons
+	nextLabel := "[>]"
+	nw := c.measureText(nextLabel, 13)
+	nx := px - nw - 8
+	isNextHover := mx >= nx && mx < nx+nw && my >= y && my < y+lineH
+	nextClr := dim
+	if isNextHover {
+		nextClr = gold
+		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			c.auctionPage++
+			c.engine.SendAuctionRequest(0x01, c.auctionPage, nil)
+			c.menuScroll = 0
+		}
+	}
+	c.drawText(nextLabel, nx, y, 13, nextClr)
+
+	prevLabel := "[<]"
+	pvw := c.measureText(prevLabel, 13)
+	pvx := nx - pvw - 4
+	isPrevHover := mx >= pvx && mx < pvx+pvw && my >= y && my < y+lineH
+	prevClr := dim
+	if isPrevHover {
+		prevClr = gold
+		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && c.auctionPage > 0 {
+			c.auctionPage--
+			c.engine.SendAuctionRequest(0x01, c.auctionPage, nil)
+			c.menuScroll = 0
+		}
+	}
+	c.drawText(prevLabel, pvx, y, 13, prevClr)
+
+	y += lineH + 4
+
+	// Auto-request on first open
+	if !c.auctionRequested {
+		c.engine.SendAuctionRequest(0x01, 0, nil)
+		c.auctionRequested = true
+	}
+
+	if len(gs.AuctionItems) == 0 {
+		c.drawText("No auction listings.", menuXPos()+menuPad, y, 14, dim)
+		return
+	}
+
+	// Header
+	c.drawText(fmt.Sprintf("Listings: %d", len(gs.AuctionItems)), menuXPos()+menuPad, y, 14, gold)
+	y += lineH + 2
+
+	// Column headers
+	nameCol := menuXPos() + menuPad + 4
+	sellerCol := menuXPos() + menuPad + menuW*45/100
+	bidCol := menuXPos() + menuPad + menuW*65/100
+	buyoutCol := menuXPos() + menuPad + menuW*82/100
+
+	c.drawText("Item", nameCol, y, 12, gold)
+	c.drawText("Seller", sellerCol, y, 12, gold)
+	c.drawText("Bid", bidCol, y, 12, gold)
+	c.drawText("Buyout", buyoutCol, y, 12, gold)
+	y += lineH
+
+	// Scrollable list
+	listTop := y
+	listH := contentH - (y - startY) - 4
+	maxVisible := int(listH / lineH)
+	if c.menuScroll > len(gs.AuctionItems)-maxVisible {
+		c.menuScroll = len(gs.AuctionItems) - maxVisible
+	}
+	if c.menuScroll < 0 {
+		c.menuScroll = 0
+	}
+
+	for i := c.menuScroll; i < len(gs.AuctionItems) && int32(i-c.menuScroll)*lineH < listH; i++ {
+		ey := listTop + int32(i-c.menuScroll)*lineH
+		ai := gs.AuctionItems[i]
+
+		if i%2 == 0 {
+			rl.DrawRectangle(menuXPos()+menuPad, ey, menuW-menuPad*2, lineH, colorRowBg1)
+		}
+
+		// Item name
+		c.drawText(ai.Item.Name, nameCol, ey+2, 13, white)
+
+		// Seller
+		c.drawText(ai.Seller, sellerCol, ey+2, 12, dim)
+
+		// Current bid
+		bidStr := fmt.Sprintf("%d", ai.CurrentBid)
+		c.drawText(bidStr, bidCol, ey+2, 12, gold)
+
+		// Buyout
+		if ai.BuyoutPrice > 0 {
+			buyStr := fmt.Sprintf("%d", ai.BuyoutPrice)
+			c.drawText(buyStr, buyoutCol, ey+2, 12, gold)
+		} else {
+			c.drawText("-", buyoutCol, ey+2, 12, dim)
+		}
 	}
 }
 

@@ -238,6 +238,7 @@ func handleCommand(engine *game.Engine, line string) {
 		fmt.Println("  guildinvite <n> — Invite player to guild")
 		fmt.Println("  guildkick <n>   — Kick member from guild")
 		fmt.Println("  who             — Request who list")
+		fmt.Println("  auction [page]  — Browse auction house listings")
 		fmt.Println("  lfg             — Toggle LFG registration")
 		fmt.Println("  create <name> <race> <class> [gender] — Create character")
 		fmt.Println("  spellfx <hex>   — Dump spell effect by DictID (e.g. spellfx 0xDA9BEA13)")
@@ -1708,6 +1709,31 @@ func handleCommand(engine *game.Engine, line string) {
 			fmt.Printf("=== Who List (%d) ===\n", len(gs.WhoList))
 			for _, w := range gs.WhoList {
 				fmt.Printf("  %-20s Level %d\n", w.Name, w.Level)
+			}
+		}
+
+	case "auction":
+		// auction [page] — browse auction house listings
+		page := byte(0)
+		if len(parts) >= 2 {
+			p, err := strconv.Atoi(parts[1])
+			if err == nil && p >= 0 && p < 256 {
+				page = byte(p)
+			}
+		}
+		engine.SendAuctionRequest(0x01, page, nil)
+		fmt.Printf("Auction browse requested (page %d). Results will appear shortly.\n", page)
+		// Print any cached results
+		gs := engine.State
+		if len(gs.AuctionItems) > 0 {
+			fmt.Printf("=== Auction Listings (%d) ===\n", len(gs.AuctionItems))
+			for i, ai := range gs.AuctionItems {
+				buyoutStr := "none"
+				if ai.BuyoutPrice > 0 {
+					buyoutStr = fmt.Sprintf("%d", ai.BuyoutPrice)
+				}
+				fmt.Printf("  [%d] %-30s  seller=%-15s  bid=%d  buyout=%s\n",
+					i+1, ai.Item.Name, ai.Seller, ai.CurrentBid, buyoutStr)
 			}
 		}
 

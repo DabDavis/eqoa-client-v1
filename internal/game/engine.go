@@ -1311,6 +1311,25 @@ func (e *Engine) SendWhoList() {
 	log.Printf("Sent WhoList request token=%d", e.whoToken)
 }
 
+// SendAuctionRequest sends an auction browse/search request (opcode 0x1205).
+// sub: sub-command byte (e.g. 0x01=browse, 0x07=search).
+// page: pagination page number.
+// extra: optional additional filter/search bytes (nil for simple browse).
+func (e *Engine) SendAuctionRequest(sub byte, page byte, extra []byte) {
+	if e.State.Conn == nil {
+		return
+	}
+	data := make([]byte, 3+len(extra))
+	data[0] = sub
+	data[1] = page
+	data[2] = 0 // unk byte
+	copy(data[3:], extra)
+	if !e.State.Conn.QueueReliable(protocol.OpcodeAuctionRequest, data) {
+		log.Printf("WARNING: AuctionRequest send window full")
+	}
+	log.Printf("Sent AuctionRequest sub=0x%02X page=%d extraLen=%d", sub, page, len(extra))
+}
+
 // SendLFGToggle toggles the player's LFG registration by sending "lfg" or "lfg off" in chat.
 // Sandstorm uses chat commands for LFG, not a dedicated opcode.
 func (e *Engine) SendLFGToggle(register bool) {

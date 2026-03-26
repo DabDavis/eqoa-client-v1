@@ -1645,9 +1645,77 @@ func (gs *GameState) handleConfirmBankTunar(msg *protocol.Message) {
 }
 
 // handleAuctionStuff handles opcode 0x1206 — auction data.
+// Small (7 bytes): sub(0x81) + page + 5 zeros = status/ack.
+// Large (5000+ bytes, reassembled from fragments): item listings.
+//   Header: sub(0x81) + page(byte) + unk(byte) + itemCount(byte)
+//   Per item: sellerNameLen(uint32) + sellerName(ASCII) + item fields (parseSingleItem)
+//             + currentBid(zigzag) + buyoutPrice(zigzag)
 func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 	data := msg.Data()
 	log.Printf("AuctionStuff: dataLen=%d", len(data))
+
+	if len(data) < 4 {
+		log.Printf("AuctionStuff: too short (%d bytes)", len(data))
+		return
+	}
+
+	// Small ack packet (7 bytes): sub + page + 5 zeros
+	if len(data) <= 7 {
+		log.Printf("AuctionStuff: ack/status sub=0x%02X page=%d", data[0], data[1])
+		return
+	}
+
+	// Large listing packet
+	sub := data[0]
+	page := data[1]
+	_ = data[2] // unk
+	itemCount := int(data[3])
+	log.Printf("AuctionStuff: sub=0x%02X page=%d itemCount=%d", sub, page, itemCount)
+
+	reader := buffer.NewReader(data[4:])
+	items := make([]AuctionItem, 0, itemCount)
+
+	for i := 0; i < itemCount; i++ {
+		var ai AuctionItem
+
+		// Seller name: uint32 length + ASCII bytes
+		sellerLen, err := reader.ReadUint32()
+		if err != nil || sellerLen > 200 {
+			log.Printf("AuctionStuff: bad seller name len %d at item %d", sellerLen, i)
+			break
+		}
+		if sellerLen > 0 {
+			nameBytes := make([]byte, sellerLen)
+			for j := uint32(0); j < sellerLen; j++ {
+				b, err := reader.ReadByte()
+				if err != nil {
+					log.Printf("AuctionStuff: read seller name failed at item %d", i)
+					break
+				}
+				nameBytes[j] = b
+			}
+			ai.Seller = string(nameBytes)
+		}
+
+		// Item data — same format as MemoryDump items
+		item, err := parseSingleItem(reader)
+		if err != nil {
+			log.Printf("AuctionStuff: parseSingleItem failed at item %d: %v", i, err)
+			break
+		}
+		ai.Item = item
+
+		// Auction-specific trailing fields
+		ai.CurrentBid, _ = reader.Read7BitEncodedInt64()
+		ai.BuyoutPrice, _ = reader.Read7BitEncodedInt64()
+
+		items = append(items, ai)
+		log.Printf("AuctionItem[%d]: seller=%q name=%q bid=%d buyout=%d",
+			i, ai.Seller, ai.Item.Name, ai.CurrentBid, ai.BuyoutPrice)
+	}
+
+	gs.AuctionItems = items
+	gs.addChatMessage(fmt.Sprintf("Auction: %d items listed (page %d)", len(items), page), ChatSystem)
 }
 
 // handleAdminShutdown handles opcode 0x07C1 — server shutdown announcement.

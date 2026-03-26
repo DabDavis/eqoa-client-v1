@@ -278,6 +278,8 @@ func (c *Client) disconnectAndReturnToLogin() {
 	c.logoutActive = false
 	c.menuOpen = false
 	c.whoRequested = false
+	c.auctionRequested = false
+	c.auctionPage = 0
 	c.charSelectIdx = -1
 	// Reset to 640x480 for login screen
 	screenWidth = 640
