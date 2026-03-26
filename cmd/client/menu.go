@@ -2348,8 +2348,8 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	}
 	c.drawText(searchLabel, leftX, y, 13, searchClr)
 
-	// Load More button (next page)
-	if gs.AuctionLastListing != 0 && len(gs.AuctionItems) < gs.AuctionTotalCount {
+	// Load More button (next page) — show whenever we have a cursor from previous page
+	if gs.AuctionLastListing != 0 {
 		moreLabel := "[Load More]"
 		mw := c.measureText(moreLabel, 13)
 		moreX := leftX + sw + 12
