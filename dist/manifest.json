@@ -1,9 +1,9 @@
 {
-  "version": "20260326-3498ee0",
+  "version": "20260326-86cb5fb",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "40260a6f0fb6d1ed46b1424531f66f0f80dc6a88958f585612794278f3e1d6c0",
+  "linux_sha256": "29766188a223f9155713600ee15a69b3c7e1a05503a8653d4593da04d9b6643b",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "08c72e9fc1fbf7dc4b7fcbf0b19af000f1af035e58aef9be0f9ecd1c96395cc8",
-  "changelog": "- Auction: pagination working (60 items across 3 pages confirmed)\n- Auction UI: elegant redesign with proper protocol\n- Auction pagination: cursor-based next page, auto-fetch all pages\n- Auction: itemCount=total results, parse until data exhausted\n- Auction items parsing WORKING! 40 items per page decoded"
+  "windows_sha256": "486bbca6d9dafc1482f24e2b064bb86f51900edfa91bb934da759086e1a69261",
+  "changelog": "- Auction: show total parsed count, not /40\n- Auction: pagination working (60 items across 3 pages confirmed)\n- Auction UI: elegant redesign with proper protocol\n- Auction pagination: cursor-based next page, auto-fetch all pages\n- Auction: itemCount=total results, parse until data exhausted"
 }

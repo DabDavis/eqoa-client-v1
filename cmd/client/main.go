@@ -256,8 +256,10 @@ type Client struct {
 	menuStickLatched bool // right stick sub-tab latch (fires once per deflection)
 	whoRequested      bool // true after first who list request sent
 	whoSortByLevel    bool // false=alphabetical, true=by level
-	auctionRequested  bool // true after first auction browse sent
-	auctionPage       byte // current auction page number
+	auctionRequested  bool      // true after first auction browse sent
+	auctionFetchAll   bool      // auto-fetch all pages
+	auctionLastFetch  time.Time // throttle for auto-fetch
+	auctionPage       int       // current page for UI
 
 	// Group tab state
 	groupInviteInput  string // text input for invite-by-name

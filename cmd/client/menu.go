@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 
@@ -2335,6 +2336,8 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	}
 	if isSearchHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 		gs.AuctionItems = nil
+		gs.AuctionLastListing = 0
+		gs.AuctionSeq = 0
 		seq := gs.AuctionSessionID
 		if seq == 0 { seq = 0x04 }
 		filter := []byte{
@@ -2344,6 +2347,7 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 		}
 		c.engine.SendAuctionRequest(0x07, seq, filter)
 		c.auctionRequested = true
+		c.auctionFetchAll = true
 		c.menuScroll = 0
 	}
 	c.drawText(searchLabel, leftX, y, 13, searchClr)
@@ -2382,6 +2386,15 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 		}
 		c.engine.SendAuctionRequest(0x07, seq, filter)
 		c.auctionRequested = true
+	}
+
+	// Auto-fetch all pages when Search All is active
+	if c.auctionFetchAll && gs.AuctionLastListing != 0 && time.Since(c.auctionLastFetch) > 1500*time.Millisecond {
+		c.engine.SendAuctionNextPage()
+		c.auctionLastFetch = time.Now()
+		if len(gs.AuctionItems) > 500 {
+			c.auctionFetchAll = false // safety cap
+		}
 	}
 
 	if len(gs.AuctionItems) == 0 {

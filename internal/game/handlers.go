@@ -1816,7 +1816,7 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 		gs.AuctionLastListing = items[len(items)-1].ListingID
 		gs.AuctionSeq = page + 2
 	}
-	gs.addChatMessage(fmt.Sprintf("Auction: +%d items (total %d/%d)", len(items), len(gs.AuctionItems), itemCount), ChatSystem)
+	log.Printf("Auction: +%d items (total %d)", len(items), len(gs.AuctionItems))
 }
 
 // handleAdminShutdown handles opcode 0x07C1 — server shutdown announcement.
