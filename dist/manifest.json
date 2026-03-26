@@ -1,9 +1,9 @@
 {
-  "version": "20260326-e1e0fdb",
+  "version": "20260326-463a9bb",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "57204f3db9d0295ad479750b843134d0933cc7fdaa9f333a95d2d80ab7120afe",
+  "linux_sha256": "217572f945121585dd169eca4a3615dacf646870f7194071f8199f75dd151b54",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "ab0524e36eac25a1f11604e81bf4d41381df47210e7a8c5db78671625985ea60",
-  "changelog": "- Implement guild chat and guild functions\n- Apply pcap findings: combat state, facing float, PrepareItem, AdjustItemHP\n- Add equipment hotbar swap via PrepareItem (0x000A)\n- Parse weapon AttackType from state channel bytes 91-92\n- State channel RE: decode all 162 bytes, monitor entity diffs"
+  "windows_sha256": "fe0645eba13c1c97c94b03c56b43fed9d8e06eb64455747dec805eae74ff637f",
+  "changelog": "- Fix guild chat: 0x0A7A (ClientMessage) is guild chat on Sandstorm\n- Implement guild chat and guild functions\n- Apply pcap findings: combat state, facing float, PrepareItem, AdjustItemHP\n- Add equipment hotbar swap via PrepareItem (0x000A)\n- Parse weapon AttackType from state channel bytes 91-92"
 }

@@ -1695,10 +1695,15 @@ func (gs *GameState) handleColoredChat(msg *protocol.Message) {
 			channel = ChatSystem // server message (0xFFF7 = system)
 		}
 	}
-	// Guild chat detection: if we're in a guild and the color matches guild green
-	// or the text starts with guild-specific prefix
-	if r == 0 && g == 255 && b == 0 {
-		channel = ChatGuild
+	// Detect channel from text content (Sandstorm embeds channel in the message text)
+	if strings.Contains(text, " tells you:") {
+		channel = ChatTell
+	} else if strings.Contains(text, " shouts:") {
+		channel = ChatShout
+	} else if r == 255 && g == 63 && b == 63 {
+		channel = ChatError
+	} else if r == 48 && g == 244 && b == 255 {
+		channel = ChatSystem // auction/system cyan
 	}
 
 	log.Printf("ColoredChat: %s (color: %d,%d,%d ch=%d)", text, r, g, b, channel)
