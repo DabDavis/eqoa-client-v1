@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
+
+	"github.com/eqoa/client/internal/game"
 )
 
 // =============================================================================
@@ -278,4 +280,47 @@ func (c *Client) uiDividerH(x, y, w int32) {
 // uiPanel draws a dark panel background.
 func (c *Client) uiPanel(x, y, w, h int32) {
 	rl.DrawRectangle(x, y, w, h, rl.Color{R: 20, G: 20, B: 32, A: 255})
+}
+
+// --- Character Preview ---
+
+// CharPreviewData holds the data needed to render a 3D character preview.
+// Can be populated from Player, Entity, CharInfo, or inspect data.
+type CharPreviewData struct {
+	ModelID         uint32
+	Race            byte
+	Scale           float32
+	PrimaryWeapon   uint32
+	SecondaryWeapon uint32
+	Shield          uint32
+	// Equipment appearance
+	Chest, Bracer, Gloves, Legs, Boots, Helm, Robe byte
+	ChestTint, BracerTint, GlovesTint, LegsTint, BootsTint, HelmTint, RobeTint byte
+	HairColor, HairLength, HairStyle, FaceOption byte
+}
+
+// CharPreviewFromPlayer creates preview data from the current player.
+func CharPreviewFromPlayer(p *game.Entity) CharPreviewData {
+	return CharPreviewData{
+		ModelID: p.ModelID, Race: p.Race, Scale: 1.0,
+		PrimaryWeapon: p.PrimaryWeapon, SecondaryWeapon: p.SecondaryWeapon, Shield: p.Shield,
+		Chest: p.Chest, Bracer: p.Bracer, Gloves: p.Gloves,
+		Legs: p.Legs, Boots: p.Boots, Helm: p.Helm, Robe: p.Robe,
+		ChestTint: p.ChestTint, BracerTint: p.BracerTint, GlovesTint: p.GlovesTint,
+		LegsTint: p.LegsTint, BootsTint: p.BootsTint, HelmTint: p.HelmTint, RobeTint: p.RobeTint,
+		HairColor: p.HairColor, HairLength: p.HairLength, HairStyle: p.HairStyle, FaceOption: p.FaceOption,
+	}
+}
+
+// CharPreviewFromEntity creates preview data from a nearby entity.
+func CharPreviewFromEntity(e *game.Entity) CharPreviewData {
+	return CharPreviewData{
+		ModelID: e.ModelID, Race: e.Race, Scale: e.Scale,
+		PrimaryWeapon: e.PrimaryWeapon, SecondaryWeapon: e.SecondaryWeapon, Shield: e.Shield,
+		Chest: e.Chest, Bracer: e.Bracer, Gloves: e.Gloves,
+		Legs: e.Legs, Boots: e.Boots, Helm: e.Helm, Robe: e.Robe,
+		ChestTint: e.ChestTint, BracerTint: e.BracerTint, GlovesTint: e.GlovesTint,
+		LegsTint: e.LegsTint, BootsTint: e.BootsTint, HelmTint: e.HelmTint, RobeTint: e.RobeTint,
+		HairColor: e.HairColor, HairLength: e.HairLength, HairStyle: e.HairStyle, FaceOption: e.FaceOption,
+	}
 }

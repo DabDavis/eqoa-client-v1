@@ -1,9 +1,9 @@
 {
-  "version": "20260326-400c3ee",
+  "version": "20260326-9135a5d",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "8aa3bcb22a44306c242d50d595e986cd06a02ca8b5796785a48cee391c3e7fb1",
+  "linux_sha256": "6c0f7d5703063e636bb9ccb8ca30f71087fc0a831c4a1664660812f9ace8fb53",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "9ec3e1ba758b85cf76f38dcfc29037f76a08f499fe3bcccdd449e28e39018406",
-  "changelog": "- Auction: two-column UI with search filters\n- Auction: auto-fetch all pages, remove chat spam, fix Search All\n- Auction: show total parsed count, not /40\n- Auction: pagination working (60 items across 3 pages confirmed)\n- Auction UI: elegant redesign with proper protocol"
+  "windows_sha256": "7b7d80c1043b145328e24d0a65d50dd45ec00a637eee9904bddb86e355c4e646",
+  "changelog": "- Add UI widget system: Button, TextInput, Slider, ScrollList, Checkbox\n- Session end: auction working, UI widget system planned\n- Auction: two-column UI with search filters\n- Auction: auto-fetch all pages, remove chat spam, fix Search All\n- Auction: show total parsed count, not /40"
 }
