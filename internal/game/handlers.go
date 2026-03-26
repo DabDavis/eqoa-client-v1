@@ -1652,27 +1652,29 @@ func (gs *GameState) handleConfirmBankTunar(msg *protocol.Message) {
 //             + currentBid(zigzag) + buyoutPrice(zigzag)
 func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 	data := msg.Data()
-	log.Printf("AuctionStuff: dataLen=%d", len(data))
-
 	if len(data) < 4 {
-		log.Printf("AuctionStuff: too short (%d bytes)", len(data))
+		return
+	}
+	payload := data[2:] // skip 2-byte opcode prefix
+	log.Printf("AuctionStuff: payloadLen=%d hex=%X", len(payload), payload[:min(32, len(payload))])
+
+	// Small ack packet (<=7 bytes after opcode): status response
+	if len(payload) <= 7 {
+		if len(payload) >= 2 {
+			log.Printf("AuctionStuff: ack sub=0x%02X page=%d", payload[0], payload[1])
+		}
 		return
 	}
 
-	// Small ack packet (7 bytes): sub + page + 5 zeros
-	if len(data) <= 7 {
-		log.Printf("AuctionStuff: ack/status sub=0x%02X page=%d", data[0], data[1])
-		return
-	}
-
-	// Large listing packet
-	sub := data[0]
-	page := data[1]
-	_ = data[2] // unk
-	itemCount := int(data[3])
+	// Large listing packet — PS2 func_00BBD9E8 reads zigzag(count) + items
+	// Sandstorm format from pcap: sub(1) + seq(1) + unk(1) + itemCount(1) + items...
+	sub := payload[0]
+	page := payload[1]
+	_ = payload[2] // unk
+	itemCount := int(payload[3])
 	log.Printf("AuctionStuff: sub=0x%02X page=%d itemCount=%d", sub, page, itemCount)
 
-	reader := buffer.NewReader(data[4:])
+	reader := buffer.NewReader(payload[4:])
 	items := make([]AuctionItem, 0, itemCount)
 
 	for i := 0; i < itemCount; i++ {

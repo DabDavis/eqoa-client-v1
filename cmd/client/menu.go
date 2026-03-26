@@ -2330,7 +2330,7 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	if isBrowseHover {
 		browseClr = gold
 		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			c.engine.SendAuctionRequest(0x01, c.auctionPage, nil)
+			c.engine.SendAuctionRequest(0x08, c.auctionPage, nil)
 			c.auctionRequested = true
 		}
 	}
@@ -2352,7 +2352,7 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 		nextClr = gold
 		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 			c.auctionPage++
-			c.engine.SendAuctionRequest(0x01, c.auctionPage, nil)
+			c.engine.SendAuctionRequest(0x08, c.auctionPage, nil)
 			c.menuScroll = 0
 		}
 	}
@@ -2367,7 +2367,7 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 		prevClr = gold
 		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && c.auctionPage > 0 {
 			c.auctionPage--
-			c.engine.SendAuctionRequest(0x01, c.auctionPage, nil)
+			c.engine.SendAuctionRequest(0x08, c.auctionPage, nil)
 			c.menuScroll = 0
 		}
 	}
@@ -2377,7 +2377,7 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 
 	// Auto-request on first open
 	if !c.auctionRequested {
-		c.engine.SendAuctionRequest(0x01, 0, nil)
+		c.engine.SendAuctionRequest(0x08, 0, nil)
 		c.auctionRequested = true
 	}
 

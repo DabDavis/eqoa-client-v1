@@ -1713,16 +1713,35 @@ func handleCommand(engine *game.Engine, line string) {
 		}
 
 	case "auction":
-		// auction [page] — browse auction house listings
-		page := byte(0)
+		// auction [seq] — search auction house
+		// PS2 sequence: sub=0x08 (open), then sub=0x07 (search)
+		// The sequence byte increments with each request
+		seq := byte(0x10) // starting sequence
 		if len(parts) >= 2 {
 			p, err := strconv.Atoi(parts[1])
 			if err == nil && p >= 0 && p < 256 {
-				page = byte(p)
+				seq = byte(p)
 			}
 		}
-		engine.SendAuctionRequest(0x01, page, nil)
-		fmt.Printf("Auction browse requested (page %d). Results will appear shortly.\n", page)
+		// PS2 sequence from pcap: 0x08(6), 0x08(10), 0x07(16)
+		// Step 1: Open auction categories
+		engine.SendAuctionRequest(0x08, 0x06, nil)
+		time.Sleep(300 * time.Millisecond)
+		engine.SendAuctionRequest(0x08, 0x0A, nil)
+		time.Sleep(300 * time.Millisecond)
+		// Step 2: Search all items (sub=0x07, empty filter)
+		searchFilter := []byte{
+			0x01, 0x01,                                     // flags
+			0x00, 0x00, 0x00, 0x00,                         // name filter len (0)
+			0x00, 0x00, 0x00, 0x00, 0x00,                   // padding
+			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // class/race mask (all)
+			0x02, 0x64,                                     // level range (2-100)
+			0x00,                                           // unk
+			0xFE, 0xA7, 0xD6, 0xB9, 0x07,                  // max price (zigzag)
+			0x03, 0x01, 0x01,                               // sort/page
+		}
+		engine.SendAuctionRequest(0x07, seq, searchFilter)
+		fmt.Printf("Auction search requested (seq %d). Results will appear shortly.\n", seq)
 		// Print any cached results
 		gs := engine.State
 		if len(gs.AuctionItems) > 0 {

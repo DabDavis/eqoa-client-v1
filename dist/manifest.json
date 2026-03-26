@@ -1,9 +1,9 @@
 {
-  "version": "20260326-65f5483",
+  "version": "20260326-5255a07",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "ddb591abf97433fe6c84c7f2505c0edf1f7ff91413983eca1867e0922812e91c",
+  "linux_sha256": "3fd526d63d03d3aa10b7b513bcf07628235c16f12fb0ae97e07818452abd21ce",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "cabc055457dc96062e6edce8aafab55178060bac01c4293a6e7f1279cdf35852",
-  "changelog": "- Detect tells and channel types from ColoredChat text content\n- Fix guild chat: 0x0A7A (ClientMessage) is guild chat on Sandstorm\n- Implement guild chat and guild functions\n- Apply pcap findings: combat state, facing float, PrepareItem, AdjustItemHP\n- Add equipment hotbar swap via PrepareItem (0x000A)"
+  "windows_sha256": "5a5c8041946ac5df001811bad21c3d5b2c0b162b76d943a2b07a27694075a763",
+  "changelog": "- Implement auction house system with protocol, handler, UI, and headless command\n- Add Guild tab to main menu with Roster and Chat sub-tabs\n- Detect tells and channel types from ColoredChat text content\n- Fix guild chat: 0x0A7A (ClientMessage) is guild chat on Sandstorm\n- Implement guild chat and guild functions"
 }
