@@ -1,9 +1,9 @@
 {
-  "version": "20260326-aafdb52",
+  "version": "20260326-506c933",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "c26d97b7971b5b4985b4d73af6aedaf5a6d26c07f8aa5cd5c5fd3c03b252b650",
+  "linux_sha256": "bbeb90a63a468eaa925227ed0dca3a14d3da369217c4213f386de1829f403c9f",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "57af75808562c85bf532749f6d7ffa9f5cbaa22f57fa9dd61c372f07435d0720",
-  "changelog": "- Login screen: convert to widget system\n- Fix tooltip stat dancing: sort map keys for stable order\n- Wire item tooltip to auction hover — shows stats, icon, description\n- UI Theme toggle: Modern (rounded/shadows/gradients) vs Classic\n- Widgets: add TabBar, CheckboxGroup, ItemTooltip with icon"
+  "windows_sha256": "bb972a51496837691849246df8dbe9541b154956f0f6b9cd4ff56b650d242d1e",
+  "changelog": "- Updater: convert to widget system\n- Login screen: convert to widget system\n- Fix tooltip stat dancing: sort map keys for stable order\n- Wire item tooltip to auction hover — shows stats, icon, description\n- UI Theme toggle: Modern (rounded/shadows/gradients) vs Classic"
 }

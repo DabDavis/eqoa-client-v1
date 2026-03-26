@@ -747,34 +747,14 @@ func (c *Client) drawMenuInventory(startY, contentH int32) {
 		return
 	}
 
-	gold := colorGold
-	dimGold := colorGoldDim
 	white := rl.Color{R: 200, G: 200, B: 200, A: 255}
 	dim := colorDim
 	rowBg1 := colorRowBg1
 	rowBg2 := colorRowBg2
 
 	// Sub-tab bar: Equipped / Carrying / Bank
-	subTabs := []string{"Equipped", "Carrying", "Bank"}
-	stx := menuXPos() + menuPad
 	mx, my := rl.GetMouseX(), rl.GetMouseY()
-	subTabH := int32(22)
-	for i, label := range subTabs {
-		tw := c.measureText(label, 13) + 16
-		clr := dimGold
-		if i == c.invSubTab {
-			clr = gold
-			rl.DrawRectangle(stx, startY+subTabH-2, tw, 2, gold)
-		}
-		// Click handling
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && mx >= stx && mx < stx+tw && my >= startY && my < startY+subTabH {
-			c.invSubTab = i
-			c.menuScroll = 0
-		}
-		c.drawText(label, stx+8, startY+4, 13, clr)
-		stx += tw + 4
-	}
-	startY += subTabH + 4
+	startY = c.uiTabBar(menuXPos()+menuPad, startY, []string{"Equipped", "Carrying", "Bank"}, &c.invSubTab)
 
 	// Filter items based on sub-tab.
 	// EquipLocation >= 0 = equipped, < 0 = carrying.
@@ -804,7 +784,7 @@ func (c *Client) drawMenuInventory(startY, contentH int32) {
 	}
 
 	// Remaining content height after sub-tabs
-	listH := contentH - subTabH - 4
+	listH := contentH - 26
 
 	// Equipment preview: on Equipped sub-tab, show 3D model on the left.
 	// The preview panel shifts the item list to the right.
@@ -1199,30 +1179,10 @@ func (c *Client) drawEquippedGrid(items []ParsedItem, leftX, startY, areaW, area
 }
 
 func (c *Client) drawMenuCharacter(startY, contentH int32) {
-	gold := colorGold
-	dimGold := colorGoldDim
 
 	// Sub-tab bar: Stats / Spells / Class Mastery / Faction
-	subTabs := []string{"Stats", "Spells", "Class Mastery", "Faction"}
-	stx := menuXPos() + menuPad
-	mx, my := rl.GetMouseX(), rl.GetMouseY()
-	subTabH := int32(22)
-	for i, label := range subTabs {
-		tw := c.measureText(label, 13) + 16
-		clr := dimGold
-		if i == c.charSubTab {
-			clr = gold
-			rl.DrawRectangle(stx, startY+subTabH-2, tw, 2, gold)
-		}
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && mx >= stx && mx < stx+tw && my >= startY && my < startY+subTabH {
-			c.charSubTab = i
-			c.menuScroll = 0
-		}
-		c.drawText(label, stx+8, startY+4, 13, clr)
-		stx += tw + 4
-	}
-	innerY := startY + subTabH + 4
-	innerH := contentH - subTabH - 4
+	innerY := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Stats", "Spells", "Class Mastery", "Faction"}, &c.charSubTab)
+	innerH := contentH - 26
 
 	switch c.charSubTab {
 	case 0:
@@ -1892,30 +1852,10 @@ func (c *Client) drawMenuNearby(startY, contentH int32) {
 }
 
 func (c *Client) drawMenuSocial(startY, contentH int32) {
-	gold := colorGold
-	dimGold := colorGoldDim
 
 	// Sub-tab bar: Who / Group / LFG / Auction
-	subTabs := []string{"Who", "Group", "LFG", "Auction"}
-	stx := menuXPos() + menuPad
-	mx, my := rl.GetMouseX(), rl.GetMouseY()
-	subTabH := int32(22)
-	for i, label := range subTabs {
-		tw := c.measureText(label, 13) + 16
-		clr := dimGold
-		if i == c.socialSubTab {
-			clr = gold
-			rl.DrawRectangle(stx, startY+subTabH-2, tw, 2, gold)
-		}
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && mx >= stx && mx < stx+tw && my >= startY && my < startY+subTabH {
-			c.socialSubTab = i
-			c.menuScroll = 0
-		}
-		c.drawText(label, stx+8, startY+4, 13, clr)
-		stx += tw + 4
-	}
-	innerY := startY + subTabH + 4
-	innerH := contentH - subTabH - 4
+	innerY := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Who", "Group", "LFG", "Auction"}, &c.socialSubTab)
+	innerH := contentH - 26
 
 	switch c.socialSubTab {
 	case 0:
@@ -2403,26 +2343,6 @@ func (c *Client) auctionDoSearch(gs *game.GameState) {
 
 // formatTunar is defined below (shared with merchant/repair UI)
 
-// drawSubTabs renders a row of clickable subtab labels with underline on active.
-func (c *Client) drawSubTabs(labels []string, active int, y int32, onClick func(int)) {
-	stx := menuXPos() + menuPad
-	mx, my := rl.GetMouseX(), rl.GetMouseY()
-	h := int32(22)
-	for i, label := range labels {
-		tw := c.measureText(label, 13) + 16
-		clr := colorGoldDim
-		if i == active {
-			clr = colorGold
-			rl.DrawRectangle(stx, y+h-2, tw, 2, colorGold)
-		}
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && mx >= stx && mx < stx+tw && my >= y && my < y+h {
-			onClick(i)
-		}
-		c.drawText(label, stx+8, y+4, 13, clr)
-		stx += tw + 4
-	}
-}
-
 func (c *Client) drawMenuGuild(startY, contentH int32) {
 	gs := c.engine.State
 	gold := colorGold
@@ -2430,17 +2350,7 @@ func (c *Client) drawMenuGuild(startY, contentH int32) {
 	gray := rl.Color{R: 180, G: 180, B: 180, A: 255}
 
 	// Sub-tab bar: Roster / Chat
-	subTabs := []string{"Roster", "Chat"}
-	subY := startY
-	for i, label := range subTabs {
-		x := menuXPos() + menuPad + int32(i)*80
-		col := gray
-		if i == c.guildSubTab {
-			col = gold
-		}
-		c.drawText(label, x, subY, 14, col)
-	}
-	y := subY + 22
+	y := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Roster", "Chat"}, &c.guildSubTab)
 
 	switch c.guildSubTab {
 	case 0: // Roster — show guild members from GuildInfo (0x0468)
@@ -2523,9 +2433,7 @@ func (c *Client) drawMenuSettings(startY, contentH int32) {
 	rowW := menuW - menuPad*2
 
 	// Subtab bar
-	subtabs := []string{"Graphics", "Camera", "Audio"}
-	c.drawSubTabs(subtabs, c.settingsSubTab, startY, func(i int) { c.settingsSubTab = i })
-	y := startY + 22
+	y := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Graphics", "Camera", "Audio"}, &c.settingsSubTab)
 
 	sliderX := rowX + 8
 	sliderW := rowW - 16
