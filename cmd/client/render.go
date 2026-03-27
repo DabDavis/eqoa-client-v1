@@ -196,6 +196,10 @@ func (c *Client) drawWorld() {
 	if c.skyDome != nil {
 		dt := rl.GetFrameTime()
 		gameHour := c.engine.State.GameHour()
+		// PS2: weather drives sky overcast (ProcessTransitions → GetOvercastInterp)
+		if c.weather != nil {
+			c.skyDome.SetOvercast(c.weather.OvercastInterp)
+		}
 		c.skyDome.Update(dt, gameHour)
 		c.skyDome.Draw(camera)
 	}

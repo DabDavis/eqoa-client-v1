@@ -68,6 +68,17 @@ type WeatherSystem struct {
 	// PS2 ProcessTransitions (0x004198B0): transitionProgress 0.0→1.0
 	transitionProgress float32
 
+	// PS2 overcast interpolation (offset +0x61C, GetOvercastInterp at 0x00418D48).
+	// 0.0 = clear sky, 1.0 = fully overcast. Used by sky dome for:
+	//   - Sky texture crossfade (Sunny→DarkClouds)
+	//   - Sun/corona/moon alpha reduction
+	//   - Star visibility reduction
+	OvercastInterp float32
+
+	// PS2 effect mix (offset +0x80, SetEffectMix at 0x00418DC0).
+	// Blends between weather types during transitions.
+	EffectMix float32
+
 	particles []weatherParticle
 	splashes  []weatherSplash // ground splashes (PS2: 200-node linked list pool)
 	rng       *rand.Rand
@@ -191,7 +202,8 @@ func (ws *WeatherSystem) Update(dt, gameHour float32, camX, camY, camZ float32) 
 
 	// --- PS2 ProcessTransitions (0x004198B0) ---
 	// Transition speed: deltaTime * (1/30) = 30-second full transition.
-	if ws.TargetType != ws.Type || (ws.TargetType == WeatherClear && ws.Intensity > 0) {
+	transitioning := ws.TargetType != ws.Type || (ws.TargetType == WeatherClear && ws.Intensity > 0)
+	if transitioning {
 		ws.transitionProgress += dt * weatherTransRate
 		if ws.transitionProgress >= 1.0 {
 			ws.transitionProgress = 0
@@ -204,7 +216,6 @@ func (ws *WeatherSystem) Update(dt, gameHour float32, camX, camY, camZ float32) 
 				ws.Intensity = 1.0
 			}
 		} else {
-			// Interpolate intensity during transition
 			if ws.TargetType == WeatherClear {
 				ws.Intensity = 1.0 - ws.transitionProgress
 			} else {
@@ -212,6 +223,36 @@ func (ws *WeatherSystem) Update(dt, gameHour float32, camX, camY, camZ float32) 
 				ws.Intensity = ws.transitionProgress
 			}
 		}
+	}
+
+	// --- PS2 GetOvercastInterp (0x00418D48) ---
+	// Determines sky darkening based on current/target weather.
+	isOvercast := func(wt WeatherType) bool {
+		return wt == WeatherRain || wt == WeatherSnow || wt == WeatherSleet ||
+			wt == WeatherThunder || wt == WeatherSandstorm
+	}
+	curOC := isOvercast(ws.Type)
+	tgtOC := isOvercast(ws.TargetType)
+	if !curOC && !tgtOC {
+		ws.OvercastInterp = 0.0 // clear → clear
+	} else if !curOC && tgtOC {
+		ws.OvercastInterp = ws.transitionProgress // clear → overcast
+	} else if curOC && !tgtOC {
+		ws.OvercastInterp = 1.0 - ws.transitionProgress // overcast → clear
+	} else {
+		ws.OvercastInterp = 1.0 // overcast → overcast
+	}
+
+	// --- PS2 effect mix (ProcessTransitions) ---
+	// Controls particle blend between weather types during transition.
+	if !curOC && !tgtOC {
+		ws.EffectMix = 0.0
+	} else if !curOC && tgtOC {
+		ws.EffectMix = 1.0 - ws.transitionProgress
+	} else if curOC && !tgtOC {
+		ws.EffectMix = 1.0
+	} else {
+		ws.EffectMix = 0.5
 	}
 
 	if ws.Type == WeatherClear || ws.Type == WeatherLavastorm {

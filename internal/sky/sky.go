@@ -72,6 +72,11 @@ type Sky struct {
 	sunAlpha  uint8 // 0 at night, 255 during day
 	moonAlpha uint8 // 255 at night, 0 during day
 	starAlpha uint8 // 255 at night, fades at dawn/dusk
+
+	// Weather-driven overcast (PS2 VIAtmosphere offset +0x61C).
+	// Set by SetOvercast(). 0.0 = clear, 1.0 = fully overcast.
+	// Darkens sky, reduces sun/moon/star alpha, boosts cloud overlay.
+	overcastInterp float32
 }
 
 // NewSky opens SKY.ESF and loads all SimpleSprite geometry and textures.
@@ -293,6 +298,22 @@ func (s *Sky) generateStars() {
 	}
 }
 
+// SetOvercast sets the weather-driven overcast blend factor.
+// PS2 VIAtmosphere offset +0x61C (GetOvercastInterp at 0x00418D48).
+// 0.0 = clear sky, 1.0 = fully overcast (dark clouds, no sun/stars).
+func (s *Sky) SetOvercast(interp float32) {
+	if s == nil {
+		return
+	}
+	if interp < 0 {
+		interp = 0
+	}
+	if interp > 1 {
+		interp = 1
+	}
+	s.overcastInterp = interp
+}
+
 // Update computes time-based dome rotation and time-of-day tints.
 // dt is unused (kept for interface stability). gameHour = 0.0-24.0.
 // PS2 VIAtmosphere::Update uses timeOfDay * π/12 for sun angle and a
@@ -329,6 +350,44 @@ func (s *Sky) Update(dt, gameHour float32) {
 	s.moonAlpha = celestialAlpha(s.moonDir.Y)
 	s.starAlpha = starAlpha(gameHour)
 
+	// PS2 ProcessTransitions: overcast reduces sun/moon/star visibility
+	// and darkens the sky dome tint.
+	if s.overcastInterp > 0 {
+		oc := s.overcastInterp
+
+		// PS2: sun alpha = 255 - overcastAlpha*2 (sprite 1 in palette animation)
+		sunReduce := uint8(float32(s.sunAlpha) * oc)
+		if sunReduce > s.sunAlpha {
+			s.sunAlpha = 0
+		} else {
+			s.sunAlpha -= sunReduce
+		}
+
+		// Moon dims with overcast too
+		moonReduce := uint8(float32(s.moonAlpha) * oc * 0.8)
+		if moonReduce > s.moonAlpha {
+			s.moonAlpha = 0
+		} else {
+			s.moonAlpha -= moonReduce
+		}
+
+		// PS2: stars invisible when overcastInterp <= 0 (RenderStars early exit)
+		s.starAlpha = uint8(float32(s.starAlpha) * (1.0 - oc))
+
+		// Darken base tint toward storm grey
+		stormR, stormG, stormB := byte(60), byte(65), byte(80)
+		s.baseTint.R = lerpByte(s.baseTint.R, stormR, oc)
+		s.baseTint.G = lerpByte(s.baseTint.G, stormG, oc)
+		s.baseTint.B = lerpByte(s.baseTint.B, stormB, oc)
+
+		// Boost cloud overlay opacity during overcast
+		boostA := uint8(float32(255-s.overlayTint.A) * oc * 0.6)
+		if int(s.overlayTint.A)+int(boostA) > 255 {
+			s.overlayTint.A = 255
+		} else {
+			s.overlayTint.A += boostA
+		}
+	}
 }
 
 // computeSkyTint returns the base dome color modulation for a game hour.
