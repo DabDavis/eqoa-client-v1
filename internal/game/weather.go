@@ -35,8 +35,8 @@ const (
 
 // PS2 VIAtmosphere constants (from Init at 0x00416B60).
 const (
-	weatherMaxParticles = 200   // offset +8 in VIAtmosphere
-	weatherRange        = 10.0  // spawn radius around camera (Go scale)
+	weatherMaxParticles = 200    // offset +8 in VIAtmosphere
+	weatherRange        = 40.0   // PS2: 200, scaled for visual density at Go draw distance
 	weatherTransRate    = 1.0 / 30.0 // PS2: 30-second full transition
 )
 
@@ -96,6 +96,9 @@ type WeatherSystem struct {
 	lightningDuration   float32 // how long current flash lasts
 	lightningIntensity  float32 // peak brightness (0.0-1.0)
 	LightningBrightness float32 // current brightness for screen tint (public for render)
+
+	// Indoor suppression — set by caller each frame
+	Indoor bool // true = player is inside a building, suppress particles
 
 	// PS2 VIAtmosphere textures from SKY.ESF
 	rainTex   rl.Texture2D
@@ -159,7 +162,7 @@ func getWeatherConfig(wt WeatherType) weatherConfig {
 	switch wt {
 	case WeatherRain:
 		return weatherConfig{
-			velY: -15.0, windMul: 0.02, size: 0.02,
+			velY: -25.0, windMul: 0.01, size: 0.04,
 			color: rl.Color{R: 180, G: 200, B: 255, A: 100}, // PS2: teal (71,235,174)
 		}
 	case WeatherSnow:
@@ -179,7 +182,7 @@ func getWeatherConfig(wt WeatherType) weatherConfig {
 		}
 	case WeatherThunder:
 		return weatherConfig{
-			velY: -18.0, windMul: 0.01, size: 0.02,
+			velY: -30.0, windMul: 0.01, size: 0.04,
 			color: rl.Color{R: 160, G: 180, B: 220, A: 110},
 		}
 	default:
@@ -450,7 +453,7 @@ func (ws *WeatherSystem) weatherTexture() rl.Texture2D {
 // Render draws all weather particles as billboard quads.
 // PS2: RenderWeather (0x00418700) + RenderSplashes (0x0041B420).
 func (ws *WeatherSystem) Render(camera rl.Camera3D) {
-	if ws.Type == WeatherClear || len(ws.particles) == 0 {
+	if ws.Type == WeatherClear || len(ws.particles) == 0 || ws.Indoor {
 		return
 	}
 

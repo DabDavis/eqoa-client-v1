@@ -566,6 +566,8 @@ func (c *Client) drawWorld() {
 	// Draw weather particles (rain, snow, etc).
 	if c.weather != nil {
 		gh := c.engine.State.GameHour()
+		// Suppress weather inside buildings (PS2: VIEnvRay per-particle roof check)
+		c.weather.Indoor = c.portalNav != nil && c.portalNav.FindRoom(p.X, p.Y, p.Z) >= 0
 		c.weather.Update(dt, gh, camera.Position.X, camera.Position.Y, camera.Position.Z)
 		c.weather.Render(camera)
 

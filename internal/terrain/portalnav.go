@@ -27,9 +27,9 @@ func NewPortalNav(rooms []esf.ZoneRoom) *PortalNav {
 	return &PortalNav{rooms: rooms}
 }
 
-// findRoom returns the room index containing point (x,y,z), or -1.
-// Uses room bounding boxes for fast lookup.
-func (pn *PortalNav) findRoom(x, y, z float32) int {
+// FindRoom returns the room index containing point (x,y,z), or -1.
+// Uses room bounding boxes for fast lookup. Also used for indoor weather suppression.
+func (pn *PortalNav) FindRoom(x, y, z float32) int {
 	bestIdx := -1
 	bestVol := float32(math.MaxFloat32)
 	for i, r := range pn.rooms {
@@ -69,7 +69,7 @@ func (pn *PortalNav) FindRoomAt(x, y, z float32) int {
 	if pn == nil {
 		return -1
 	}
-	return pn.findRoom(x, y, z)
+	return pn.FindRoom(x, y, z)
 }
 
 // GetVisibleRooms returns the set of room indices visible from position (x,y,z)
@@ -80,7 +80,7 @@ func (pn *PortalNav) GetVisibleRooms(x, y, z float32) map[int]bool {
 		return nil
 	}
 
-	startRoom := pn.findRoom(x, y, z)
+	startRoom := pn.FindRoom(x, y, z)
 	if startRoom < 0 {
 		return nil // outdoor — draw everything
 	}
@@ -121,8 +121,8 @@ func (pn *PortalNav) FindPath(sx, sy, sz, gx, gy, gz float32) []PortalWaypoint {
 		return nil
 	}
 
-	startRoom := pn.findRoom(sx, sy, sz)
-	goalRoom := pn.findRoom(gx, gy, gz)
+	startRoom := pn.FindRoom(sx, sy, sz)
+	goalRoom := pn.FindRoom(gx, gy, gz)
 
 	if startRoom < 0 || goalRoom < 0 {
 		return nil // one or both points are outside any room
