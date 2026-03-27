@@ -817,12 +817,6 @@ func (c *Client) drawWorld() {
 			c.debugFXIndex+1, len(c.debugFXIDs), uint32(dictID))
 		c.drawCenteredText(fxStr, 28, 16, rl.Color{R: 100, G: 255, B: 200, A: 255})
 	}
-	// Underwater screen tint (PS2: blue-green overlay when fully submerged only)
-	if c.waterState == terrain.WaterUnder {
-		rl.DrawRectangle(0, 0, screenWidth, screenHeight,
-			rl.Color{R: 10, G: 40, B: 80, A: 60})
-	}
-
 	// Game clock (top-right, below water state)
 	if c.engine.State.TimeValid {
 		gh := c.engine.State.GameHour()
