@@ -706,7 +706,10 @@ func (c *Client) handleInWorldInput() {
 		c.currentSpeed = c.currentSpeed*decay + targetSpeed*(1-decay)
 
 		// PS2 VIWalkControl::SetTargetHeading — set target, TurnLeft rotates per frame.
-		c.targetFacing = float32(math.Atan2(float64(moveX), float64(moveZ)))
+		// First person: character faces camera, not movement direction.
+		if !c.firstPerson {
+			c.targetFacing = float32(math.Atan2(float64(moveX), float64(moveZ)))
+		}
 
 		// Apply movement using ramped speed.
 		// PS2 Run() in liquid: caps to walkSpeed.
