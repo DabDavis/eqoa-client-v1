@@ -102,6 +102,11 @@ type WeatherSystem struct {
 	snowTex   rl.Texture2D
 	splashTex rl.Texture2D
 	hasTex    bool
+
+	// PS2 weather sound DictIDs (from SetResources at 0x00417848)
+	RainSoundDictID    int32 // "rain_lt" — looping rain ambient
+	ThunderSoundDictID int32 // "lightning_far02" — thunder crack one-shot
+	rainSoundPlaying   bool  // true when rain loop is active
 }
 
 // NewWeatherSystem creates a weather system.
@@ -396,6 +401,41 @@ func (ws *WeatherSystem) Update(dt, gameHour float32, camX, camY, camZ float32) 
 }
 
 // weatherTexture returns the appropriate texture for the current weather type.
+// IsRainSoundPlaying returns whether the rain loop is currently active.
+func (ws *WeatherSystem) IsRainSoundPlaying() bool {
+	return ws != nil && ws.rainSoundPlaying
+}
+
+// SetRainSoundPlaying sets the rain sound playing state.
+func (ws *WeatherSystem) SetRainSoundPlaying(playing bool) {
+	if ws != nil {
+		ws.rainSoundPlaying = playing
+	}
+}
+
+// WantsRainLoop returns true if the weather system wants a rain ambient loop playing.
+func (ws *WeatherSystem) WantsRainLoop() bool {
+	if ws == nil {
+		return false
+	}
+	return ws.Intensity > 0.1 && (ws.Type == WeatherRain || ws.Type == WeatherThunder || ws.Type == WeatherSleet)
+}
+
+// RainVolume returns the desired rain loop volume (0.0-1.0).
+// PS2: intensity * (1 - effectMix) * masterVolume * constant
+func (ws *WeatherSystem) RainVolume() float32 {
+	return ws.Intensity * (1.0 - ws.EffectMix*0.5) * 0.4
+}
+
+// ThunderTriggered is set to true when a lightning flash starts (caller should clear after playing sound).
+func (ws *WeatherSystem) PopThunder() bool {
+	// Check if a new flash just started (progress near 0)
+	if ws.lightningProgress > 0 && ws.lightningProgress < 0.05 && ws.lightningIntensity > 0.3 {
+		return true
+	}
+	return false
+}
+
 func (ws *WeatherSystem) weatherTexture() rl.Texture2D {
 	switch ws.Type {
 	case WeatherRain, WeatherSleet, WeatherThunder:

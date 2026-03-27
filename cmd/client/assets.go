@@ -165,6 +165,26 @@ func (c *Client) loadAssets(assetsDir string) {
 	// Initialize weather system and load PS2 VIAtmosphere textures from SKY.ESF.
 	c.weather = game.NewWeatherSystem()
 	c.loadWeatherTextures()
+	c.loadWeatherSounds()
+}
+
+// loadWeatherSounds loads rain/thunder sounds from SKY.ESF into the audio system.
+// PS2 VIAtmosphere::SetResources: "rain_lt" (looping), "lightning_far02" (one-shot).
+func (c *Client) loadWeatherSounds() {
+	if c.weather == nil || c.audioSys == nil {
+		return
+	}
+	f, err := c.openAssetESF("SKY.ESF")
+	if err != nil {
+		return
+	}
+	n := c.audioSys.LoadSpellSounds(f) // reuse SoundSprite loader
+	if n > 0 {
+		log.Printf("loadWeatherSounds: loaded %d sounds from SKY.ESF", n)
+	}
+	// PS2 DictIDs: rain_lt = 111162647, lightning_far02 = -64459608
+	c.weather.RainSoundDictID = 111162647
+	c.weather.ThunderSoundDictID = -64459608
 }
 
 // loadReticleFromFile loads both Selection_Rings textures from a pre-opened UI.ESF.

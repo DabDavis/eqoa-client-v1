@@ -574,6 +574,23 @@ func (c *Client) drawWorld() {
 			a := uint8(c.weather.LightningBrightness * 180)
 			rl.DrawRectangle(0, 0, screenWidth, screenHeight, rl.Color{R: 220, G: 220, B: 255, A: a})
 		}
+
+		// PS2 weather sound: rain ambient loop + thunder cracks (ProcessTransitions)
+		if c.audioSys != nil {
+			camPos := [3]float32{camera.Position.X, camera.Position.Y, camera.Position.Z}
+			if c.weather.WantsRainLoop() {
+				if !c.weather.IsRainSoundPlaying() {
+					c.audioSys.PlayLoop(c.weather.RainSoundDictID, 9990, camPos, c.weather.RainVolume(), 9999)
+					c.weather.SetRainSoundPlaying(true)
+				}
+			} else if c.weather.IsRainSoundPlaying() {
+				c.audioSys.StopLoop(9990)
+				c.weather.SetRainSoundPlaying(false)
+			}
+			if c.weather.PopThunder() {
+				c.audioSys.Play(c.weather.ThunderSoundDictID, 9991, camPos, 0.7, 9999)
+			}
+		}
 	}
 
 	// Draw spell visual effects (particles, lightning, sprites).
