@@ -258,14 +258,28 @@ func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.C
 					}
 				}
 
-				if bestT < 1.0 {
-					camX = startX + dx*bestT
-					camY = startY + dy*bestT
-					camZ = startZ + dz*bestT
-					if groundY, ok := zt.SampleHeight(camX, camZ, camY); ok {
-						if camY < groundY+camClearance {
-							camY = groundY + camClearance
-						}
+				// Smooth collision distance to prevent bouncing on beams/overhangs.
+				// Pull IN is instant (safety), pull OUT ramps smoothly.
+				if bestT < c.camCollDist {
+					// Blocked closer — snap immediately (safety)
+					c.camCollDist = bestT
+				} else {
+					// Clear further — ramp out slowly (prevents bounce)
+					dt := rl.GetFrameTime()
+					rampSpeed := float32(2.0) // recover to full distance in ~0.5s
+					c.camCollDist += (bestT - c.camCollDist) * dt * rampSpeed
+					if c.camCollDist > bestT {
+						c.camCollDist = bestT
+					}
+				}
+
+				useT := c.camCollDist
+				camX = startX + dx*useT
+				camY = startY + dy*useT
+				camZ = startZ + dz*useT
+				if groundY, ok := zt.SampleHeight(camX, camZ, camY); ok {
+					if camY < groundY+camClearance {
+						camY = groundY + camClearance
 					}
 				}
 			}

@@ -76,6 +76,7 @@ type Client struct {
 	firstPerson    bool    // true = first-person camera mode
 	camMode        int     // 0=tether, 1=follow, 2=first-person
 	invertPitch    bool    // invert controller pitch (stick up = look down)
+	camCollDist    float32 // smoothed collision distance (fraction 0-1, prevents bouncing)
 	safeX, safeY, safeZ float32 // last known position outside walls
 	safeValid      bool         // true once first safe position is recorded
 
