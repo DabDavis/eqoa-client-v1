@@ -203,36 +203,59 @@ func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.C
 
 		// PS2 MoveCamera (0x00482AF0): camera-terrain collision.
 		// PS2 uses VICollSphere swept sphere from player to camera.
-		// We ray-march along the player→camera line, sampling terrain height
-		// at each step. If any sample clips terrain, pull camera to that point.
-		const camClearance = float32(0.5) // PS2 collisionRadius (+0x270)
-		const camSteps = 8               // number of samples along ray
+		// We ray-march along the player→camera line with terrain height +
+		// wall collision checks. More aggressive for indoor areas.
+		const camClearance = float32(1.0)  // clearance above terrain (PS2: collisionRadius ~1.57)
+		const camSteps = 16                // samples along ray (more = catches thin walls)
+		const camWallRadius = float32(0.8) // lateral clearance from walls
 		if c.terrainLoader != nil && c.camDist > 0.5 {
 			zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
 			if zt != nil {
-				// Ray from target point (shoulder) to camera position
 				startX, startY, startZ := targX, targY, targZ
 				dx := camX - startX
 				dy := camY - startY
 				dz := camZ - startZ
 
-				bestT := float32(1.0) // fraction along ray where camera can be (1.0 = full distance)
+				bestT := float32(1.0)
 				for i := 1; i <= camSteps; i++ {
 					t := float32(i) / float32(camSteps)
 					sx := startX + dx*t
 					sy := startY + dy*t
 					sz := startZ + dz*t
+
+					// Terrain height check
 					if groundY, ok := zt.SampleHeight(sx, sz, sy); ok {
 						if sy < groundY+camClearance {
-							// This point clips terrain — camera can't go this far
-							// Pull back to just before the clip point
 							pullT := t - 1.0/float32(camSteps)
-							if pullT < 0.1 {
-								pullT = 0.1 // minimum distance (don't go inside character)
+							if pullT < 0.05 {
+								pullT = 0.05
 							}
 							if pullT < bestT {
 								bestT = pullT
 							}
+							break // first clip stops the march
+						}
+					}
+
+					// Wall collision check: test if CalcFit would push us
+					// (indicates a wall between previous and current sample)
+					if i > 1 {
+						prevT := float32(i-1) / float32(camSteps)
+						px := startX + dx*prevT
+						pz := startZ + dz*prevT
+						fit := zt.CalcFit(px, sy, pz, sx, sz)
+						// If CalcFit moved us significantly, there's a wall
+						fitDX := fit.X - sx
+						fitDZ := fit.Z - sz
+						if fitDX*fitDX+fitDZ*fitDZ > camWallRadius*camWallRadius*0.01 {
+							pullT := prevT
+							if pullT < 0.05 {
+								pullT = 0.05
+							}
+							if pullT < bestT {
+								bestT = pullT
+							}
+							break
 						}
 					}
 				}
@@ -241,7 +264,6 @@ func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.C
 					camX = startX + dx*bestT
 					camY = startY + dy*bestT
 					camZ = startZ + dz*bestT
-					// Ensure camera stays above terrain at final position
 					if groundY, ok := zt.SampleHeight(camX, camZ, camY); ok {
 						if camY < groundY+camClearance {
 							camY = groundY + camClearance
