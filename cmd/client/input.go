@@ -692,7 +692,9 @@ func (c *Client) handleInWorldInput() {
 		}
 		const runThreshold = float32(0.7) // PS2 InitParms+0x5C
 		var targetSpeed float32
-		if c.runMode && mag > runThreshold {
+		// PS2: first person backward/strafe = walk speed only, forward = run allowed.
+		fpWalkOnly := c.firstPerson && (inputFwd <= 0 || inputRight != 0)
+		if c.runMode && mag > runThreshold && !fpWalkOnly {
 			targetSpeed = serverSpeed
 		} else {
 			targetSpeed = walkSpeedCap
