@@ -202,16 +202,50 @@ func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.C
 		targZ = p.Z
 
 		// PS2 MoveCamera (0x00482AF0): camera-terrain collision.
-		// Full PS2 uses VICollSphere swept sphere test. We use a simpler
-		// terrain height sample — push camera above terrain + clearance.
-		const camClearance = float32(0.5) // minimum height above terrain
-		if c.terrainLoader != nil {
+		// PS2 uses VICollSphere swept sphere from player to camera.
+		// We ray-march along the player→camera line, sampling terrain height
+		// at each step. If any sample clips terrain, pull camera to that point.
+		const camClearance = float32(0.5) // PS2 collisionRadius (+0x270)
+		const camSteps = 8               // number of samples along ray
+		if c.terrainLoader != nil && c.camDist > 0.5 {
 			zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
 			if zt != nil {
-				if groundY, ok := zt.SampleHeight(camX, camZ, camY); ok {
-					minY := groundY + camClearance
-					if camY < minY {
-						camY = minY
+				// Ray from target point (shoulder) to camera position
+				startX, startY, startZ := targX, targY, targZ
+				dx := camX - startX
+				dy := camY - startY
+				dz := camZ - startZ
+
+				bestT := float32(1.0) // fraction along ray where camera can be (1.0 = full distance)
+				for i := 1; i <= camSteps; i++ {
+					t := float32(i) / float32(camSteps)
+					sx := startX + dx*t
+					sy := startY + dy*t
+					sz := startZ + dz*t
+					if groundY, ok := zt.SampleHeight(sx, sz, sy); ok {
+						if sy < groundY+camClearance {
+							// This point clips terrain — camera can't go this far
+							// Pull back to just before the clip point
+							pullT := t - 1.0/float32(camSteps)
+							if pullT < 0.1 {
+								pullT = 0.1 // minimum distance (don't go inside character)
+							}
+							if pullT < bestT {
+								bestT = pullT
+							}
+						}
+					}
+				}
+
+				if bestT < 1.0 {
+					camX = startX + dx*bestT
+					camY = startY + dy*bestT
+					camZ = startZ + dz*bestT
+					// Ensure camera stays above terrain at final position
+					if groundY, ok := zt.SampleHeight(camX, camZ, camY); ok {
+						if camY < groundY+camClearance {
+							camY = groundY + camClearance
+						}
 					}
 				}
 			}
