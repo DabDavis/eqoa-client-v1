@@ -200,9 +200,23 @@ func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.C
 		targX = p.X
 		targY = p.Y + targHeight
 		targZ = p.Z
-	}
 
-	// Camera shake disabled — was triggering constantly due to stale spell effect state.
+		// PS2 MoveCamera (0x00482AF0): camera-terrain collision.
+		// Full PS2 uses VICollSphere swept sphere test. We use a simpler
+		// terrain height sample — push camera above terrain + clearance.
+		const camClearance = float32(0.5) // minimum height above terrain
+		if c.terrainLoader != nil {
+			zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
+			if zt != nil {
+				if groundY, ok := zt.SampleHeight(camX, camZ, camY); ok {
+					minY := groundY + camClearance
+					if camY < minY {
+						camY = minY
+					}
+				}
+			}
+		}
+	}
 
 	return rl.Camera3D{
 		Position:   rl.Vector3{X: camX, Y: camY, Z: camZ},
