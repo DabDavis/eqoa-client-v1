@@ -431,7 +431,9 @@ func (c *Client) handleInWorldInput() {
 	const camDampingBase = float64(0.01)
 	camDecay := float32(math.Pow(camDampingBase, float64(dt)))
 
-	// Camera orbit: A/D accumulate angular force (PS2 OrbitRight).
+	// Camera orbit / character turn: A/D + right stick X.
+	// PS2: In first person, A/D rotates the character (camera follows facing).
+	// In third person, A/D orbits the camera independently.
 	ctrlDown := rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
 	var camAngleForce float32
 	if !ctrlDown && rl.IsKeyDown(rl.KeyA) {
@@ -440,9 +442,7 @@ func (c *Client) handleInWorldInput() {
 	if !ctrlDown && rl.IsKeyDown(rl.KeyD) {
 		camAngleForce += rotSpeed
 	}
-	// Add gamepad stick as force (same path as keyboard A/D).
 	camAngleForce += gpCamH
-	// Integrate: vel += force * dt, angle += vel * dt, vel *= decay
 	c.camAngleVel += camAngleForce * dt
 	c.camAngle += c.camAngleVel * dt
 	c.camAngleVel *= camDecay
@@ -471,13 +471,13 @@ func (c *Client) handleInWorldInput() {
 		c.camPitchVel = 0
 	}
 
-	// Arrow keys: camera-relative player movement.
+	// Arrow keys / left stick: player movement.
 	// PS2 ViewRelativeWalk (0x004856B8): converts camera-relative input to world heading.
-	// Camera sits at player + dist*(cos(angle), sin(angle)) in XZ,
-	// so "forward" (away from camera) = (-cos(angle), -sin(angle)).
 	//
-	// Track raw input separately for facing calculation.
-	// Tick down hotkey close cooldown (prevents arrow release from triggering movement).
+	// First person (PS2 mode 0): arrow left/right + left stick X = STRAFE.
+	//   A/D + right stick X = turn character (camera follows).
+	// Third person (PS2 mode 3): arrow left/right + left stick X = camera-relative move.
+	//   A/D + right stick X = orbit camera.
 	if c.hotkeyCloseTime > 0 {
 		c.hotkeyCloseTime -= dt
 	}
@@ -489,16 +489,34 @@ func (c *Client) handleInWorldInput() {
 		if rl.IsKeyDown(rl.KeyDown) {
 			inputFwd -= 1
 		}
-		if rl.IsKeyDown(rl.KeyRight) {
-			inputRight += 1
-		}
-		if rl.IsKeyDown(rl.KeyLeft) {
-			inputRight -= 1
+		if c.firstPerson {
+			// First person: arrow left/right = strafe
+			if rl.IsKeyDown(rl.KeyRight) {
+				inputRight += 1
+			}
+			if rl.IsKeyDown(rl.KeyLeft) {
+				inputRight -= 1
+			}
+		} else {
+			// Third person: arrow left/right = camera-relative move
+			if rl.IsKeyDown(rl.KeyRight) {
+				inputRight += 1
+			}
+			if rl.IsKeyDown(rl.KeyLeft) {
+				inputRight -= 1
+			}
 		}
 	}
-	// Merge gamepad left stick input
-	inputFwd += gpFwd
-	inputRight += gpRight
+
+	if c.firstPerson {
+		// First person: left stick X = strafe, not camera-relative right
+		inputFwd += gpFwd
+		inputRight += gpRight
+	} else {
+		// Third person: merge gamepad left stick as camera-relative
+		inputFwd += gpFwd
+		inputRight += gpRight
+	}
 
 	// Cancel auto-run on manual movement input
 	if c.autoRun && (inputFwd != 0 || inputRight != 0) {
@@ -802,10 +820,21 @@ func (c *Client) handleInWorldInput() {
 		}
 	}
 
-	// === Facing rotation — snap to target heading ===
-	// PS2 uses force-based turning tuned for analog stick (1.8 rad/s).
-	// Digital input needs instant response — snap facing to target each frame.
-	{
+	// === Facing rotation ===
+	// First person: character always faces camera direction (PS2 mode 0).
+	// Third person: character faces movement direction (PS2 ViewRelativeWalk).
+	if c.firstPerson {
+		// Camera angle IS the character facing in first person.
+		// Normalize to [0, 2*PI] — camAngle can drift outside.
+		facing := c.camAngle + math.Pi // camAngle=0 faces +Z, facing=0 faces -Z
+		for facing < 0 {
+			facing += 2 * math.Pi
+		}
+		for facing >= 2*math.Pi {
+			facing -= 2 * math.Pi
+		}
+		p.Facing = facing
+	} else {
 		p.Facing = c.targetFacing
 	}
 
