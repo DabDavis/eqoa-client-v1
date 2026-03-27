@@ -8,6 +8,10 @@ package game
 //
 // Wire format: opcodes 0x00C5 (WeatherControl) and 0x00C7 (SkyboxWeather)
 // each send a single byte (0-6). 0xC5 = instant, 0xC7 = fade transition.
+//
+// PS2 ProcessTransitions (0x004198B0): 30-second crossfade.
+// PS2 ProcessWeather (0x00418EE8): position-wrapping particles (no age/lifespan).
+// PS2 GetLightning (0x0041AA58): thunderstorm screen flash + bolt geometry.
 
 import (
 	"math"
@@ -31,52 +35,77 @@ const (
 
 // PS2 VIAtmosphere constants (from Init at 0x00416B60).
 const (
-	weatherMaxParticles = 200  // offset +8 in VIAtmosphere
-	weatherRange        = 10.0 // offset +4 — spawn radius around camera
+	weatherMaxParticles = 200   // offset +8 in VIAtmosphere
+	weatherRange        = 10.0  // spawn radius around camera (Go scale)
+	weatherTransRate    = 1.0 / 30.0 // PS2: 30-second full transition
 )
 
-// weatherParticle is a single rain/snow/sand/etc particle.
+// weatherParticle — PS2 struct is 36 bytes: pos/vel/groundY/hitGround.
+// PS2 uses position wrapping (no age/lifespan) but we keep age for fade-in.
 type weatherParticle struct {
-	x, y, z    float32 // world position
+	x, y, z    float32 // position relative to camera
 	vx, vy, vz float32 // velocity
-	age        float32 // seconds alive
-	lifespan   float32 // seconds to live
 	size       float32 // billboard half-size
+	age        float32 // time since spawn (for fade-in only)
+}
+
+// weatherSplash — ground contact splash from rain.
+// PS2: 36-byte struct in linked list pool (RenderSplashes at 0x0041B420).
+type weatherSplash struct {
+	x, y, z    float32 // world position
+	brightness float32 // 0.2-0.6 range
+	frame      int     // 0-3 animation frame (4 = expired)
+	age        float32 // seconds alive
 }
 
 // WeatherSystem manages weather particle rendering.
+// PS2: VIAtmosphere (0x11A8 bytes).
 type WeatherSystem struct {
 	Type       WeatherType
 	TargetType WeatherType
-	Intensity  float32 // 0.0 = off, 1.0 = full (transition blend)
+	Intensity  float32 // 0.0 = off, 1.0 = full (PS2 offset +0x48)
+
+	// PS2 ProcessTransitions (0x004198B0): transitionProgress 0.0→1.0
+	transitionProgress float32
 
 	particles []weatherParticle
+	splashes  []weatherSplash // ground splashes (PS2: 200-node linked list pool)
 	rng       *rand.Rand
 
-	// PS2 VIAtmosphere wind direction (computed from game time).
-	// Update at 0x00418280: windAngle = gameTime * π/12
-	// windX = sin(windAngle) * 35.0, windZ = cos(windAngle) * -35.0
+	// PS2 VIAtmosphere wind (Update at 0x00418280)
 	windX, windZ float32
 
-	// PS2 VIAtmosphere textures from SKY.ESF (set via SetTextures).
+	// Previous camera position for camera-relative particle movement (PS2 pattern)
+	prevCamX, prevCamY, prevCamZ float32
+	camInit                      bool
+
+	// Lightning (PS2 GetLightning at 0x0041AA58)
+	lightningTimer      float32 // countdown to next flash
+	lightningProgress   float32 // time into current flash
+	lightningDuration   float32 // how long current flash lasts
+	lightningIntensity  float32 // peak brightness (0.0-1.0)
+	LightningBrightness float32 // current brightness for screen tint (public for render)
+
+	// PS2 VIAtmosphere textures from SKY.ESF
 	rainTex   rl.Texture2D
 	snowTex   rl.Texture2D
 	splashTex rl.Texture2D
-	hasTex    bool // true if any texture was loaded
+	hasTex    bool
 }
 
 // NewWeatherSystem creates a weather system.
 func NewWeatherSystem() *WeatherSystem {
 	return &WeatherSystem{
-		Type:      WeatherClear,
-		Intensity: 0,
-		particles: make([]weatherParticle, 0, weatherMaxParticles),
-		rng:       rand.New(rand.NewSource(42)),
+		Type:           WeatherClear,
+		Intensity:      0,
+		particles:      make([]weatherParticle, 0, weatherMaxParticles),
+		splashes:       make([]weatherSplash, 0, weatherMaxParticles),
+		rng:            rand.New(rand.NewSource(42)),
+		lightningTimer: 3.0 + rand.Float32()*5.0,
 	}
 }
 
 // SetTextures assigns GPU textures for weather particles.
-// Called from asset loading after extracting from SKY.ESF.
 func (ws *WeatherSystem) SetTextures(rain, snow, splash rl.Texture2D) {
 	ws.rainTex = rain
 	ws.snowTex = snow
@@ -85,63 +114,56 @@ func (ws *WeatherSystem) SetTextures(rain, snow, splash rl.Texture2D) {
 }
 
 // SetWeather changes the active weather type.
-// If fade is true, transition smoothly; otherwise instant.
+// PS2: SetWeather (0x00417F78) — simple stub that sets target state.
 func (ws *WeatherSystem) SetWeather(wt WeatherType, fade bool) {
-	if wt == WeatherClear {
-		ws.TargetType = WeatherClear
-		if !fade {
-			ws.Type = WeatherClear
-			ws.Intensity = 0
-			ws.particles = ws.particles[:0]
-		}
-		return
-	}
 	ws.TargetType = wt
 	if !fade {
 		ws.Type = wt
-		ws.Intensity = 1.0
+		if wt == WeatherClear {
+			ws.Intensity = 0
+			ws.particles = ws.particles[:0]
+			ws.splashes = ws.splashes[:0]
+		} else {
+			ws.Intensity = 1.0
+		}
+		ws.transitionProgress = 0
 	}
 }
 
 // weatherConfig holds per-type particle parameters.
+// PS2 color table at 0x4E0740.
 type weatherConfig struct {
-	velY     float32 // downward velocity (negative = down)
-	windMul  float32 // multiplier for global wind direction (0 = no wind influence)
-	size     float32 // particle size
-	lifespan float32 // seconds
-	color    rl.Color
+	velY    float32  // downward velocity
+	windMul float32  // wind influence multiplier
+	size    float32  // base particle size (PS2: particleSizeBase 0x088)
+	color   rl.Color // particle tint
 }
 
 func getWeatherConfig(wt WeatherType) weatherConfig {
 	switch wt {
 	case WeatherRain:
 		return weatherConfig{
-			velY: -15.0, windMul: 0.02,
-			size: 0.02, lifespan: 1.6,
-			color: rl.Color{R: 180, G: 200, B: 255, A: 100},
+			velY: -15.0, windMul: 0.02, size: 0.02,
+			color: rl.Color{R: 180, G: 200, B: 255, A: 100}, // PS2: teal (71,235,174)
 		}
 	case WeatherSnow:
 		return weatherConfig{
-			velY: -1.5, windMul: 0.03,
-			size: 0.06, lifespan: 8.0,
+			velY: -1.5, windMul: 0.03, size: 0.06,
 			color: rl.Color{R: 255, G: 255, B: 255, A: 180},
 		}
 	case WeatherSleet:
 		return weatherConfig{
-			velY: -10.0, windMul: 0.02,
-			size: 0.03, lifespan: 2.0,
+			velY: -10.0, windMul: 0.02, size: 0.03,
 			color: rl.Color{R: 200, G: 210, B: 240, A: 120},
 		}
 	case WeatherSandstorm:
 		return weatherConfig{
-			velY: -0.5, windMul: 0.10,
-			size: 0.05, lifespan: 3.0,
-			color: rl.Color{R: 210, G: 180, B: 120, A: 100},
+			velY: -0.5, windMul: 0.10, size: 0.05,
+			color: rl.Color{R: 210, G: 180, B: 120, A: 100}, // PS2: amber (208,166,50)
 		}
 	case WeatherThunder:
 		return weatherConfig{
-			velY: -18.0, windMul: 0.01,
-			size: 0.02, lifespan: 1.3,
+			velY: -18.0, windMul: 0.01, size: 0.02,
 			color: rl.Color{R: 160, G: 180, B: 220, A: 110},
 		}
 	default:
@@ -150,80 +172,185 @@ func getWeatherConfig(wt WeatherType) weatherConfig {
 }
 
 // Update advances the weather simulation by dt seconds.
-// gameHour is 0.0-24.0 (same as sky dome time).
+// PS2: VIAtmosphere::Update (0x00418280) + ProcessWeather (0x00418EE8) + ProcessTransitions (0x004198B0).
 func (ws *WeatherSystem) Update(dt, gameHour float32, camX, camY, camZ float32) {
-	// PS2 VIAtmosphere::Update at 0x00418280:
-	// windAngle = gameTime * π/12
-	// windX = sin(windAngle) * 35.0, windZ = cos(windAngle) * -35.0
+	// PS2 wind: windAngle = gameTime * π/12
 	windAngle := float64(gameHour) * (math.Pi / 12.0)
 	ws.windX = float32(math.Sin(windAngle)) * 35.0
 	ws.windZ = float32(math.Cos(windAngle)) * -35.0
 
-	// Transition intensity toward target.
-	if ws.TargetType == WeatherClear {
-		ws.Intensity -= dt * 0.5 // fade out over 2 seconds
-		if ws.Intensity <= 0 {
-			ws.Intensity = 0
-			ws.Type = WeatherClear
-			ws.particles = ws.particles[:0]
-			return
-		}
-	} else {
-		if ws.Type != ws.TargetType {
+	// Camera delta for position-wrapping (PS2 subtracts camera movement)
+	var camDX, camDY, camDZ float32
+	if ws.camInit {
+		camDX = camX - ws.prevCamX
+		camDY = camY - ws.prevCamY
+		camDZ = camZ - ws.prevCamZ
+	}
+	ws.prevCamX, ws.prevCamY, ws.prevCamZ = camX, camY, camZ
+	ws.camInit = true
+
+	// --- PS2 ProcessTransitions (0x004198B0) ---
+	// Transition speed: deltaTime * (1/30) = 30-second full transition.
+	if ws.TargetType != ws.Type || (ws.TargetType == WeatherClear && ws.Intensity > 0) {
+		ws.transitionProgress += dt * weatherTransRate
+		if ws.transitionProgress >= 1.0 {
+			ws.transitionProgress = 0
 			ws.Type = ws.TargetType
-			ws.particles = ws.particles[:0]
-		}
-		ws.Intensity += dt * 0.5
-		if ws.Intensity > 1.0 {
-			ws.Intensity = 1.0
+			if ws.Type == WeatherClear {
+				ws.Intensity = 0
+				ws.particles = ws.particles[:0]
+				ws.splashes = ws.splashes[:0]
+			} else {
+				ws.Intensity = 1.0
+			}
+		} else {
+			// Interpolate intensity during transition
+			if ws.TargetType == WeatherClear {
+				ws.Intensity = 1.0 - ws.transitionProgress
+			} else {
+				ws.Type = ws.TargetType
+				ws.Intensity = ws.transitionProgress
+			}
 		}
 	}
 
 	if ws.Type == WeatherClear || ws.Type == WeatherLavastorm {
+		ws.LightningBrightness = 0
 		return
 	}
 
 	cfg := getWeatherConfig(ws.Type)
+	halfRange := float32(weatherRange * 0.5)
 
-	// Age existing particles, remove dead ones.
-	alive := 0
-	for i := range ws.particles {
+	// --- PS2 ProcessWeather (0x00418EE8): position-wrapping particle update ---
+	activeCount := int(ws.Intensity * weatherMaxParticles)
+
+	// Ensure we have enough particles (spawn on first need)
+	for len(ws.particles) < activeCount {
+		ws.particles = append(ws.particles, weatherParticle{
+			x:    (ws.rng.Float32()*2 - 1) * weatherRange,
+			y:    ws.rng.Float32() * weatherRange,
+			z:    (ws.rng.Float32()*2 - 1) * weatherRange,
+			vx:   (ws.rng.Float32()*2 - 1) * 0.5,
+			vy:   cfg.velY,
+			vz:   (ws.rng.Float32()*2 - 1) * 0.5,
+			size: cfg.size * (0.7 + ws.rng.Float32()*0.6),
+			age:  0,
+		})
+	}
+
+	// Update particles (position wrapping, no death)
+	for i := 0; i < len(ws.particles) && i < activeCount; i++ {
 		p := &ws.particles[i]
 		p.age += dt
-		if p.age >= p.lifespan {
-			continue
-		}
-		// Move particle: gravity + coherent wind drift.
+
+		// Move particle
 		p.x += (p.vx + ws.windX*cfg.windMul) * dt
 		p.y += p.vy * dt
 		p.z += (p.vz + ws.windZ*cfg.windMul) * dt
 
-		// Snow: gentle sinusoidal wobble on top of wind.
+		// Snow wobble
 		if ws.Type == WeatherSnow {
 			p.x += float32(math.Sin(float64(p.age*2.0+p.z))) * 0.3 * dt
 			p.z += float32(math.Cos(float64(p.age*1.7+p.x))) * 0.3 * dt
 		}
 
-		ws.particles[alive] = ws.particles[i]
-		alive++
-	}
-	ws.particles = ws.particles[:alive]
+		// PS2: subtract camera movement (particles are camera-relative)
+		p.x -= camDX
+		p.y -= camDY
+		p.z -= camDZ
 
-	// PS2: particleCount = intensity * maxParticles (uniform 200 for all types).
-	targetCount := int(ws.Intensity * weatherMaxParticles)
-	for len(ws.particles) < targetCount {
-		p := weatherParticle{
-			x:        camX + (ws.rng.Float32()*2-1)*weatherRange,
-			y:        camY + weatherRange*ws.rng.Float32(),
-			z:        camZ + (ws.rng.Float32()*2-1)*weatherRange,
-			vx:       (ws.rng.Float32()*2 - 1) * 0.5, // small random per-particle variation
-			vy:       cfg.velY,
-			vz:       (ws.rng.Float32()*2 - 1) * 0.5,
-			age:      ws.rng.Float32() * cfg.lifespan * 0.5, // stagger births
-			lifespan: cfg.lifespan * (0.8 + ws.rng.Float32()*0.4),
-			size:     cfg.size * (0.7 + ws.rng.Float32()*0.6),
+		// PS2: wrap at range boundaries (particles never die)
+		wrapped := false
+		if p.y < -halfRange {
+			p.y += weatherRange
+			wrapped = true
+		} else if p.y > halfRange {
+			p.y -= weatherRange
+			wrapped = true
 		}
-		ws.particles = append(ws.particles, p)
+		if p.x < -weatherRange {
+			p.x += weatherRange * 2
+			wrapped = true
+		} else if p.x > weatherRange {
+			p.x -= weatherRange * 2
+			wrapped = true
+		}
+		if p.z < -weatherRange {
+			p.z += weatherRange * 2
+			wrapped = true
+		} else if p.z > weatherRange {
+			p.z -= weatherRange * 2
+			wrapped = true
+		}
+
+		// Ground contact: spawn splash (rain/thunder/sleet only)
+		isRainType := ws.Type == WeatherRain || ws.Type == WeatherThunder || ws.Type == WeatherSleet
+		if isRainType && p.y < -halfRange+0.5 && !wrapped {
+			// Splash at ground contact point
+			if len(ws.splashes) < weatherMaxParticles {
+				ws.splashes = append(ws.splashes, weatherSplash{
+					x: camX + p.x, y: camY + p.y + halfRange, z: camZ + p.z,
+					brightness: 0.28 + ws.rng.Float32()*0.2, // PS2: 0.2825 + rand*0.2
+					frame:      0,
+				})
+			}
+		}
+	}
+
+	// Trim excess particles if intensity dropped
+	if len(ws.particles) > activeCount {
+		ws.particles = ws.particles[:activeCount]
+	}
+
+	// --- Update splashes (PS2: 4-frame animation, RenderSplashes at 0x0041B420) ---
+	alive := 0
+	for i := range ws.splashes {
+		s := &ws.splashes[i]
+		s.age += dt
+		// PS2: frame advances each tick, 4 frames total (~0.13s per frame at 30fps)
+		s.frame = int(s.age / 0.13)
+		if s.frame < 4 {
+			ws.splashes[alive] = ws.splashes[i]
+			alive++
+		}
+	}
+	ws.splashes = ws.splashes[:alive]
+
+	// --- PS2 Lightning (GetLightning at 0x0041AA58) ---
+	ws.LightningBrightness = 0
+	if ws.Type == WeatherThunder && ws.Intensity > 0.5 {
+		ws.lightningTimer -= dt
+		if ws.lightningTimer <= 0 {
+			// New flash: PS2 ResetLightning (0x0041A6C8)
+			ws.lightningIntensity = 0.3 + ws.rng.Float32()*0.7
+			ws.lightningDuration = ws.lightningIntensity * (0.6 + ws.rng.Float32()*0.6)
+			ws.lightningProgress = 0
+			ws.lightningTimer = 3.0 + ws.rng.Float32()*8.0 // 3-11 seconds between flashes
+		}
+		if ws.lightningProgress < ws.lightningDuration*1.5 {
+			ws.lightningProgress += dt
+			// PS2: first 0.2s ramp up, then ramp down
+			var brightness float32
+			if ws.lightningProgress < 0.2 {
+				brightness = ws.lightningProgress / 0.2
+			} else {
+				brightness = 1.0 - (ws.lightningProgress-0.2)/(ws.lightningDuration-0.2)
+			}
+			if brightness < 0 {
+				brightness = 0
+			}
+			// PS2: random flicker
+			flicker := (ws.rng.Float32() - ws.rng.Float32()) * 0.3
+			brightness = brightness*ws.lightningIntensity + flicker
+			if brightness < 0 {
+				brightness = 0
+			}
+			if brightness > 1 {
+				brightness = 1
+			}
+			ws.LightningBrightness = brightness * 0.8 // PS2: * (1-intensity) * 0.8
+		}
 	}
 }
 
@@ -239,46 +366,32 @@ func (ws *WeatherSystem) weatherTexture() rl.Texture2D {
 	}
 }
 
-// weatherBlendAdditive returns true for particle types that should use additive
-// blending (texture has opaque black background, not premultiplied alpha).
-func (ws *WeatherSystem) weatherBlendAdditive() bool {
-	switch ws.Type {
-	case WeatherSnow:
-		return true
-	default:
-		return false
-	}
-}
-
 // Render draws all weather particles as billboard quads.
+// PS2: RenderWeather (0x00418700) + RenderSplashes (0x0041B420).
 func (ws *WeatherSystem) Render(camera rl.Camera3D) {
 	if ws.Type == WeatherClear || len(ws.particles) == 0 {
 		return
 	}
 
 	cfg := getWeatherConfig(ws.Type)
-
 	camRight, camUp := billboardVectors(camera)
-
-	// Rain: use vertical-stretch billboards instead of camera-facing.
 	isRain := ws.Type == WeatherRain || ws.Type == WeatherSleet || ws.Type == WeatherThunder
 	if isRain {
-		// Stretch vertically for rain streak effect.
 		camUp = rl.Vector3{X: 0, Y: 1, Z: 0}
 	}
 
 	rl.DisableDepthMask()
 
-	// Snow/textured particles: additive blend (black bg adds nothing).
-	// Rain/sand/etc: standard alpha blend.
-	tex := ws.weatherTexture()
-	useTex := tex.ID > 0
-	if useTex && ws.weatherBlendAdditive() {
+	// PS2: weather materials use additive blend mode 3
+	isSnow := ws.Type == WeatherSnow
+	if isSnow {
 		rl.BeginBlendMode(rl.BlendAdditive)
 	} else {
 		rl.BeginBlendMode(rl.BlendAlpha)
 	}
 
+	tex := ws.weatherTexture()
+	useTex := tex.ID > 0
 	if useTex {
 		rl.SetTexture(tex.ID)
 	}
@@ -286,37 +399,35 @@ func (ws *WeatherSystem) Render(camera rl.Camera3D) {
 
 	alpha := uint8(float32(cfg.color.A) * ws.Intensity)
 	clr := cfg.color
-	clr.A = alpha
 
-	for i := range ws.particles {
+	activeCount := int(ws.Intensity * weatherMaxParticles)
+	camX, camY, camZ := camera.Position.X, camera.Position.Y, camera.Position.Z
+
+	for i := 0; i < len(ws.particles) && i < activeCount; i++ {
 		p := &ws.particles[i]
-		if p.age >= p.lifespan {
-			continue
-		}
 
-		// Fade in/out at edges of lifespan.
-		fadeAge := p.age / p.lifespan
+		// Fade-in for first 0.3s (prevents pop-in)
 		fade := float32(1.0)
-		if fadeAge < 0.1 {
-			fade = fadeAge * 10.0
-		} else if fadeAge > 0.8 {
-			fade = (1.0 - fadeAge) * 5.0
+		if p.age < 0.3 {
+			fade = p.age / 0.3
 		}
 		a := uint8(float32(alpha) * fade)
 		if a == 0 {
 			continue
 		}
 
+		// World position = camera + relative offset
+		wx := camX + p.x
+		wy := camY + p.y
+		wz := camZ + p.z
+
 		size := p.size
 		var rx, ry, rz, ux, uy, uz float32
 		if isRain {
-			// Rain streaks: narrow horizontal, tall vertical.
 			rx = camRight.X * size * 0.3
 			ry = camRight.Y * size * 0.3
 			rz = camRight.Z * size * 0.3
-			ux = 0
-			uy = size * 3.0
-			uz = 0
+			ux, uy, uz = 0, size*3.0, 0
 		} else {
 			rx = camRight.X * size
 			ry = camRight.Y * size
@@ -330,25 +441,56 @@ func (ws *WeatherSystem) Render(camera rl.Camera3D) {
 		if useTex {
 			rl.TexCoord2f(0, 1)
 		}
-		rl.Vertex3f(p.x-rx-ux, p.y-ry-uy, p.z-rz-uz)
+		rl.Vertex3f(wx-rx-ux, wy-ry-uy, wz-rz-uz)
 		if useTex {
 			rl.TexCoord2f(1, 1)
 		}
-		rl.Vertex3f(p.x+rx-ux, p.y+ry-uy, p.z+rz-uz)
+		rl.Vertex3f(wx+rx-ux, wy+ry-uy, wz+rz-uz)
 		if useTex {
 			rl.TexCoord2f(1, 0)
 		}
-		rl.Vertex3f(p.x+rx+ux, p.y+ry+uy, p.z+rz+uz)
+		rl.Vertex3f(wx+rx+ux, wy+ry+uy, wz+rz+uz)
 		if useTex {
 			rl.TexCoord2f(0, 0)
 		}
-		rl.Vertex3f(p.x-rx+ux, p.y-ry+uy, p.z-rz+uz)
+		rl.Vertex3f(wx-rx+ux, wy-ry+uy, wz-rz+uz)
 	}
 
 	rl.End()
 	if useTex {
-		rl.SetTexture(0) // unbind
+		rl.SetTexture(0)
 	}
+
+	// --- Render splashes (PS2: RenderSplashes at 0x0041B420) ---
+	if len(ws.splashes) > 0 && ws.splashTex.ID > 0 {
+		rl.SetTexture(ws.splashTex.ID)
+		rl.Begin(rl.Quads)
+
+		splashSize := float32(0.08) // PS2: 0x3DA3D70A
+		for i := range ws.splashes {
+			s := &ws.splashes[i]
+			b := uint8(s.brightness * 255)
+			rl.Color4ub(b, b, b, b)
+
+			// PS2: 4-frame animated UV
+			u0 := float32(s.frame) * 0.25
+			u1 := u0 + 0.25
+
+			// Ground-facing billboard (Y-up)
+			sx, sy, sz := s.x, s.y+0.08, s.z // PS2: splashOffset = 0.08
+			rl.TexCoord2f(u0, 1)
+			rl.Vertex3f(sx-splashSize, sy, sz-splashSize)
+			rl.TexCoord2f(u1, 1)
+			rl.Vertex3f(sx+splashSize, sy, sz-splashSize)
+			rl.TexCoord2f(u1, 0)
+			rl.Vertex3f(sx+splashSize, sy, sz+splashSize)
+			rl.TexCoord2f(u0, 0)
+			rl.Vertex3f(sx-splashSize, sy, sz+splashSize)
+		}
+		rl.End()
+		rl.SetTexture(0)
+	}
+
 	rl.EndBlendMode()
 	rl.EnableDepthMask()
 }

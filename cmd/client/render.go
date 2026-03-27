@@ -564,6 +564,12 @@ func (c *Client) drawWorld() {
 		gh := c.engine.State.GameHour()
 		c.weather.Update(dt, gh, camera.Position.X, camera.Position.Y, camera.Position.Z)
 		c.weather.Render(camera)
+
+		// PS2 lightning screen flash (GetLightning at 0x0041AA58)
+		if c.weather.LightningBrightness > 0.01 {
+			a := uint8(c.weather.LightningBrightness * 180)
+			rl.DrawRectangle(0, 0, screenWidth, screenHeight, rl.Color{R: 220, G: 220, B: 255, A: a})
+		}
 	}
 
 	// Draw spell visual effects (particles, lightning, sprites).
