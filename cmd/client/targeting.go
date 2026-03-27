@@ -202,12 +202,11 @@ func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.C
 		targZ = p.Z
 
 		// PS2 MoveCamera (0x00482AF0): camera-terrain collision.
-		// PS2 uses VICollSphere swept sphere from player to camera.
-		// We ray-march along the player→camera line with terrain height +
-		// wall collision checks. More aggressive for indoor areas.
-		const camClearance = float32(1.0)  // clearance above terrain (PS2: collisionRadius ~1.57)
-		const camSteps = 16                // samples along ray (more = catches thin walls)
-		const camWallRadius = float32(0.8) // lateral clearance from walls
+		// PS2 uses VICollSphere (radius ~1.57) swept from player to camera,
+		// with fallback to FindOrbitAngle if too close. We ray-march with
+		// terrain + wall checks and use sweepSphereVsWalls for the full path.
+		const camClearance = float32(1.2)  // PS2 collisionRadius ≈ PI/2
+		const camSteps = 20                // dense sampling for indoor walls
 		if c.terrainLoader != nil && c.camDist > 0.5 {
 			zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
 			if zt != nil {
@@ -217,46 +216,45 @@ func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.C
 				dz := camZ - startZ
 
 				bestT := float32(1.0)
+				step := float32(1.0) / float32(camSteps)
+
 				for i := 1; i <= camSteps; i++ {
-					t := float32(i) / float32(camSteps)
+					t := float32(i) * step
 					sx := startX + dx*t
 					sy := startY + dy*t
 					sz := startZ + dz*t
 
-					// Terrain height check
+					clipped := false
+
+					// Terrain floor check
 					if groundY, ok := zt.SampleHeight(sx, sz, sy); ok {
 						if sy < groundY+camClearance {
-							pullT := t - 1.0/float32(camSteps)
-							if pullT < 0.05 {
-								pullT = 0.05
-							}
-							if pullT < bestT {
-								bestT = pullT
-							}
-							break // first clip stops the march
+							clipped = true
 						}
 					}
 
-					// Wall collision check: test if CalcFit would push us
-					// (indicates a wall between previous and current sample)
-					if i > 1 {
-						prevT := float32(i-1) / float32(camSteps)
+					// Wall check via swept sphere every 4th step (perf: ~5 sphere sweeps)
+					if !clipped && i > 1 && i%4 == 0 {
+						prevT := float32(i-4) * step
 						px := startX + dx*prevT
+						py := startY + dy*prevT
 						pz := startZ + dz*prevT
-						fit := zt.CalcFit(px, sy, pz, sx, sz)
-						// If CalcFit moved us significantly, there's a wall
-						fitDX := fit.X - sx
-						fitDZ := fit.Z - sz
-						if fitDX*fitDX+fitDZ*fitDZ > camWallRadius*camWallRadius*0.01 {
-							pullT := prevT
-							if pullT < 0.05 {
-								pullT = 0.05
-							}
-							if pullT < bestT {
-								bestT = pullT
-							}
-							break
+						_, _, _, hitT, hit := zt.SweepSphereVsWalls(
+							px, py, pz, sx, sy, sz, 0.5)
+						if hit && hitT < 0.9 {
+							clipped = true
 						}
+					}
+
+					if clipped {
+						pullT := float32(i-1) * step
+						if pullT < 0.05 {
+							pullT = 0.05
+						}
+						if pullT < bestT {
+							bestT = pullT
+						}
+						break
 					}
 				}
 

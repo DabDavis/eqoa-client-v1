@@ -276,11 +276,11 @@ func sweepSphereTriangle(
 	return 0, 0, 0, 0, false
 }
 
-// sweepSphereVsWalls sweeps a sphere from start to end against all non-walkable
+// SweepSphereVsWalls sweeps a sphere from start to end against all non-walkable
 // triangles in nearby collision tiles. Returns the closest hit.
 // Replaces castWallRay — covers the full sphere volume instead of approximating
-// with discrete ray heights.
-func (zt *ZoneTerrain) sweepSphereVsWalls(
+// with discrete ray heights. Also used by camera collision.
+func (zt *ZoneTerrain) SweepSphereVsWalls(
 	fromX, fromY, fromZ,
 	toX, toY, toZ,
 	radius float32,
@@ -590,7 +590,7 @@ func (zt *ZoneTerrain) CalcFit(oldX, oldY, oldZ, newX, newZ float32) CalcFitResu
 		toX := fromX + remX
 		toZ := fromZ + remZ
 
-		hnx, hny, hnz, t, hit := zt.sweepSphereVsWalls(
+		hnx, hny, hnz, t, hit := zt.SweepSphereVsWalls(
 			fromX, sphereY, fromZ,
 			toX, sphereY, toZ,
 			charRadius,
