@@ -94,7 +94,8 @@ type Client struct {
 	swimVelY  float32 // player-requested swim vertical velocity (Q/E/gamepad right stick)
 
 	// PS2 VIWalkControl swim state (ported from VIWalkControl::Move at 0x486778)
-	waterState terrain.WaterState // current water/swim state
+	waterState  terrain.WaterState // current water/swim state
+	breathTimer float32            // seconds of breath remaining (60 = full, 0 = drowning)
 
 	// Animation manager (combat, debug cycling, landing)
 	animMgr *AnimationManager

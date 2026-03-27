@@ -119,6 +119,7 @@ type Entity struct {
 	PoisonRAdd, DiseaseRAdd, FireRAdd, ColdRAdd, LightningRAdd, ArcaneRAdd int32 // additions only
 	XPPct           byte  // XP progress within current level (0-255)
 	XPRaw           int64 // raw total XP from server
+	Breath          byte  // PS2: +0x30 breath (0=full, 255=empty/drowning)
 	IsNPC           bool
 	IsPlayer  bool
 	NameColor byte // state channel offset 142: 0=NPC, 2=Player (indexes VICSprite::NameColors)
@@ -1163,7 +1164,7 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 	level, _ := reader.Read7BitEncodedInt64()         // PS2: +0x24
 	xp, _ := reader.Read7BitEncodedInt64()            // PS2: +0x28 XP in level
 	reader.Read7BitEncodedInt64()                     // PS2: +0x2C Debt
-	reader.ReadByte()                                 // PS2: +0x30 Breath (1 byte)
+	breath, _ := reader.ReadByte()                    // PS2: +0x30 Breath (0=full, 255=drowning)
 	tunar, _ := reader.Read7BitEncodedInt64()         // PS2: +0x34 Inventory tunar
 	gs.Tunar = tunar
 	reader.Read7BitEncodedInt64()                     // PS2: +0x38 Bank tunar
@@ -1221,6 +1222,7 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 		Sex:            SexFromModelID(playerModelID),
 		XPRaw:          xp,
 		XPPct:          xpLevelPct(int(level), xp),
+		Breath:         breath,
 		ServerTargetID: 0xFFFFFFFF, // no target initially
 		IsPlayer:       true,
 		HP: prevHP, MaxHP: prevMaxHP,

@@ -817,11 +817,14 @@ func (c *Client) drawWorld() {
 			c.debugFXIndex+1, len(c.debugFXIDs), uint32(dictID))
 		c.drawCenteredText(fxStr, 28, 16, rl.Color{R: 100, G: 255, B: 200, A: 255})
 	}
-	// Water state indicator
-	if c.waterState == terrain.WaterSurface {
-		c.drawText("SWIMMING", screenWidth-100, 10, 16, rl.Color{R: 100, G: 175, B: 255, A: 255})
-	} else if c.waterState == terrain.WaterUnder {
-		c.drawText("UNDERWATER", screenWidth-120, 10, 16, rl.Color{R: 50, G: 100, B: 200, A: 255})
+	// Underwater screen tint (PS2: blue-green overlay when submerged)
+	if c.waterState == terrain.WaterUnder {
+		rl.DrawRectangle(0, 0, screenWidth, screenHeight,
+			rl.Color{R: 10, G: 40, B: 80, A: 60})
+	} else if c.waterState == terrain.WaterSurface {
+		// Subtle ripple tint at water surface
+		rl.DrawRectangle(0, screenHeight-screenHeight/4, screenWidth, screenHeight/4,
+			rl.Color{R: 20, G: 60, B: 100, A: 30})
 	}
 
 	// Game clock (top-right, below water state)
@@ -886,6 +889,30 @@ func (c *Client) drawWorld() {
 		bubbleY := xpY + barH + barGap
 		pink := rl.Color{R: 255, G: 100, B: 180, A: 255}
 		c.drawTexturedBarTinted(barX, bubbleY, barW, barH, texBarXP, bubbleFrac, "", pink)
+	}
+
+	// Breath bar (only when underwater) — below XP/bubble bars
+	if c.waterState != terrain.WaterNone {
+		// Client-side breath tracking: 60 seconds underwater = empty.
+		// PS2 breath byte is 0=full, 255=empty. We count down locally.
+		if c.waterState == terrain.WaterUnder {
+			c.breathTimer -= dt
+			if c.breathTimer < 0 {
+				c.breathTimer = 0
+			}
+		} else {
+			// At surface: refill breath
+			c.breathTimer += dt * 3 // refill 3x faster than drain
+			if c.breathTimer > 60 {
+				c.breathTimer = 60
+			}
+		}
+		breathFrac := c.breathTimer / 60.0
+		breathY := xpY + barH*2 + barGap*2
+		cyan := rl.Color{R: 80, G: 180, B: 255, A: 255}
+		c.drawTexturedBarTinted(barX, breathY, barW, barH, texBarPower, breathFrac, "", cyan)
+	} else {
+		c.breathTimer = 60 // reset when out of water
 	}
 
 	// Group member HUD (below compass/player bars)
