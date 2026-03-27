@@ -827,14 +827,14 @@ func (c *Client) handleInWorldInput() {
 	// First person: character always faces camera direction (PS2 mode 0).
 	// Third person: character faces movement direction (PS2 ViewRelativeWalk).
 	if c.firstPerson {
-		// Camera angle IS the character facing in first person.
-		// Normalize to [0, 2*PI] — camAngle can drift outside.
-		facing := c.camAngle + math.Pi // camAngle=0 faces +Z, facing=0 faces -Z
-		for facing < 0 {
+		// PS2 mode 0: character faces camera look direction.
+		// Camera look = (-cosA, -sinA) in XZ plane.
+		// Facing = atan2(lookX, lookZ) = atan2(-cosA, -sinA).
+		cosA := float32(math.Cos(float64(c.camAngle)))
+		sinA := float32(math.Sin(float64(c.camAngle)))
+		facing := float32(math.Atan2(float64(-cosA), float64(-sinA)))
+		if facing < 0 {
 			facing += 2 * math.Pi
-		}
-		for facing >= 2*math.Pi {
-			facing -= 2 * math.Pi
 		}
 		p.Facing = facing
 	} else {
