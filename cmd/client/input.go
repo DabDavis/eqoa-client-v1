@@ -1192,6 +1192,7 @@ afterPhysics:
 // cycleCameraMode cycles through: tether → follow → first-person → tether.
 func (c *Client) cycleCameraMode() {
 	c.camMode = (c.camMode + 1) % 3
+	wasFP := c.firstPerson
 	switch c.camMode {
 	case 0:
 		// Tether: free zoom, restore saved distance.
@@ -1212,6 +1213,12 @@ func (c *Client) cycleCameraMode() {
 		c.camSavedDist = c.camFollowDist // save for return to tether
 		c.camDist = 0
 		log.Printf("Camera: first-person")
+	}
+	// Leaving first person: sync targetFacing to camera-derived facing
+	// so character doesn't snap back to old movement direction.
+	if wasFP && !c.firstPerson {
+		p := &c.engine.State.Player
+		c.targetFacing = p.Facing
 	}
 }
 
