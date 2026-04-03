@@ -42,6 +42,8 @@ const (
 	gmActionPlayerName = 4 // enter player name
 )
 
+func gmEnabled() bool { return true }
+
 // gmMenuEntry is a clickable row in the GM menu.
 type gmMenuEntry struct {
 	Label  string

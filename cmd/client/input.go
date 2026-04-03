@@ -96,8 +96,8 @@ func (c *Client) handleInWorldInput() {
 		return
 	}
 
-	// F11: toggle GM menu
-	if rl.IsKeyPressed(rl.KeyF11) {
+	// F11: toggle GM menu (dev builds only)
+	if gmEnabled() && rl.IsKeyPressed(rl.KeyF11) {
 		c.gmMenuOpen = !c.gmMenuOpen
 		c.gmInputMode = false
 		return
