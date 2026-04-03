@@ -14,7 +14,7 @@ BUILD_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
 BUILD_VERSION="$(date +%Y%m%d)-${BUILD_HASH}"
 # Changelog: last 5 commit subjects for update popup (newlines as \n for JSON)
 CHANGELOG="$(git log -5 --format='- %s' 2>/dev/null | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}' | sed 's/\\n$//' || echo '')"
-LDFLAGS="-X main.BuildVersion=${BUILD_VERSION}"
+LDFLAGS="-s -w -X main.BuildVersion=${BUILD_VERSION}"
 
 echo "=== Deploy v${BUILD_VERSION} ==="
 

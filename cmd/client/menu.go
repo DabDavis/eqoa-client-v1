@@ -2455,10 +2455,14 @@ func (c *Client) drawSettingsCamera(y, sliderX, sliderW int32) {
 	c.uiCheckbox(x, y, "Invert Pitch", &c.invertPitch)
 	y += 28
 
+	c.uiCheckbox(x, y, "Camera Collision", &c.camCollision)
+	y += 28
+
 	if c.uiButton(x, y, "Reset to Defaults", 13) {
 		c.camSensitivity = 1.0
 		c.camMaxDist = 8
 		c.invertPitch = false
+		c.camCollision = false
 		if c.camDist > c.camMaxDist {
 			c.camDist = c.camMaxDist
 		}
@@ -2469,6 +2473,7 @@ func (c *Client) drawSettingsCamera(y, sliderX, sliderW int32) {
 		cfg.MaxZoom = c.camMaxDist
 		cfg.CamSensitivity = c.camSensitivity
 		cfg.InvertPitch = c.invertPitch
+		cfg.CamCollision = c.camCollision
 		saveLoginConfig(cfg)
 	}
 }

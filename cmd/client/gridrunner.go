@@ -1,3 +1,5 @@
+//go:build dev
+
 package main
 
 import (
@@ -106,10 +108,10 @@ func grLandZRange(x float32) (minZ, maxZ float32, ok bool) {
 	return minZ, maxZ, true
 }
 
-// GridRunner automates serpentine traversal of the world, harvesting entity data.
+// gridRunnerState automates serpentine traversal of the world, harvesting entity data.
 // Activated from the GM menu. Uses the visual client's normal movement system —
 // the server sees legitimate walking/running with proper velocity and animation.
-type GridRunner struct {
+type gridRunnerState struct {
 	active    bool
 	db        *sql.DB
 	mu        sync.Mutex
@@ -157,10 +159,10 @@ func (c *Client) gridRunnerStart() {
 		log.Printf("GRID RUNNER: failed to open DB: %v", err)
 		return
 	}
-	initGridRunnerDB(db)
+	initgridRunnerStateDB(db)
 
 	// Grid bounds: X covers zone grid columns 0-11 (X=2000 to X=26000)
-	gr := &GridRunner{
+	gr := &gridRunnerState{
 		active:    true,
 		db:        db,
 		seen:      make(map[uint32]bool),
@@ -203,7 +205,7 @@ func (c *Client) gridRunnerStart() {
 
 // setupColumn configures the Z sweep range for the current column using the zone grid.
 // Skips columns that have no land zones.
-func (gr *GridRunner) setupColumn() {
+func (gr *gridRunnerState) setupColumn() {
 	for gr.col < gr.totalCols {
 		x := gr.minX + float32(gr.col)*gr.stepSize
 		gr.targetX = x
@@ -401,7 +403,7 @@ func (c *Client) gridRunnerStatus() string {
 	return fmt.Sprintf("GR: col %d/%d %s | %d NPCs", gr.col+1, gr.totalCols, dir, gr.npcCount)
 }
 
-func initGridRunnerDB(db *sql.DB) {
+func initgridRunnerStateDB(db *sql.DB) {
 	db.Exec(`CREATE TABLE IF NOT EXISTS npcs (
 		npc_id INTEGER PRIMARY KEY,
 		npc_name TEXT,
@@ -431,7 +433,7 @@ func initGridRunnerDB(db *sql.DB) {
 }
 
 // loadProgress loads completed columns and previously seen ObjectIDs from DB.
-func (gr *GridRunner) loadProgress() {
+func (gr *gridRunnerState) loadProgress() {
 	// Load completed columns
 	rows, err := gr.db.Query(`SELECT col_id FROM gr_progress`)
 	if err != nil {
@@ -477,6 +479,6 @@ func (gr *GridRunner) loadProgress() {
 }
 
 // saveColumnProgress marks a column as completed in the DB.
-func (gr *GridRunner) saveColumnProgress(col int) {
+func (gr *gridRunnerState) saveColumnProgress(col int) {
 	gr.db.Exec(`INSERT OR REPLACE INTO gr_progress (col_id, completed_at) VALUES (?, datetime('now'))`, col)
 }

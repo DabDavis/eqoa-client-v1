@@ -3,8 +3,6 @@ package main
 import (
 	"log"
 	"math"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -76,6 +74,7 @@ type Client struct {
 	firstPerson    bool    // true = first-person camera mode
 	camMode        int     // 0=tether, 1=follow, 2=first-person
 	invertPitch    bool    // invert controller pitch (stick up = look down)
+	camCollision   bool    // camera terrain/wall collision clamping
 	camCollDist    float32 // smoothed collision distance (fraction 0-1, prevents bouncing)
 	safeX, safeY, safeZ float32 // last known position outside walls
 	safeValid      bool         // true once first safe position is recorded
@@ -326,7 +325,7 @@ type Client struct {
 	gmNoClip       bool       // noclip fly mode (no collision, no gravity)
 	gmShowStats    bool       // PS2 "Toggle Stats" — FPS, entity count, network
 	gmExtrapolate  bool       // PS2 extrapolate/interpolate toggle (default: interpolate)
-	gridRunner     *GridRunner // grid runner autopilot (GM menu)
+	gridRunner     *gridRunnerState // grid runner autopilot (GM menu)
 	hideHelm       bool       // client-side helm visibility toggle
 	hideRobe       bool       // client-side robe visibility toggle
 
@@ -430,9 +429,6 @@ func main() {
 	// Reduce GC frequency — live heap has many pointers causing high GC CPU.
 	// GOGC=200: trigger at 2x live heap instead of default 1x.
 	debug.SetGCPercent(200)
-
-	// pprof for CPU profiling (http://localhost:6060/debug/pprof/)
-	go func() { _ = http.ListenAndServe("localhost:6060", nil) }()
 
 	// Resolve assets directory: CLI arg > config > ./assets (distro) > ../extracted-assets (dev)
 	assetsDir := ""
@@ -894,6 +890,9 @@ func main() {
 				}
 				if cfg.InvertPitch {
 					client.invertPitch = true
+				}
+				if cfg.CamCollision {
+					client.camCollision = true
 				}
 
 				// Audio

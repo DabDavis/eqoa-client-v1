@@ -205,11 +205,9 @@ func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.C
 		// PS2 uses VICollSphere (radius ~1.57) swept from player to camera,
 		// with fallback to FindOrbitAngle if too close. We ray-march with
 		// terrain + wall checks and use sweepSphereVsWalls for the full path.
-		// NOTE: Disabled for now — camera clips through terrain/walls freely.
 		const camClearance = float32(1.2)  // PS2 collisionRadius ≈ PI/2
 		const camSteps = 20                // dense sampling for indoor walls
-		const camCollisionEnabled = false
-		if camCollisionEnabled && c.terrainLoader != nil && c.camDist > 0.5 {
+		if c.camCollision && c.terrainLoader != nil && c.camDist > 0.5 {
 			zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
 			if zt != nil {
 				startX, startY, startZ := targX, targY, targZ

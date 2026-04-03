@@ -29,6 +29,7 @@ type loginConfig struct {
 	MaxZoom        float32 `json:"max_zoom,omitempty"`
 	CamSensitivity float32 `json:"cam_sensitivity,omitempty"`
 	InvertPitch    bool    `json:"invert_pitch,omitempty"`
+	CamCollision   bool    `json:"cam_collision,omitempty"`
 	MasterVolume float32 `json:"master_volume,omitempty"`
 	SFXVolume    float32 `json:"sfx_volume,omitempty"`
 	BGMVolume    float32 `json:"bgm_volume,omitempty"`
