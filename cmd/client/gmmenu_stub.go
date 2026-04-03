@@ -7,5 +7,5 @@ package main
 func (c *Client) drawGMMenu()       {}
 func (c *Client) drawGMDisplayPos() {}
 func (c *Client) drawGMStats()      {}
-func (c *Client) handleGMMenuInput() {}
+func (c *Client) handleGMMenuInput() { c.gmMenuOpen = false }
 func loadGMLocations()               {}
