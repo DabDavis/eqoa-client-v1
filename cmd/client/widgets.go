@@ -905,17 +905,33 @@ func (c *Client) uiMuteButton(x, y int32) {
 	rl.DrawRectangle(x, y, sz, sz, bg)
 
 	muted := c.masterVolume == 0
+	// Draw speaker icon with primitives (EQOA bitmap font lacks music glyphs).
+	// Speaker body (small rectangle) + cone (triangle).
+	cx, cy := float32(x)+float32(sz)/2, float32(y)+float32(sz)/2
+	var clr rl.Color
 	if muted {
-		c.drawText("\u266B", x+5, y+3, 16, rl.Color{R: 200, G: 80, B: 80, A: 255})
+		clr = rl.Color{R: 200, G: 80, B: 80, A: 255}
+	} else if hover {
+		clr = colorWhite
+	} else {
+		clr = colorDim
+	}
+	// Speaker body
+	rl.DrawRectangle(int32(cx)-5, int32(cy)-3, 4, 6, clr)
+	// Cone
+	rl.DrawTriangle(
+		rl.Vector2{X: cx - 1, Y: cy - 6},
+		rl.Vector2{X: cx - 1, Y: cy + 6},
+		rl.Vector2{X: cx + 5, Y: cy},
+		clr)
+	if muted {
 		// X overlay
 		rl.DrawLine(x+4, y+4, x+sz-4, y+sz-4, rl.Color{R: 255, G: 60, B: 60, A: 200})
 		rl.DrawLine(x+4, y+sz-4, x+sz-4, y+4, rl.Color{R: 255, G: 60, B: 60, A: 200})
 	} else {
-		clr := colorDim
-		if hover {
-			clr = colorWhite
-		}
-		c.drawText("\u266B", x+5, y+3, 16, clr)
+		// Sound waves (two small arcs via lines)
+		rl.DrawLine(int32(cx)+6, int32(cy)-3, int32(cx)+8, int32(cy)-5, clr)
+		rl.DrawLine(int32(cx)+6, int32(cy)+3, int32(cx)+8, int32(cy)+5, clr)
 	}
 
 	if hover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {

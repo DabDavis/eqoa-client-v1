@@ -276,6 +276,13 @@ func authGet(httpClient *http.Client, url string) (*http.Response, error) {
 func checkForUpdate(state *updateState, assetsDir string) {
 	defer func() { state.done = true }()
 
+	// Dev builds skip auto-updater for rapid iteration.
+	if gmEnabled() {
+		log.Println("Dev build — skipping auto-update check")
+		state.status = "Dev build"
+		return
+	}
+
 	// Fetch manifest
 	client := &http.Client{Timeout: updateTimeout}
 	resp, err := authGet(client, manifestURL)
