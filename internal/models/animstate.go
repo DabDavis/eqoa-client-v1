@@ -1,5 +1,7 @@
 package models
 
+import "time"
+
 // AnimState tracks per-entity animation playback using PS2-accurate frame
 // position tracking (VIHSprite::ProcessPlayList port).
 //
@@ -50,6 +52,25 @@ type AnimState struct {
 	Controller *SpriteAnimController
 
 	playOnceDone bool // one-shot flag to log play-once completion once
+	LoggedWalk   bool // diagnostic: true after first non-idle anim logged
+
+	// PS2 HSprite trigger system: "Spell FX 1-4" keyframe triggers.
+	// Indexed by trigger slot (0-3). Tripped when animation frame crosses
+	// the keyframe Time for that trigger's RefID.
+	SpellFXTripped [4]bool
+
+	// Sound trigger system: "Primary Sound"/"Secondary Sound" keyframe triggers.
+	// PS2 resets these on animation change (SetAnimation success path).
+	// Tripped when frame crosses the keyframe, consumed by entity sound system.
+	SoundTripped [2]bool // [0]=primary, [1]=secondary
+
+	// Weapon trail state (PS2 VICSprite+0x11C0..+0x11D3).
+	// Set by SetWeaponTrail during PlayAttack, rendered by ProcessWeaponTrails.
+	TrailActive bool
+	TrailID     int32
+	TrailColor  [3]float32
+	TrailStart  time.Time  // when trail was activated (auto-expire after duration)
+	TrailPoints [][3]float32 // ring buffer of weapon tip world positions (last N frames)
 }
 
 // animStateMap stores per-entity animation states, keyed by a unique entity identifier.

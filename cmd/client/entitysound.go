@@ -1,17 +1,12 @@
 package main
 
-import (
-	"github.com/eqoa/client/internal/models"
-)
+import ()
 
 // entitySoundState tracks per-entity sound playback for keyframe triggers
 // and continuous ambient sounds.
 // Frame position tracking is now handled by the animation system (AnimState.FramePos)
 // — this eliminates duplicate frame tracking between animation and sound.
 type entitySoundState struct {
-	lastAnimByte byte  // previous animation byte (detect transitions)
-	lastSlot     int   // last CPlayList slot (for sound lookup)
-	prevFrame    float32 // previous frame position snapshot (for crossing detection on first frame after transition)
 	// Continuous/ambient sound (PS2 0x2940 ContSound)
 	contSoundActive bool  // true if continuous sound is playing for this entity
 	contSoundID     int32 // DictID of the active continuous sound
@@ -68,96 +63,38 @@ func (c *Client) updateEntitySounds(dt float32) {
 }
 
 // processEntitySound handles PS2-accurate sound triggering for a single entity.
-// Reads frame position from the animation system's AnimState (set by applySkeletal).
-// PS2 ProcessPlayTiming (0x00449850): detects keyframe crossings.
-// PS2 CSprite::Process (0x00423ED8): matches RefID → sound DictID.
+// PS2 ProcessPlayTiming (0x00449850) detects keyframe crossings in applySkeletal
+// and sets SoundTripped[ch] flags. We consume those flags here to play sounds.
+// PS2 CSprite::Process (0x00423ED8) matches trigger RefID → sound DictID per slot.
 func (c *Client) processEntitySound(objectID uint32, modelID int32, animByte byte,
 	x, y, z float32) {
 
 	model, ok := c.modelMgr.GetCachedModel(modelID)
-	if !ok || model == nil {
-		return
-	}
-
-	// Need both keyframe data and sound config
-	if model.AnimKeyframes == nil || model.PLSlotSound == nil {
-		return
-	}
-
-	state := c.getEntitySoundState(objectID)
-	pos := [3]float32{x, y, z}
-
-	// Resolve CPlayList slot → raw animation index
-	slot := int(animByte)
-	rawIdx := -1
-	if model.PLSlotToRawPair != nil {
-		if pair, ok := model.PLSlotToRawPair[slot]; ok {
-			rawIdx = pair[0]
-		}
-	} else if model.PLSlotToRaw != nil {
-		if idx, ok := model.PLSlotToRaw[slot]; ok {
-			rawIdx = idx
-		}
-	}
-
-	// Animation changed — reset and skip this frame (PS2: SetAnimation resets triggers)
-	if animByte != state.lastAnimByte || slot != state.lastSlot {
-		state.lastAnimByte = animByte
-		state.lastSlot = slot
-		state.prevFrame = 0
-		return // don't fire on the transition frame
-	}
-
-	if rawIdx < 0 {
-		return
-	}
-
-	// Get keyframes for this animation
-	keyframes := model.AnimKeyframes[rawIdx]
-	if len(keyframes) == 0 {
+	if !ok || model == nil || model.PLSlotSound == nil {
 		return
 	}
 
 	// Get sound config for current CPlayList slot
+	slot := int(animByte)
 	slotSound, hasSound := model.PLSlotSound[slot]
 	if !hasSound {
 		return
 	}
 
-	// Read frame position from animation system (set by applySkeletal in ProcessPlayList port)
+	// Consume SoundTripped flags set by applySkeletal's keyframe crossing detection.
+	// PS2: ProcessPlayTiming fires triggers → CSprite::Process plays sounds.
 	as := c.modelMgr.GetAnimState(objectID)
-	if as == nil || as.NumFrames <= 0 {
+	if as == nil {
 		return
 	}
 
-	framePos := as.FramePos
-	prevFrame := as.PrevFrame
-
-	// Check loop/play-once
-	isLoop := !as.IsPlayOnce
-
-	// PS2 ProcessPlayTiming: check if any keyframe was crossed
-	for _, kf := range keyframes {
-		kfFrame := kf.Time // frame position (not seconds)
-		if kfFrame < 0 {
+	pos := [3]float32{x, y, z}
+	for ch := 0; ch < 2; ch++ {
+		if !as.SoundTripped[ch] {
 			continue
 		}
+		as.SoundTripped[ch] = false // consume
 
-		crossed := false
-		if prevFrame < framePos {
-			// Normal forward
-			crossed = kfFrame > prevFrame && kfFrame <= framePos
-		} else if isLoop {
-			// Wrapped: check both sides
-			crossed = kfFrame > prevFrame || kfFrame <= framePos
-		}
-
-		if !crossed {
-			continue
-		}
-
-		// PS2 CSprite::Process: match trigger RefID → sound channel
-		ch := models.SoundChannel(kf.RefID)
 		dictID := slotSound.SoundDictID[ch]
 		if dictID == 0 {
 			continue

@@ -1,9 +1,9 @@
 {
-  "version": "20260326-baf2540",
+  "version": "20260403-2e06bd2",
   
   "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "8977887f986c492161b22f6bf27977d690f7e9954d32628c83859bcd17a95f54",
+  "linux_sha256": "9033376b69f2a7296df96be42cfadec5b3be4e4da26d24b90d7872f2a4e64ff8",
   "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "e6613c17bc1af1c3ea88e2b8576f80e99b836157b112911e2e720f26271947ab",
-  "changelog": "- Convert Who List and LFG panels to widget system\n- Replace all 5 inline sub-tab drawings with uiTabBar widget\n- Updater: convert to widget system\n- Login screen: convert to widget system\n- Fix tooltip stat dancing: sort map keys for stable order"
+  "windows_sha256": "0073192aa57b978e3fbb3eec723a58c677135a132f2314c6f4a98b49bef2976b",
+  "changelog": "- Gate F11 GM menu behind gmEnabled() — no-op in stable builds\n- Fix F11 freeze in stable build: stub closes GM menu immediately\n- Split dev/stable builds: GM tools, pprof, gridrunner behind build tag\n- Disable camera terrain/wall collision clamping\n- Fix rain speed, suppress weather indoors, increase weather range"
 }

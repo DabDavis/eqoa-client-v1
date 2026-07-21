@@ -231,26 +231,26 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 					}
 				}
 			}
-			// Build per-animation keyframe trigger map (only sound triggers).
+			// Build per-animation keyframe trigger map (sound + spell FX triggers).
 			// Store raw frame positions — PS2 ProcessPlayTiming compares frame positions directly.
 			for rawIdx, anim := range cs.Animations {
 				if anim == nil || len(anim.Keyframes) == 0 {
 					continue
 				}
-				var soundKFs []AnimSoundKeyframe
+				var kfs []AnimSoundKeyframe
 				for _, kf := range anim.Keyframes {
-					if IsSoundTrigger(kf.RefID) {
-						soundKFs = append(soundKFs, AnimSoundKeyframe{
+					if IsSoundTrigger(kf.RefID) || IsSpellFXTrigger(kf.RefID) {
+						kfs = append(kfs, AnimSoundKeyframe{
 							Time:  kf.Time, // raw frame position (PS2 ProcessPlayTiming)
 							RefID: kf.RefID,
 						})
 					}
 				}
-				if len(soundKFs) > 0 {
+				if len(kfs) > 0 {
 					if model.AnimKeyframes == nil {
 						model.AnimKeyframes = make(map[int][]AnimSoundKeyframe, len(cs.Animations))
 					}
-					model.AnimKeyframes[rawIdx] = soundKFs
+					model.AnimKeyframes[rawIdx] = kfs
 				}
 			}
 			if !model.IsHumanoid {
@@ -450,47 +450,25 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 	// Extract bone positions from the skeleton hierarchy.
 	// The hierarchy stores absolute bind-pose positions in model space.
 	// We apply the same XZ centering and Y-bottom=0 adjustment as the mesh.
-	// Humanoid detection: TSlotList (equipment slots) OR paired animation layout.
-	// Player races have TSlotList. NPC humanoids (skeletons, undead, etc.) lack
-	// TSlotList but share the paired animation structure (61 pairs = 122 anims).
-	// Non-humanoid monsters typically have <=24 single animations.
-	// Threshold 40 catches all paired-anim NPC humanoids without false positives.
+	// Humanoid detection: PS2 uses SkelType from ESF CSprite header (VICSprite+0x194).
+	// SkelType 1 = dual-pair humanoid (upper/lower body split animation).
+	// SkelType 0/2/3 = single-body animation (creatures, quadrupeds, flying).
 	hasTSlotList := len(tslotMap) > 0
-	// Check if CPlayList has humanoid-style combat slots (>=22) with paired anims.
-	// Models like wererat have <40 anims but use humanoid combat slots (22,23,30,etc.).
-	hasPairedCombatSlots := false
-	if cs, ok := obj.(*esf.CSprite); ok {
-		for _, pl := range cs.PlayList {
-			if pl.Index >= 22 && pl.AnimDictID[0] != 0 && pl.AnimDictID[1] != 0 {
-				hasPairedCombatSlots = true
-				break
-			}
-		}
-	}
-	isHumanoid := hasTSlotList || len(model.Animations) >= 40 || hasPairedCombatSlots
+	isHumanoid := model.SkelType == 1
 	model.IsHumanoid = isHumanoid
 	model.HasTSlotList = hasTSlotList
-	// Assign AnimProfile based on anim count and CPlayList structure:
-	//   TSlotList + >=60 anims    → humanoidProfile (player race models — 80 anims)
-	//   TSlotList + <60 anims     → humanoid40Profile (gnolls, etc. — 40 anims with equipment)
-	//   >=60 anims, no TSlotList  → npcHumanoidProfile (skeletons, undead — 72 anims)
-	//   >=40 anims or paired combat slots → humanoid40Profile
-	//   >=14 anims                → nonHumanoidLargeProfile (larger creatures — 18 anims)
-	//   <14 anims                 → nonHumanoidSmallProfile (small creatures — 13 anims)
+	// Assign AnimProfile based on SkelType and anim count:
+	//   SkelType 1 + >=60 anims  → humanoidProfile (player races — 72-80 anims)
+	//   SkelType 1 + <60 anims   → humanoidArmedProfile (gnolls, etc. — 24-40 anims with equipment)
+	//   SkelType 0/2/3           → nonHumanoidProfile (creatures — 4-18 anims, single body)
 	nAnims := len(model.Animations)
 	switch {
-	case hasTSlotList && nAnims >= 60:
+	case isHumanoid && nAnims >= 60:
 		model.AnimProfile = humanoidProfile
-	case hasTSlotList:
-		model.AnimProfile = humanoid40Profile
-	case nAnims >= 60:
-		model.AnimProfile = npcHumanoidProfile
-	case nAnims >= 40 || hasPairedCombatSlots:
-		model.AnimProfile = humanoid40Profile
-	case nAnims >= 14:
-		model.AnimProfile = nonHumanoidLargeProfile
+	case isHumanoid:
+		model.AnimProfile = humanoidArmedProfile
 	default:
-		model.AnimProfile = nonHumanoidSmallProfile
+		model.AnimProfile = nonHumanoidProfile
 	}
 	// Per-model override as final fallback for edge cases.
 	if override, ok := profileOverrides[modelID]; ok {

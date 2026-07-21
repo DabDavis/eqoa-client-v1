@@ -1695,23 +1695,27 @@ func (c *Connection) Metrics() ConnectionMetrics {
 	return c.metrics
 }
 
-// updateRTT updates the retransmit timeout using PS2's 16-sample min-RTT algorithm (#25).
-// PS2: 16-sample circular buffer (uint16_t[16] at conn+0x1128), index at 0x1122 (& 0x0F),
-// minimum at 0x1124. RTO = 2 * minRTT (clamped to 200ms..10s).
+// updateRTT updates the retransmit timeout using PS2's 16-sample max-RTT algorithm.
+// PS2 connection_add_rtt_sample: circular buffer uint16[16] at conn+0x1126,
+// index at conn+0x1122 (& 0x0F). Computes MAXIMUM across all 16 samples (conn+0x1124).
+// PS2 uses max RTT for conservative RTO — avoids premature retransmits under jitter.
+// RTO = 2 * maxRTT (clamped to 200ms..10s).
 func (c *Connection) updateRTT(rtt time.Duration) {
 	c.rttSamples[c.rttSampleIdx&0x0F] = rtt
 	c.rttSampleIdx++
 
-	// Find minimum non-zero sample
-	minRTT := time.Duration(0)
+	// PS2: find MAXIMUM across all 16 samples (conservative retransmit).
+	// connection_add_rtt_sample seeds from history[0], then for each entry:
+	//   if (entry < current) keep current; else use entry → accumulates max.
+	maxRTT := time.Duration(0)
 	for _, s := range c.rttSamples {
-		if s > 0 && (minRTT == 0 || s < minRTT) {
-			minRTT = s
+		if s > maxRTT {
+			maxRTT = s
 		}
 	}
 
-	if minRTT > 0 {
-		c.rto = minRTT * 2
+	if maxRTT > 0 {
+		c.rto = maxRTT * 2
 	}
 	if c.rto < 200*time.Millisecond {
 		c.rto = 200 * time.Millisecond

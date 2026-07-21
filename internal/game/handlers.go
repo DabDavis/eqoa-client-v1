@@ -1,8 +1,18 @@
 package game
 
 // handlers.go — Server→Client opcode handlers for all opcodes identified from
-// PS2 CLIENT.AUT decompilation. Covers entity lifecycle, quest system, world
-// entry/zone transfer, NPC interaction, item streaming, chat, and social.
+// PS2 CLIENT.AUT decompilation (VIClient.cpp mega-function at 0x00BD0DC8).
+// Covers entity lifecycle, quest system, world entry/zone transfer, NPC
+// interaction, item streaming, chat, guild, and social.
+//
+// PS2 Disconnect Error Codes (from debug printf strings in CLIENT data section):
+//   Disconnect-5:  Malformed entity/group data (opcodes 0x0012, 0x07A2)
+//   Disconnect-6:  Bad stats update (opcode 0x0790)
+//   Disconnect-7:  Invalid admin/world data (opcode 0x0700)
+//   Disconnect-8:  Buddy list corruption (opcode 0x0771)
+//   Disconnect-9:  Auction system error (opcode 0x07E2)
+//   Disconnect-12: Combat state corruption (opcode 0x0777)
+//   Disconnect-??: Unknown/catch-all
 
 import (
 	"encoding/binary"
@@ -14,6 +24,24 @@ import (
 	"github.com/eqoa/client/internal/protocol"
 	"github.com/DabDavis/eqoa-esf-tools/pkg/buffer"
 )
+
+// PS2 disconnect error codes from CLIENT debug strings.
+// Logged when opcode handlers receive malformed data.
+var ps2DisconnectCodes = map[uint16]int{
+	0x0012: 5,  // GroupInvite
+	0x0700: 7,  // AdminCode
+	0x0771: 8,  // BuddyListStuff
+	0x0777: 12, // CombatEnd
+	0x0790: 6,  // StatsUpdate
+	0x07A2: 5,  // EntityStringUpdate
+	0x07E2: 9,  // Auction
+}
+
+func logPS2DisconnectCode(opcode uint16) {
+	if code, ok := ps2DisconnectCodes[opcode]; ok {
+		log.Printf("WARNING: malformed data for opcode 0x%04X (PS2 Disconnect-%d)", opcode, code)
+	}
+}
 
 // =============================================================================
 // Entity Lifecycle (0x00B3/B5/B8/FC/FD/FF)
@@ -695,47 +723,112 @@ func (gs *GameState) handleGuildWorldEntry(msg *protocol.Message) {
 
 // handleServerAssignment handles opcode 0x0790 — server/world assignment.
 // PS2: name + flags + zone → state 19.
-func (gs *GameState) handleServerAssignment(msg *protocol.Message) {
+// handleStatsUpdate handles opcode 0x0790 — XP/stats update.
+// PS2: reads int64+int32+int64 into entity+0x4F0F0..+0x4F107, sets sentinel -1,
+// then calls UI refresh. Likely current XP, level/stat, max XP.
+func (gs *GameState) handleStatsUpdate(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 4 {
+	payload := data[2:] // skip opcode
+	if len(payload) < 20 {
+		logPS2DisconnectCode(0x0790)
+		log.Printf("StatsUpdate: too short (%d bytes)", len(payload))
 		return
 	}
-	log.Printf("ServerAssignment: dataLen=%d", len(data))
-	// Try to read server name
-	reader := buffer.NewReader(data[2:])
-	if reader.Remaining() >= 4 {
-		nameLen, _ := reader.ReadInt32()
-		if nameLen > 0 && nameLen <= 256 && reader.Remaining() >= int(nameLen) {
-			nameBytes, _ := reader.ReadBytes(int(nameLen))
-			log.Printf("ServerAssignment: server=%q", string(nameBytes))
-		}
-	}
+	val1 := binary.LittleEndian.Uint64(payload[0:8])
+	val2 := binary.LittleEndian.Uint32(payload[8:12])
+	val3 := binary.LittleEndian.Uint64(payload[12:20])
+	log.Printf("StatsUpdate: val1=%d val2=%d val3=%d", val1, val2, val3)
+	// Store for UI (XP bar, level display)
+	gs.Player.Experience = int64(val1)
+	gs.Player.ExperienceMax = int64(val3)
 }
 
-// handleZoneTransferInit handles opcode 0x07B0 — zone transfer + loading state.
+// handleZoneTransferInit handles opcode 0x07B0 — zone transfer init/loading.
+// PS2 FUN_00BE71B0: reads 1-byte sub-type, dispatches to state machine:
+//   0=init (guard state==3), 1=ready (guard state==5),
+//   2=zone data (guard state==1), 3=zone resource (guard state==2),
+//   4=complete (guard state==4), 5=abort, 6=extra handler
 func (gs *GameState) handleZoneTransferInit(msg *protocol.Message) {
 	data := msg.Data()
-	log.Printf("ZoneTransferInit: dataLen=%d — entering loading state", len(data))
-	gs.ZoneTransferActive = true
+	payload := data[2:] // skip opcode
+	if len(payload) < 1 {
+		return
+	}
+	subType := payload[0]
+	rest := payload[1:]
 
-	if len(data) > 2 {
-		reader := buffer.NewReader(data[2:])
-		// Try to read zone path
-		if reader.Remaining() >= 4 {
-			text, err := readStringFromReader(reader)
-			if err == nil && text != "" {
-				gs.ZoneTransferZone = text
-				gs.ZonePath = text
-				log.Printf("ZoneTransferInit: zone=%q", text)
+	switch subType {
+	case 0: // Init — server initiates zone transfer
+		log.Printf("ZoneTransfer: sub=0 INIT (dataLen=%d)", len(rest))
+		gs.ZoneTransferActive = true
+		gs.ZoneTransferState = 3 // ready for next phase
+		if len(rest) >= 1 {
+			result := rest[0]
+			log.Printf("ZoneTransfer: init result=%d", result)
+			// PS2 stores pending zone index at entity+0x4F0E8 for the
+			// zone about to be loaded. The result byte indicates the target zone.
+			gs.PendingZoneIdx = int(result)
+		}
+
+	case 1: // Ready — server confirms zone is available
+		log.Printf("ZoneTransfer: sub=1 READY (dataLen=%d)", len(rest))
+		if len(rest) >= 1 {
+			result := rest[0]
+			log.Printf("ZoneTransfer: ready result=%d", result)
+			if result == 0 {
+				gs.ZoneTransferState = 0 // success → start loading
 			}
 		}
+
+	case 2: // Zone data — server sends zone proxy list
+		log.Printf("ZoneTransfer: sub=2 ZONE_DATA (dataLen=%d)", len(rest))
+		if len(rest) >= 5 { // 1 result + 4 count
+			result := rest[0]
+			count := int(binary.LittleEndian.Uint32(rest[1:5]))
+			log.Printf("ZoneTransfer: zone data result=%d count=%d", result, count)
+			// Each entry is 24 bytes (zone proxy data)
+			if count > 0 && count <= 100 {
+				gs.ZoneTransferProxyCount = count
+			}
+		}
+
+	case 3: // Zone resource — server sends zone ESF data blob
+		log.Printf("ZoneTransfer: sub=3 ZONE_RESOURCE (dataLen=%d)", len(rest))
+		if len(rest) >= 1 {
+			result := rest[0]
+			log.Printf("ZoneTransfer: resource result=%d blobLen=%d", result, len(rest)-1)
+			// PS2 reads blob(0x4000) into zone resource buffer
+			// The blob contains ESF zone data for streaming
+		}
+
+	case 4: // Complete — zone transfer finalized
+		log.Printf("ZoneTransfer: sub=4 COMPLETE (dataLen=%d)", len(rest))
+		gs.ZoneTransferActive = false
+		gs.ZoneTransferState = 0
+		// PS2 reads 1 byte result + zigzag varint, then calls finalize
+		if len(rest) >= 1 {
+			result := rest[0]
+			log.Printf("ZoneTransfer: complete result=%d", result)
+		}
+
+	case 5: // Abort — cancel zone transfer
+		log.Printf("ZoneTransfer: sub=5 ABORT")
+		gs.ZoneTransferActive = false
+		gs.ZoneTransferState = 0
+
+	case 6: // Extra handler
+		log.Printf("ZoneTransfer: sub=6 EXTRA (dataLen=%d)", len(rest))
+
+	default:
+		log.Printf("ZoneTransfer: unknown sub-type %d (dataLen=%d)", subType, len(rest))
 	}
 }
 
 // handleZoneTransferConfirm handles opcode 0x07B2 — zone transfer complete.
+// PS2: same handler as 0x07B0 (FUN_00BE71B0) — shared sub-type dispatch.
 func (gs *GameState) handleZoneTransferConfirm(msg *protocol.Message) {
-	log.Printf("ZoneTransferConfirm: zone transfer complete")
-	gs.ZoneTransferActive = false
+	// Route through the same sub-type dispatcher
+	gs.handleZoneTransferInit(msg)
 }
 
 // parseWorldEntryAppearance tries to parse appearance/equipment from world entry data.
@@ -1366,12 +1459,236 @@ func (gs *GameState) handleGuildInviteStuff(msg *protocol.Message) {
 }
 
 // handleBuddyInvite handles opcode 0x076F — buddy invite received.
-func (gs *GameState) handleBuddyInvite(msg *protocol.Message) {
+// handleBuffNotification handles opcode 0x076F — buff/debuff applied.
+// PS2: reads buffID(int32) + buffName(24-byte string), shows notification,
+// sends acknowledgment opcode 0x0368 back to server.
+func (gs *GameState) handleBuffNotification(msg *protocol.Message) {
 	data := msg.Data()
-	log.Printf("BuddyInvite: dataLen=%d", len(data))
-	strs := extractUTF16Strings(data)
-	if len(strs) > 0 {
-		gs.addChatMessage(fmt.Sprintf("Buddy request from %s", strs[0]), ChatSystem)
+	payload := data[2:] // skip opcode
+	if len(payload) < 4 {
+		return
+	}
+	buffID := binary.LittleEndian.Uint32(payload[0:4])
+	buffName := ""
+	if len(payload) >= 28 {
+		// 24-byte null-terminated string
+		nameBytes := payload[4:28]
+		for i, b := range nameBytes {
+			if b == 0 {
+				buffName = string(nameBytes[:i])
+				break
+			}
+		}
+		if buffName == "" {
+			buffName = string(nameBytes)
+		}
+	}
+	log.Printf("BuffNotification: id=%d name=%q", buffID, buffName)
+	if buffName != "" {
+		gs.addChatMessage(fmt.Sprintf("Buff: %s", buffName), ChatSystem)
+	}
+	// PS2 sends acknowledgment opcode 0x0368 back to server.
+	// Build and queue the ack: opcode(2) + buffID(4) + flag(1) + fragment
+	if gs.Conn != nil {
+		ackData := make([]byte, 5)
+		binary.LittleEndian.PutUint32(ackData[0:4], buffID)
+		ackData[4] = 1 // ack flag
+		gs.Conn.QueueReliable(0x0368, ackData)
+		log.Printf("BuffNotification: sent ack 0x0368 for buff %d", buffID)
+	}
+}
+
+// handleCombatEnd handles opcode 0x0777 — combat end / target clear.
+// PS2: no data payload. Resets combat target to -1, clears connection state,
+// transitions entity to idle mode. Server sends this when target dies,
+// goes out of range, or combat is explicitly stopped.
+func (gs *GameState) handleCombatEnd(msg *protocol.Message) {
+	log.Printf("CombatEnd: server cleared combat state")
+	gs.Player.AttackCount = 0
+	gs.PlayerInCombat = false
+	gs.CombatEnded = true // consumed by animation manager to clear combat state
+}
+
+// handleNPCInteractResult handles opcodes 0x0729 / 0x0773 — NPC interaction result.
+// PS2: reads entityID(uint32) + actionType(uint32) + nameString(24 bytes).
+// Server confirms which NPC was interacted with and the result type.
+func (gs *GameState) handleNPCInteractResult(msg *protocol.Message) {
+	data := msg.Data()
+	payload := data[2:] // skip opcode
+	if len(payload) < 8 {
+		return
+	}
+	entityID := binary.LittleEndian.Uint32(payload[0:4])
+	actionType := binary.LittleEndian.Uint32(payload[4:8])
+	name := ""
+	if len(payload) >= 32 {
+		nameBytes := payload[8:32]
+		for i, b := range nameBytes {
+			if b == 0 {
+				name = string(nameBytes[:i])
+				break
+			}
+		}
+	}
+	log.Printf("NPCInteractResult: entity=0x%08X action=%d name=%q", entityID, actionType, name)
+
+	// PS2: calls SetAction on the NPC actor to play interaction animation
+	// (turn to face player, gesture, etc). actionType maps to a CPlayList slot.
+	if gs.SpellFXSys != nil && gs.SpellFXSys.OnSetAction != nil && entityID != 0 {
+		gs.SpellFXSys.OnSetAction(entityID, int32(actionType))
+	}
+}
+
+// handleColoredChat — see state.go for existing implementation of 0x0A7A / 0x0A7B.
+
+// handleQuestUpdate handles PS2 quest sub-types (0x80-0x89) from opcode 0x1206.
+// PS2 FUN_00BB9D90: reads 1-byte sub-type, dispatches to quest lifecycle handlers.
+//
+// Quest context struct (entity+0x7770 area):
+//   Quest journal: collection at entity+0x1DDC*4, 800 bytes per entry
+//   Quest tracking: collection at entity+0x1DE2*4, 32 bytes per entry
+//   Quest data: entity+0x78BC (questID), +0x78C0 (quest list), +0x78C8 (state)
+func (gs *GameState) handleQuestUpdate(payload []byte) {
+	if len(payload) < 1 {
+		return
+	}
+	subType := payload[0]
+	rest := payload[1:]
+
+	switch subType {
+	case 0x80:
+		// Clear quest journal — reset all quest state
+		log.Printf("QuestUpdate: sub=0x80 CLEAR_JOURNAL")
+		gs.QuestJournal = nil
+
+	case 0x81:
+		// Quest update — reads zigzag(questID) + quest data fields
+		// PS2: reads zigzag, then checks if questID matches current,
+		// reads additional zigzag+blob fields for quest state
+		log.Printf("QuestUpdate: sub=0x81 QUEST_UPDATE (dataLen=%d)", len(rest))
+		if len(rest) > 0 {
+			reader := buffer.NewReader(rest)
+			questID, _ := reader.Read7BitEncodedInt64()
+			log.Printf("QuestUpdate: questID=%d", questID)
+			// Additional fields: zigzag(phase) + blob(objectives) + blob(rewards)
+			// Store for quest journal display
+			gs.updateQuestEntry(questID, reader)
+		}
+
+	case 0x82:
+		// Add quest to journal — reads full quest blob data
+		// PS2: blob_read → adds to journal collection at entity+0x1DDC
+		log.Printf("QuestUpdate: sub=0x82 QUEST_ADD (dataLen=%d)", len(rest))
+		if len(rest) > 0 {
+			reader := buffer.NewReader(rest)
+			gs.addQuestFromBlob(reader)
+		}
+
+	case 0x83:
+		// Remove quest from journal — reads zigzag(questID), removes from collection
+		// PS2: zigzag → search journal by ID → remove entry
+		log.Printf("QuestUpdate: sub=0x83 QUEST_REMOVE (dataLen=%d)", len(rest))
+		if len(rest) > 0 {
+			reader := buffer.NewReader(rest)
+			questID, _ := reader.Read7BitEncodedInt64()
+			log.Printf("QuestUpdate: removing questID=%d", questID)
+			gs.removeQuest(questID)
+		}
+
+	case 0x84:
+		// Add quest tracking entry — reads tracking data blob
+		// PS2: blob → adds to tracking collection at entity+0x1DE2
+		log.Printf("QuestUpdate: sub=0x84 TRACKING_ADD (dataLen=%d)", len(rest))
+
+	case 0x85:
+		// Remove quest tracking — reads zigzag(trackingID), removes
+		// PS2: zigzag → search tracking by ID → remove
+		log.Printf("QuestUpdate: sub=0x85 TRACKING_REMOVE (dataLen=%d)", len(rest))
+
+	case 0x86:
+		// Update quest tracking entry — reads tracking data, updates existing
+		log.Printf("QuestUpdate: sub=0x86 TRACKING_UPDATE (dataLen=%d)", len(rest))
+
+	case 0x87:
+		// Quest journal refresh — reads zigzag(questID) + full quest list
+		// PS2: zigzag(ID) + blob_read(list) → qsort by quest field at offset 0x2C
+		log.Printf("QuestUpdate: sub=0x87 JOURNAL_REFRESH (dataLen=%d)", len(rest))
+		if len(rest) > 0 {
+			reader := buffer.NewReader(rest)
+			questID, _ := reader.Read7BitEncodedInt64()
+			log.Printf("QuestUpdate: refresh questID=%d", questID)
+		}
+
+	case 0x88:
+		// Quest page update — reads zigzag(questID), sets page state
+		// PS2: zigzag(ID), sets entity+0x78C8=0, entity+0x78B8=1
+		log.Printf("QuestUpdate: sub=0x88 PAGE_UPDATE (dataLen=%d)", len(rest))
+		if len(rest) > 0 {
+			reader := buffer.NewReader(rest)
+			questID, _ := reader.Read7BitEncodedInt64()
+			log.Printf("QuestUpdate: page questID=%d", questID)
+		}
+
+	case 0x89:
+		// Quest completion notification
+		log.Printf("QuestUpdate: sub=0x89 QUEST_COMPLETE (dataLen=%d)", len(rest))
+		gs.addChatMessage("Quest objective updated!", ChatSystem)
+
+	default:
+		log.Printf("QuestUpdate: unknown sub-type 0x%02X (dataLen=%d)", subType, len(rest))
+	}
+}
+
+// Quest journal entry
+type QuestJournalEntry struct {
+	QuestID int64
+	Name    string
+	Phase   int
+	Data    []byte // raw quest data blob
+}
+
+func (gs *GameState) updateQuestEntry(questID int64, reader *buffer.Reader) {
+	// Find or create entry
+	for i := range gs.QuestJournal {
+		if gs.QuestJournal[i].QuestID == questID {
+			// Update existing — read remaining data
+			if reader.Remaining() > 0 {
+				data, _ := reader.ReadBytes(reader.Remaining())
+				gs.QuestJournal[i].Data = data
+			}
+			log.Printf("QuestUpdate: updated quest %d", questID)
+			return
+		}
+	}
+	// New entry
+	var data []byte
+	if reader.Remaining() > 0 {
+		data, _ = reader.ReadBytes(reader.Remaining())
+	}
+	gs.QuestJournal = append(gs.QuestJournal, QuestJournalEntry{
+		QuestID: questID,
+		Data:    data,
+	})
+	log.Printf("QuestUpdate: added quest %d", questID)
+}
+
+func (gs *GameState) addQuestFromBlob(reader *buffer.Reader) {
+	if reader.Remaining() < 4 {
+		return
+	}
+	data, _ := reader.ReadBytes(reader.Remaining())
+	// PS2 stores full quest blob at entity+0x1DDC collection
+	// For now just log the size — format needs further RE
+	log.Printf("QuestUpdate: added quest blob (%d bytes)", len(data))
+}
+
+func (gs *GameState) removeQuest(questID int64) {
+	for i := range gs.QuestJournal {
+		if gs.QuestJournal[i].QuestID == questID {
+			gs.QuestJournal = append(gs.QuestJournal[:i], gs.QuestJournal[i+1:]...)
+			log.Printf("QuestUpdate: removed quest %d", questID)
+			return
+		}
 	}
 }
 
@@ -1674,6 +1991,15 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 		return
 	}
 	payload := data[2:] // skip 2-byte opcode prefix
+
+	// PS2 opcode 0x1206 is dual-purpose:
+	// Sub-types 0x80-0x89 = Quest system (PS2 retail)
+	// Sub-types < 0x80 = Auction system (Sandstorm)
+	if len(payload) >= 1 && payload[0] >= 0x80 {
+		gs.handleQuestUpdate(payload)
+		return
+	}
+
 	hexLen := min(200, len(payload))
 	log.Printf("AuctionStuff: payloadLen=%d hex=%X", len(payload), payload[:hexLen])
 

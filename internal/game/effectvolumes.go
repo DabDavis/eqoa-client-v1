@@ -905,7 +905,6 @@ func (vol *EffectVolume) updateFlock(dt float32) {
 		vol.flockTimer = 3.0 + rand.Float32()*9.0 // PS2: 3-12 seconds
 	}
 
-	n := len(vol.particles)
 	maxSpeed := vol.Speed * 5.0
 	if maxSpeed < 2.0 {
 		maxSpeed = 2.0
@@ -914,70 +913,12 @@ func (vol *EffectVolume) updateFlock(dt float32) {
 	for i := range vol.particles {
 		p := &vol.particles[i]
 
-		// --- Boids forces ---
-		var sepX, sepY, sepZ float32     // separation
-		var alignVX, alignVY, alignVZ float32 // alignment
-		var cohX, cohY, cohZ float32     // cohesion center
-		neighbors := 0
+		// Steer toward shared waypoint
+		ax := (vol.flockTarget[0] - p.X) * 0.2
+		ay := (vol.flockTarget[1] - p.Y) * 0.2
+		az := (vol.flockTarget[2] - p.Z) * 0.2
 
-		for j := 0; j < n; j++ {
-			if j == i {
-				continue
-			}
-			o := &vol.particles[j]
-			dx := p.X - o.X
-			dy := p.Y - o.Y
-			dz := p.Z - o.Z
-			distSq := dx*dx + dy*dy + dz*dz
-
-			if distSq < 9.0 { // within 3 units
-				neighbors++
-				// Separation: push away from nearby birds
-				if distSq < 1.0 { // too close (< 1 unit)
-					if distSq < 0.01 {
-						distSq = 0.01
-					}
-					invD := 1.0 / distSq
-					sepX += dx * invD
-					sepY += dy * invD
-					sepZ += dz * invD
-				}
-				// Alignment: match velocity of nearby birds
-				alignVX += o.VX
-				alignVY += o.VY
-				alignVZ += o.VZ
-				// Cohesion: average position of nearby birds
-				cohX += o.X
-				cohY += o.Y
-				cohZ += o.Z
-			}
-		}
-
-		var ax, ay, az float32
-
-		// Separation force
-		ax += sepX * 2.0
-		ay += sepY * 2.0
-		az += sepZ * 2.0
-
-		if neighbors > 0 {
-			invN := 1.0 / float32(neighbors)
-			// Alignment: steer toward average velocity
-			ax += (alignVX*invN - p.VX) * 0.5
-			ay += (alignVY*invN - p.VY) * 0.5
-			az += (alignVZ*invN - p.VZ) * 0.5
-			// Cohesion: steer toward average position
-			ax += (cohX*invN - p.X) * 0.3
-			ay += (cohY*invN - p.Y) * 0.3
-			az += (cohZ*invN - p.Z) * 0.3
-		}
-
-		// Waypoint attraction
-		ax += (vol.flockTarget[0] - p.X) * 0.2
-		ay += (vol.flockTarget[1] - p.Y) * 0.2
-		az += (vol.flockTarget[2] - p.Z) * 0.2
-
-		// Boundary steering: push back toward volume center
+		// Boundary steering: push back into volume bounds
 		bboxPad := float32(2.0)
 		if p.X < vol.BBox.MinX-bboxPad {
 			ax += 3.0

@@ -879,14 +879,12 @@ func (c *Client) drawCharSelectModel(gs *game.GameState, px, py, pw, ph int32) {
 		atkType = 11
 	}
 	dw := ch.SecondaryAttackType > 0 && ch.SecondaryAttackType != 10 && shield == 0
-	atkTable := weaponAttackAnims
-	if dw {
-		atkTable = weaponAttackAnimsDW
+	_ = dw
+	anims4 := weaponAttackAnims[atkType]
+	if anims4 == [4]byte{} {
+		anims4 = weaponAttackAnims[11]
 	}
-	atkAnims := atkTable[atkType]
-	if atkAnims == nil {
-		atkAnims = atkTable[11]
-	}
+	atkAnims := anims4[:]
 
 	// Auto-attack cycle: class/level swing count, back-to-back, then idle pause.
 	numSwings := swingsPerAttack(byte(ch.Class), byte(ch.Level), dw)

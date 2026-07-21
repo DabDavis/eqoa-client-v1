@@ -1,4 +1,4 @@
-# EQOA Go Client
+# EQOA Go Client (v1 — Production)
 
 Raylib-based 3D client for the EQOA private server. Connects to Go game server or Sandstorm (eqoa.live), renders zone terrain and character models from ESF file data.
 
@@ -19,14 +19,14 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 
 | PS2 VI Class/Function | Go Implementation | File |
 |---|---|---|
-| `VIWalkControl::Process` | `handleInWorldInput()` — camera-relative movement + facing | `cmd/client/main.go` |
-| `VIWalkControl::SetTargetHeading` | `facing = atan2(moveX, moveZ)` — model +Z forward | `cmd/client/main.go` |
+| `VIWalkControl::Process` | `handleInWorldInput()` — camera-relative movement + facing | `cmd/client/input.go` |
+| `VIWalkControl::SetTargetHeading` | `facing = atan2(moveX, moveZ)` — model +Z forward | `cmd/client/input.go` |
 | `VIWalkControl::CalcFit` | `ZoneTerrain.CalcFit() → CalcFitResult` — iterative collide + Skitter | `internal/terrain/collision.go` |
 | `VIWalkControl::CalcFloor` | `ZoneTerrain.SampleHeight()` — ground snap | `internal/terrain/collision.go` |
 | `VICollRay::Init + Collide` | `castWallRay()` — Möller-Trumbore segment-triangle test | `internal/terrain/collision.go` |
 | `VICollRay::Skitter` | Inline in `CalcFit` loop — `slide = rem - dot(rem,N)*N` | `internal/terrain/collision.go` |
 | `VICollRay::PerturbMult` | `skin = 0.25` constant in `CalcFit` | `internal/terrain/collision.go` |
-| `VIWalkCamera::Process` | Camera orbit in `handleInWorldInput()` | `cmd/client/main.go` |
+| `VIWalkCamera::Process` | Camera orbit in `handleInWorldInput()` | `cmd/client/input.go` |
 | `VIParticleEmitter::Update` | Analytical particle physics (birth/death/position/size/color) | `internal/game/particles.go` |
 | `VIParticleSprite::Raster` | Billboard quad rendering (camera-facing textured quads) | `internal/game/particles.go` |
 | `VISpellEffectSystem::Play` | Spell effect playback with timed event sequences | `internal/game/spelldriver.go` |
@@ -36,6 +36,11 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 | `VIHSprite::AddInterpolatedPlay` | 250ms cross-fade blend with per-pair rejection | `internal/models/manager.go` |
 | `VICSprite::SetAttackAction` | Primary swing anims (11 weapon types) | `cmd/client/animation.go` |
 | `VICSprite::SetAttackAltAction` | Alt swing anims (Primary/Alt alternation) | `cmd/client/animation.go` |
+| `VIAtmosphere` | Weather particles (7 types), 30s crossfade, wind, splash | `internal/game/weather.go` |
+| `VILightning` | Jagged bolt renderer (16 segments, 3 branches) | `internal/game/lightning.go` |
+| `VIEffectVolume` | Environmental volumes (fog/dust/leaves/shafts/flock) | `internal/game/effectvolumes.go` |
+| `VIZoneTree` | BSP tree for water/lava/slime/mud detection | `internal/terrain/water.go` |
+| `VIUI` | 36-sheet UI textures, 9-slice frames, 252-entry TexID table | `internal/ui/viui.go` |
 
 ### VI Functions NOT Yet Ported
 
@@ -52,31 +57,102 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 ## Architecture
 
 ```
-cmd/client/main.go              # Raylib window, Camera3D, game loop, HUD
-cmd/client/render.go             # Entity/player rendering, animation dispatch
-cmd/headless/main.go             # Headless REPL client (testing against Sandstorm)
-internal/game/engine.go          # Core game loop, position updates, movement
-internal/game/state.go           # GameState, packet handling, state channels
-internal/game/spelldriver.go     # SpellEffectSystem/Driver/EventDriver (17 event types)
-internal/game/particles.go       # ParticleSystem/Emitter — billboard quad rendering
-internal/game/spellfx.go         # SPELLFX.ESF loader
-internal/terrain/terrain.go      # ESF zone loading, Triangle/Tile/ZoneTerrain structs
-internal/terrain/renderer.go     # GPU mesh upload, multi-pass rendering
-internal/terrain/collision.go    # CalcFit (wall slide), castWallRay, SampleHeight
-internal/models/manager.go       # Character model loading, animation playback, equipment rendering
-internal/models/mesh.go          # CSprite → triangle strip → rl.Mesh
-internal/models/animcontroller.go # SpriteAnimController (dual-pair priority state machine)
-internal/models/animstate.go     # Animation playback time/blend tracking
-internal/models/equipment.go     # Equipment DictID tables (armor, hair, robe, helm, face)
-internal/models/skeleton.go      # Bone transforms, ComputeAnimPose* methods
-internal/network/connection.go   # DRDP protocol client (reliable, state channels, XOR delta)
-internal/network/packet.go       # Packet construction, CRC, segment assembly
+cmd/client/                          # Raylib 3D client (~23k lines)
+  main.go                            # Window, Camera3D, game loop
+  render.go                          # Entity/player rendering, animation dispatch
+  animation.go                       # Combat animation mapping, weapon attack pools
+  input.go                           # In-world keyboard/controller input, camera
+  hud.go                             # HUD rendering, spell effects, entity lists
+  colors.go                          # UI theme palette, drawPanel(), text helpers
+  widgets.go                         # Immediate-mode UI (buttons, inputs, dropdowns, sliders)
+  esfont.go                          # ESF bitmap font loader (EQOA.ESF glyph atlas)
+  minimap.go                         # Real-time 512x512 GPU minimap (ortho capture)
+  menu.go                            # F12 in-game menu (tabbed panel)
+  login.go                           # Login screen, server config
+  titlescreen.go                     # Animated title (fire/ship/smoke from SETUP.ESF)
+  loadingscreen.go                   # Loading screen with procedural gear texture
+  charselect.go                      # Character select (3D preview, delete, BGM)
+  charcreate.go                      # Character creation wizard (5 steps, base stats)
+  charsave.go                        # Per-character JSON state persistence
+  isoprompt.go                       # ISO path entry with file browser + drag-and-drop
+  transmog.go                        # Client-side cosmetic equipment override
+  racecam.go                         # Per-race camera params (from CLIENT.AUT 0x00CDD8A0)
+  gamepad.go                         # PS2 DualShock 2 button mapping
+  entitysound.go                     # Animation-triggered positional audio
+  screenshot.go                      # PrintScreen/F9 capture
+  updater.go                         # Auto-updater (manifest, SHA-256, self-replace)
+  gridrunner_stub.go                 # Dev-only GM grid runner stub
+  pprof_dev.go                       # Dev-only pprof on :6060
+
+cmd/headless/main.go                # Headless REPL client (Sandstorm testing)
+cmd/crawler/                         # NPC/entity grid crawler (SQLite sightings)
+cmd/statharvest/main.go             # Base stat harvester (all race/class combos)
+cmd/presence/main.go                # HTTP heartbeat server (online player list)
+cmd/dumpbgm/main.go                 # Zone BGM placement extractor
+
+internal/game/
+  engine.go                          # Core game loop, position updates, movement
+  state.go                           # GameState, packet handling, state channels
+  handlers.go                        # Entity lifecycle opcodes (0x00B3/B5/B8/FC/FD/FF)
+  spelldriver.go                     # SpellEffectSystem/Driver/EventDriver (17 event types)
+  particles.go                       # ParticleSystem/Emitter — billboard quad rendering
+  spellfx.go                         # SPELLFX.ESF loader
+  spellsprites.go                    # Spell sprite model loading/caching (GPU meshes)
+  weather.go                         # VIAtmosphere: 7 weather types, transitions, splash
+  lightning.go                       # VILightning: bolt renderer (16 segments, 3 branches)
+  effectvolumes.go                   # VIEffectVolume: fog/dust/leaves/shafts/flock (512 max)
+
+internal/terrain/
+  terrain.go                         # ESF zone loading, ZoneTerrain, EffectVolumes, PointLights
+  renderer.go                        # GPU mesh upload, multi-pass rendering, frustum culling
+  collision.go                       # CalcFit (wall slide), castWallRay, SampleHeight
+  flora.go                           # Radial flora (triangle scatter, 256-unit chunks)
+  water.go                           # VIZoneTree BSP: water/lava/slime/mud detection, ProbeWater
+  navmesh.go                         # Wrapper — delegates to server ESF navmesh builder
+  obstaclenav.go                     # Obstacle avoidance waypoints, doorway probing
+  gridnav.go                         # Local A* on 1-unit collision grid, LOS smoothing
+  grid25d.go                         # Multi-level 2.5D pathfinding (ramps, bridges)
+  sparsenav.go                       # Sparse node graph A* for open areas
+  portalnav.go                       # Room/portal graph for indoor areas (BFS visible rooms)
+  voxelsensor.go                     # 3D voxel grid for tactical step selection
+
+internal/models/
+  manager.go                         # Character model loading, animation, equipment rendering
+  mesh.go                            # CSprite → triangle strip → rl.Mesh
+  animcontroller.go                  # SpriteAnimController (dual-pair priority state machine)
+  animstate.go                       # Animation playback time/blend tracking
+  animprofile.go                     # 5 animation profiles (humanoid/NPC/creature variants)
+  equipment.go                       # Equipment DictID tables (armor, hair, robe, helm, face)
+  skeleton.go                        # Bone transforms, ComputeAnimPose* methods
+  skinning.go                        # (placeholder — reserved for vertex skinning)
+
+internal/network/
+  connection.go                      # DRDP protocol client (reliable, state channels, XOR delta)
+  packet.go                          # Packet construction, CRC, segment assembly
+  auth.go                            # Auth/patch TCP flow
+
+internal/audio/
+  audio.go                           # Sound system: 3D positional, looping, distance attenuation
+  ambient.go                         # AMBTRACK.ESF: XM→PCM, zone-based day/night selection
+  bgm.go                             # BGM zones from TUNARIA.ESF StreamAudioSprite placements
+  bgmstream.go                       # VAG ADPCM streaming decoder (block-interleaved stereo)
+  vag.go                             # VAG decoder (EQOA reversed nibble variant)
+
+internal/sky/sky.go                  # SKY.ESF dome, time-of-day tint, sun/moon/stars, weather
+internal/ui/viui.go                  # PS2 UI renderer (36 sheets, 9-slice, 252-entry TexID table)
+internal/ui/frames.go                # Frame presets (Panel/Ornate/Thin/Line)
+internal/ui/table.go                 # 252-entry PS2 TexID→source rect table (from EE 0x004EDAF8)
+internal/frustum/frustum.go          # Gribb-Hartmann frustum culling (AABB + sphere tests)
+internal/gfx/gl.go                   # C bindings for GL depth/polygon ops not in rlgl
+internal/gfx/videomode.go            # Display resolution enumeration
+internal/mathutil/mathutil.go        # ClampF, FloatToUint8, Dist2D/3D, RectContains
+internal/protocol/protocol.go        # DRDP opcodes (100+), message types, segment headers
 ```
 
 ## Quick Commands
 
 ```bash
-cd go-eqoa-client
+cd go-eqoa-client-v1
 go build -o client ./cmd/client/ && ./client
 go build -o headless ./cmd/headless/ && ./headless
 
@@ -103,7 +179,7 @@ Nginx serves from `/home/sdg/www/tpacks.art/eqoa/eqoa/`:
 **Always use `deploy.sh`** for normal updates. It builds both platforms, generates the manifest, and pushes to the update server in one step.
 
 ```bash
-cd /home/sdg/claude-eqoa/go-eqoa-client
+cd /home/sdg/claude-eqoa/go-eqoa-client-v1
 ./scripts/deploy.sh
 ```
 
@@ -121,15 +197,17 @@ Server IP: config `server_ip` > default `5.161.217.188` (Sandstorm).
 |------|---------|
 | `cmd/client/updater.go` | Auto-updater (manifest fetch, download, SHA-256 verify, self-replace) |
 | `scripts/deploy.sh` | Build + manifest + push to update server + download links |
+| `scripts/deploy-dev.sh` | Dev build deploy variant |
+| `scripts/build-dev.sh` | Dev build with pprof enabled |
 | `cmd/client/login.go` | `loginConfig` with `ServerIP`, `ISOPath` fields |
 
 ## Terrain Rendering
 
 ### Data Flow
 ```
-TUNARIA.ESF → Loader.loadZone() → ZoneTerrain (tiles + textures)
+TUNARIA.ESF → Loader.loadZone() → ZoneTerrain (tiles + textures + effects)
   → Renderer.buildMeshes() → GPU meshes (one per TexID+Layer)
-  → Renderer.Draw() → rl.DrawMesh() per group
+  → Renderer.Draw() → rl.DrawMesh() per group (frustum culled)
 ```
 
 ### Multi-Layer Materials
@@ -144,6 +222,49 @@ Overlays use `glDepthFunc(GL_LEQUAL)` + `glDepthMask(GL_FALSE)` during Pass 2. T
 
 ### Radial Flora
 Procedural flora uses a hybrid approach: scatter on **render overlay triangles** (correct visible Y positions) filtered by a **collision mesh FloraType grid** (PS2 CollBuffer type 3 per-vertex flora set index). This ensures flora only appears on natural surfaces (grass, dirt) and not on cobblestone, stone, etc. Also filtered by slope (normal Y > 0.7, ~45 degrees). Key file: `internal/terrain/flora.go`.
+
+## Water & Environment Detection
+
+`internal/terrain/water.go` implements the PS2 VIZoneTree BSP tree parsed from ESF zone data. Provides `ProbeWater()` (3-probe detection), `FindWaterSurfaceY()`, and `GetEnvFlags()` for water/lava/slime/mud detection. Used for swim/drown mechanics.
+
+## Pathfinding / Navigation (5 strategies)
+
+| Module | Strategy | Use Case |
+|--------|----------|----------|
+| `obstaclenav.go` | Building footprint + doorway probing | Waypoints around obstacles |
+| `gridnav.go` | A* on 1-unit collision grid | Local wall/doorway detection |
+| `grid25d.go` | Multi-level 2.5D grid | Ramps, stairs, bridges |
+| `sparsenav.go` | Sparse node graph A* | Open areas, wall-adjacent |
+| `portalnav.go` | Room/portal graph BFS + A* | Indoor zones (portal culling) |
+| `voxelsensor.go` | 3D voxel tactical grid | Immediate next-step selection |
+
+## Sky & Weather
+
+**Sky** (`internal/sky/sky.go`): SKY.ESF dome with dual-layer materials (base + cloud overlay at 3x UV tiling). Procedural star field (~200 golden spiral points). Sun/moon billboards with celestial elevation visibility. PS2-derived 24-hour tint table with weather-driven overcast darkening.
+
+**Weather** (`internal/game/weather.go`): 7 types (Clear, Rain, Snow, Sleet, Sandstorm, Lavastorm, Thunderstorm). 30-second crossfade transitions, wind effects, ground splash animations. Lightning flashes tied to thunderstorm.
+
+**Lightning** (`internal/game/lightning.go`): 16-segment jagged bolts with random perpendicular jitter, up to 3 branching sub-bolts. Charge decays at 5.0 units/sec, jitter regenerates on 70-350ms intervals.
+
+## Audio System
+
+| File | Purpose |
+|------|---------|
+| `audio.go` | Sound manager: 3D positional, distance attenuation, stereo panning, BGM streaming |
+| `ambient.go` | AMBTRACK.ESF: XM→PCM at 22050Hz, 12 day + 8 night tracks, zone selection |
+| `bgm.go` | BGM zones from TUNARIA.ESF StreamAudioSprite placements |
+| `bgmstream.go` | VAG ADPCM streaming decoder (block-interleaved stereo, auto-detect interleave) |
+| `vag.go` | VAG decoder — EQOA variant with reversed nibble order (predictor=high, shift=low) |
+
+Entity sounds triggered by animation keyframe crossings (`cmd/client/entitysound.go`), using per-model PLSlotSound maps.
+
+## UI System
+
+**VIUI** (`internal/ui/viui.go`): PS2-faithful renderer loading 36 texture sheets from UI.ESF via hardcoded DictID→page mapping. 252-entry TexID lookup table (`internal/ui/table.go`, extracted from EE 0x004EDAF8). 9-slice frame rendering with 4 presets (Panel/Ornate/Thin/Line in `frames.go`). PS2 alpha (0-128) → GL (0-255) conversion at load time.
+
+**ESFont** (`cmd/client/esfont.go`): Bitmap font loaded from EQOA.ESF glyph metrics → texture atlas → Raylib GPU.
+
+**Widgets** (`cmd/client/widgets.go`): Immediate-mode UI library — buttons, text input, tooltips, checkboxes, radio, dropdowns, sliders, lists. Supports "modern" (rounded/gradients) and "classic" (PS2 ESF sprite) themes.
 
 ## Equipment Texture System
 
@@ -175,9 +296,10 @@ Maps material indices to equipment slots. `count(int32) + count × { meshIndex, 
 ### Helm Rendering
 Helms are **separate 3D models** (NOT texture swaps). 8 SimpleSprite meshes in CHARCUST.CSF, rendered as standalone objects positioned at character head height. Hair hidden when helm equipped.
 
-**TODO**: Helm scale adjustment (models authored at fixed size, need to scale proportionally to character height).
+### Transmog System
+Client-side cosmetic overrides (`cmd/client/transmog.go`). Tracks known weapon/shield DictIDs from visible entities. 9 armor set names, 14 tint color names. Applies overrides to equipment state before rendering.
 
-## Animation State Machine
+## Animation System
 
 ### SpriteAnimController (`animcontroller.go`)
 Dual-pair model matching PS2 `VICSprite::SetAnimation` (0x00422D78):
@@ -187,6 +309,16 @@ Dual-pair model matching PS2 `VICSprite::SetAnimation` (0x00422D78):
 **Priority gating**: Playing animations always interruptible. Only stopped/finished play-once animations protected by priority. Idle can never replace a stopped anim. Same-animID rejected.
 
 **PlayOnce**: Attack anims hold last frame; locomotion loops. `applySkeletal` clamps play-once anims and notifies controller via `MarkActionFinished()`.
+
+### Animation Profiles (`animprofile.go`)
+5 profiles for different model types:
+- Humanoid (full weapon attack pools, dual wield/shield/2-hand)
+- NPC humanoid
+- 40-anim creatures
+- 68-anim creatures
+- 18-anim monsters
+
+Each maps logical roles (SpecialIdle, BattleStance, Death, etc.) to ESF CPlayList slot numbers.
 
 ### Cross-Fade Blend
 250ms interpolated transition (PS2 `AddInterpolatedPlay`). Per-pair rejection — locomotion blend doesn't block action pair.
@@ -240,6 +372,33 @@ moveZ = -sinA*inputFwd - cosA*inputRight
 ### Body Mesh Shader
 Body meshes use opaque shader (forces alpha=1.0) for slots 0-4. Prevents alpha cutoff from creating gaps at UV seam edges. Alpha cutoff retained for hair/face/equipment.
 
+### Frustum Culling
+`internal/frustum/frustum.go`: Gribb-Hartmann plane extraction from VP matrix. Tests AABBs and spheres against 6 clipping planes. Used by terrain renderer and entity draw.
+
+## Client Screens & Flow
+
+```
+ISO Prompt → Title Screen → Login → Character Select → [Create/Delete] → Loading → In-World
+                                                                                      ↓
+                                                                              F12 Menu, Minimap,
+                                                                              HUD, Gamepad input
+```
+
+- **ISO Prompt** (`isoprompt.go`): File browser, drag-and-drop, paste support. Validates >1GB .iso files.
+- **Title Screen** (`titlescreen.go`): Animated fire/ship/smoke from SETUP.ESF. 45+ BGM tracks.
+- **Character Select** (`charselect.go`): Up to 8 chars with 3D model preview, delete confirmation, per-race BGM.
+- **Character Create** (`charcreate.go`): 5-step wizard (race/gender, class, appearance, stats, name). Hardcoded base stats from Sandstorm.
+- **Loading Screen** (`loadingscreen.go`): Procedural 256x256 rotating gear, alpha fade transitions.
+- **Race Camera** (`racecam.go`): Per-race/gender camera params from CLIENT.AUT 0x00CDD8A0.
+
+## Character Persistence
+
+`cmd/client/charsave.go`: Per-character JSON state files mirror PS2 memory card saves. Stores position/facing/zone, identity, appearance, equipment. Used to preserve 3D model in character select.
+
+## Gamepad Support
+
+`cmd/client/gamepad.go`: PS2 DualShock 2 mapping → Raylib gamepad. Left stick = movement, right stick = camera orbit/zoom/swim, D-pad = targeting, cross/circle/square/triangle = actions. Auto-shows spell bar on first gamepad frame.
+
 ## DRDP Protocol Client (`internal/network/`)
 
 ### Connection Lifecycle
@@ -285,6 +444,15 @@ Byte 0 = update counter, bytes 1-4 = ObjectID (0 = removed). NameColor byte 142:
 - **DamageIndication (0x00DB)**: Zigzag-encoded. Negative=damage, positive=heal
 - **CastingCombat (0x00B1)**: 17 bytes. target(4) + source(4) + unk(1) + timer_ms(2) + pad(2) + animHash(4)
 
+## CLI Tools
+
+| Tool | Purpose |
+|------|---------|
+| `cmd/crawler/` | NPC/entity grid crawler — crawls Tunaria in 2000×2000 cells, stores sightings in SQLite |
+| `cmd/statharvest/` | Base stat harvester — iterates all race/class/humType combos from Sandstorm → SQLite |
+| `cmd/presence/` | HTTP heartbeat server — tracks online players (90s prune, JSON response) |
+| `cmd/dumpbgm/` | Zone BGM placement extractor — bounding boxes per audio file path |
+
 ## PS2 RE References
 
 | Resource | Location |
@@ -297,8 +465,9 @@ Byte 0 = update counter, bytes 1-4 = ObjectID (0 = removed). NameColor byte 142:
 
 ## Dependencies
 
-- `github.com/gen2brain/raylib-go/raylib` v0.55.1 — 3D rendering
-- `github.com/eqoa/server/pkg/esf` — ESF file parsing (local replace → ../go-eqoa-server)
+- `github.com/gen2brain/raylib-go/raylib` — 3D rendering (local replace → `../raylib-go/raylib`)
+- `github.com/DabDavis/eqoa-esf-tools` — ESF file parsing (local replace → `../go-eqoa-esf-tools-v1`)
+- `github.com/mattn/go-sqlite3` v1.14.34 — SQLite for crawler/statharvest tools
 
 ## TODO
 
@@ -308,3 +477,4 @@ Byte 0 = update counter, bytes 1-4 = ObjectID (0 = removed). NameColor byte 142:
 - Overlay back-face lighting fix
 - `VIWalkControl::UpdatePhysics` — gravity, jumping
 - `VICollSphere` — swept sphere collision
+- Water/swim integration (VIZoneTree BSP parsed but not driving swim mode)

@@ -48,7 +48,6 @@ type UVRateKey struct {
 type ZoneTerrain struct {
 	Tiles         map[TileKey]*Tile
 	CollTiles     map[TileKey]*CollTile          // collision mesh (from CollBuffer)
-	Nav           *NavMesh                       // pathfinding navmesh (built from walkable CollTiles)
 	Rooms         []esf.ZoneRoom                // room/portal data for indoor pathfinding
 	Textures      map[int32]*image.NRGBA         // TexID → CPU image
 	Tree          *ZoneTree                       // BSP tree for environment queries (water/lava)
@@ -64,92 +63,6 @@ type ZoneTerrain struct {
 	MinTZ         int
 	MaxTZ         int
 	NumTris       int
-	// Actor obstacle footprints for pathfinding (computed during zone load)
-	Obstacles     []ActorObstacle
-}
-
-// ActorObstacle is the 2D XZ bounding rectangle of a zone actor's collision mesh.
-// Used by auto-approach pathfinding to generate waypoints around buildings/walls.
-type ActorObstacle struct {
-	MinX, MinZ, MaxX, MaxZ float32 // axis-aligned bounds in world space
-	CX, CZ                float32 // center
-}
-
-// ProbeDoorways finds openings in an obstacle by casting CalcFit probes from
-// its center outward in 36 directions (every 10°). Directions where the probe
-// passes through without hitting a wall = door opening. Called at pathfinding
-// time when the character needs to enter/exit this obstacle.
-func ProbeDoorways(zt *ZoneTerrain, obs *ActorObstacle, refY float32) []ObstacleWaypoint {
-	if zt == nil {
-		return nil
-	}
-
-	cx, cz := obs.CX, obs.CZ
-	// Probe radius = half the obstacle's larger dimension + margin
-	extX := (obs.MaxX - obs.MinX) / 2
-	extZ := (obs.MaxZ - obs.MinZ) / 2
-	radius := extX
-	if extZ > radius {
-		radius = extZ
-	}
-	radius += 2.0 // overshoot past the wall
-
-	// Cast 36 probes from center outward (every 10°)
-	const numProbes = 36
-	var openings []ObstacleWaypoint
-
-	for i := 0; i < numProbes; i++ {
-		angle := float64(i) * 2 * math.Pi / numProbes
-		dirX := float32(math.Sin(angle))
-		dirZ := float32(math.Cos(angle))
-
-		probeX := cx + dirX*radius
-		probeZ := cz + dirZ*radius
-
-		fit := zt.CalcFit(cx, refY, cz, probeX, probeZ)
-		if !fit.Hit {
-			// No wall hit — this direction has an opening.
-			// Place the waypoint at the obstacle boundary (not center, not overshoot).
-			wpX := cx + dirX*(radius-1.0)
-			wpZ := cz + dirZ*(radius-1.0)
-			openings = append(openings, ObstacleWaypoint{X: wpX, Z: wpZ})
-		}
-	}
-
-	// Cluster nearby openings — consecutive clear probes are the same doorway.
-	// Take the midpoint of each cluster.
-	if len(openings) == 0 {
-		return nil
-	}
-
-	var doors []ObstacleWaypoint
-	clusterX := openings[0].X
-	clusterZ := openings[0].Z
-	clusterN := 1
-
-	for i := 1; i < len(openings); i++ {
-		dx := openings[i].X - openings[i-1].X
-		dz := openings[i].Z - openings[i-1].Z
-		if dx*dx+dz*dz < 9.0 { // within 3 units = same cluster
-			clusterX += openings[i].X
-			clusterZ += openings[i].Z
-			clusterN++
-		} else {
-			doors = append(doors, ObstacleWaypoint{
-				X: clusterX / float32(clusterN),
-				Z: clusterZ / float32(clusterN),
-			})
-			clusterX = openings[i].X
-			clusterZ = openings[i].Z
-			clusterN = 1
-		}
-	}
-	doors = append(doors, ObstacleWaypoint{
-		X: clusterX / float32(clusterN),
-		Z: clusterZ / float32(clusterN),
-	})
-
-	return doors
 }
 
 // loadedZone tracks one loaded zone's state.
@@ -686,12 +599,6 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 		cb, cbErr := sprite.GetCollBuffer(file)
 		if cbErr == nil && cb != nil {
 			collCount++
-			// Track XZ bounds for this actor's collision mesh (obstacle footprint)
-			actorMinX := float32(math.MaxFloat32)
-			actorMinZ := float32(math.MaxFloat32)
-			actorMaxX := float32(-math.MaxFloat32)
-			actorMaxZ := float32(-math.MaxFloat32)
-			actorTriCount := 0
 
 			for _, list := range cb.Lists {
 				nv := len(list.Vertices)
@@ -713,7 +620,7 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 					sp.Transform(&pbl)
 					sp.Transform(&pc)
 
-					// Flora type from vertices (PS2 CollBuffer type 3 stores per-vertex flora set)
+					// Flora type from vertices (CollBuffer type 5 stores per-vertex flora set; type 3 = no flora)
 					ft := a.FloraType
 					if ft < 0 {
 						ft = b.FloraType
@@ -738,31 +645,7 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 
 					addCollTriToZone(zt, ct)
 					collTriCount++
-					actorTriCount++
-
-					// Expand actor XZ bounds
-					for _, vx := range []float32{pa.X, pbl.X, pc.X} {
-						if vx < actorMinX { actorMinX = vx }
-						if vx > actorMaxX { actorMaxX = vx }
-					}
-					for _, vz := range []float32{pa.Z, pbl.Z, pc.Z} {
-						if vz < actorMinZ { actorMinZ = vz }
-						if vz > actorMaxZ { actorMaxZ = vz }
-					}
 				}
-			}
-
-			// Store obstacle footprint if actor is large enough to matter for pathfinding
-			// (skip tiny collision meshes like fence posts, small rocks)
-			extentX := actorMaxX - actorMinX
-			extentZ := actorMaxZ - actorMinZ
-			if actorTriCount >= 4 && extentX > 2 && extentZ > 2 {
-				zt.Obstacles = append(zt.Obstacles, ActorObstacle{
-					MinX: actorMinX, MinZ: actorMinZ,
-					MaxX: actorMaxX, MaxZ: actorMaxZ,
-					CX:   (actorMinX + actorMaxX) / 2,
-					CZ:   (actorMinZ + actorMaxZ) / 2,
-				})
 			}
 		}
 
@@ -1079,21 +962,6 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 		}
 		log.Printf("terrain: radial flora — %d models, %d dists, %d sets, collTri floraTypes=%v",
 			len(rf.Models), len(rf.Dists), len(rf.Sets), ftCounts)
-	}
-
-	// Build navigation mesh for pathfinding
-	zt.Nav = BuildNavMesh(zt)
-	if zt.Nav != nil {
-		edgeCount := 0
-		for _, el := range zt.Nav.Edges {
-			edgeCount += len(el)
-		}
-		log.Printf("terrain: navmesh built — %d walkable tris, %d edges, %d stitched, %d components (largest=%d)",
-			zt.Nav.TriCount(), edgeCount/2, zt.Nav.Stitched, zt.Nav.Components, zt.Nav.LargestCC)
-	}
-
-	if len(zt.Obstacles) > 0 {
-		log.Printf("terrain: %d actor obstacles for pathfinding", len(zt.Obstacles))
 	}
 
 	return zt, nil

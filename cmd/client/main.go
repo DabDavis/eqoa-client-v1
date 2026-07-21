@@ -256,7 +256,6 @@ type Client struct {
 	socialSubTab   int // 0=Who, 1=Group, 2=LFG, 3=Auction
 	guildSubTab    int // 0=Roster, 1=Chat
 	settingsSubTab int     // 0=Camera, 1=Audio
-	uiTheme        uiStyle // 0=modern, 1=classic (PS2 frames)
 	menuStickLatched bool // right stick sub-tab latch (fires once per deflection)
 	whoRequested      bool // true after first who list request sent
 	whoSortByLevel    bool // false=alphabetical, true=by level
@@ -326,37 +325,12 @@ type Client struct {
 	gmShowStats    bool       // PS2 "Toggle Stats" — FPS, entity count, network
 	gmExtrapolate  bool       // PS2 extrapolate/interpolate toggle (default: interpolate)
 	gridRunner     *gridRunnerState // grid runner autopilot (GM menu)
-	hideHelm       bool       // client-side helm visibility toggle
-	hideRobe       bool       // client-side robe visibility toggle
-
 	// Appearance editor on char select
 	appearanceEditActive bool    // true when editing appearance of existing char
 	appearanceEditIdx    int     // which char index is being edited
 	appearanceFacing     float32 // manual rotation angle during appearance edit
 
-	// Transmog: client-side appearance overrides per equipment slot.
-	// -1 = use actual equipped value, 0-8 = armor set override.
-	// Helm: -1=actual, 0=hidden, 1-8=helm model index.
-	// Robe: -1=actual, 0=hidden(255), 1-4=robe style.
-	transmogOpen   bool // transmog panel visible on Equipped tab
 	loreCategory   int  // -1=category list, 0=history, 1=races, 2=gods
-	transmogChest  int
-	transmogBracer int
-	transmogGloves int
-	transmogLegs   int
-	transmogBoots  int
-	transmogHelm   int
-	transmogRobe   int
-	transmogPrimary   int // index into known weapon models, -1=actual
-	transmogSecondary int
-	transmogShield    int
-	transmogChestTint  int // -1=actual, 0-13=tint color
-	transmogBracerTint int
-	transmogGlovesTint int
-	transmogLegsTint   int
-	transmogBootsTint  int
-	transmogHelmTint   int
-	transmogRobeTint   int
 
 	// World map overlay (M key)
 	worldMapOpen bool
@@ -506,23 +480,6 @@ func main() {
 		charSelectIdx:   -1,
 		runMode:         true,
 		loreCategory:    -1,
-		transmogChest:   -1,
-		transmogBracer:  -1,
-		transmogGloves:  -1,
-		transmogLegs:    -1,
-		transmogBoots:   -1,
-		transmogHelm:    -1,
-		transmogRobe:      -1,
-		transmogPrimary:    -1,
-		transmogSecondary: -1,
-		transmogShield:    -1,
-		transmogChestTint:  -1,
-		transmogBracerTint: -1,
-		transmogGlovesTint: -1,
-		transmogLegsTint:   -1,
-		transmogBootsTint:  -1,
-		transmogHelmTint:   -1,
-		transmogRobeTint:   -1,
 		masterVolume:    1.0,
 		sfxVolume:       1.0,
 		bgmVolume:       0.5,
@@ -752,24 +709,40 @@ func main() {
 		//   2 → SetAttackAltAction(slot=0) — primary weapon, alt swing
 		//   3 → SetAttackAltAction(slot=1) — secondary weapon, alt swing
 		// PS2 also reads Fields[1]=targetActorID, Floats[0-2]=targetPos for PlayDirectedAttack.
-		engine.SetPlayAttackCallback(func(actorObjID uint32, animPair int32) {
-			// Map animPair to attack CPlayList slots (unarmed fallback).
-			// PS2 uses weapon-specific slots via SetAttackAction jump table;
-			// we use sequential unarmed slots as approximation.
+		engine.SetPlayAttackCallback(func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32) {
+			// PS2 NewPlayAttack (0x00476370): Fields[0] selects attack pair.
+			//   0 = SetAttackAction(slot=0)    — primary weapon, primary swing
+			//   1 = SetAttackAction(slot=1)    — secondary weapon, primary swing
+			//   2 = SetAttackAltAction(slot=0) — primary weapon, alt swing
+			//   3 = SetAttackAltAction(slot=1) — secondary weapon, alt swing
+			// PS2 SetAttackAction/SetAttackAltAction use the weapon's AttackType
+			// jump table to pick the correct CPlayList slot. We index into the
+			// verified 4-entry weaponAttackAnims[attackType] table:
+			//   [0]=Pri(s=0), [1]=Pri(s=1), [2]=Alt(s=0), [3]=Alt(s=1)
+			idx := int(animPair)
+			if idx < 0 || idx > 3 {
+				idx = 0
+			}
+
 			var animByte byte
-			switch animPair {
-			case 0:
-				animByte = animAttack1 // CPlayList slot 22 — primary right
-			case 1:
-				animByte = animAttack2 // CPlayList slot 23 — primary left
-			case 2:
-				animByte = animAttack3 // CPlayList slot 24 — alt right
-			case 3:
-				animByte = animAttack4 // CPlayList slot 25 — alt left
-			default:
-				animByte = animAttack1
+			if actorObjID == engine.State.PlayerObjectID {
+				atkType := client.animMgr.GetWeaponAttackType(engine.State)
+				if anims, ok := weaponAttackAnims[atkType]; ok {
+					animByte = anims[idx]
+				} else {
+					animByte = weaponAttackAnims[11][idx] // default dagger
+				}
+			} else {
+				// NPC: use generic attack slots (PS2 uses NPC's own attackType,
+				// but we don't track per-NPC weapon types)
+				animByte = weaponAttackAnims[11][idx]
 			}
 			client.triggerSpellAnim(actorObjID, animByte)
+
+			// Mark combat active — spell FX PlayAttack means we're in combat.
+			if actorObjID == engine.State.PlayerObjectID {
+				client.animMgr.PlayerCombatActivity()
+			}
 		})
 
 		// SetAction callback — spell effects trigger cast/action animations.
@@ -797,6 +770,51 @@ func main() {
 			}
 			return true
 		})
+
+		// Trigger callbacks for spell FX Wait(sub-type 3) HasTripped.
+		engine.SetTriggerCallbacks(
+			func(actorObjID uint32, triggerName string) (int, bool) {
+				if client.modelMgr == nil {
+					return -1, false
+				}
+				return client.modelMgr.FindSpellFXTrigger(actorObjID, triggerName)
+			},
+			func(actorObjID uint32, triggerIdx int) {
+				if client.modelMgr != nil {
+					client.modelMgr.ResetSpellFXTrigger(actorObjID, triggerIdx)
+				}
+			},
+			func(actorObjID uint32, triggerIdx int) bool {
+				if client.modelMgr == nil {
+					return false
+				}
+				return client.modelMgr.HasSpellFXTripped(actorObjID, triggerIdx)
+			},
+			// IsCSprite: check if actor is a humanoid model (CSprite with TSlotList).
+			// PS2 checks sprite->state == 5. Non-CSprite actors clear Wait type 3 immediately.
+			func(actorObjID uint32) bool {
+				if client.modelMgr == nil {
+					return false
+				}
+				gs := engine.State
+				if gs == nil {
+					return false
+				}
+				var modelID uint32
+				if actorObjID == gs.PlayerObjectID {
+					modelID = gs.Player.ModelID
+				} else if ent, ok := gs.Entities[actorObjID]; ok {
+					modelID = ent.ModelID
+				}
+				return modelID != 0 && client.modelMgr.ModelIsHumanoid(int32(modelID))
+			},
+			// SetWeaponTrail: activate weapon swing trail on actor.
+			func(actorObjID uint32, trailID int32, color [3]float32) {
+				if client.modelMgr != nil {
+					client.modelMgr.SetWeaponTrail(actorObjID, trailID, color)
+				}
+			},
+		)
 
 		// Game loop -- exits when window closes or client.engine is set to nil (back to login).
 		// On exit, send disconnect opcode if still connected.

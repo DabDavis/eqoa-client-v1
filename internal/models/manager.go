@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"runtime"
+	"time"
 	"unsafe"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -201,7 +202,28 @@ const (
 	SecSoundRefID     int32 = -0x2B2DC319 // "Secondary Sound"   = 0xD4D23CE7
 	SecSoundBPURefID  int32 = -0x432742CD // "Secondary Sound_BPU" = 0xBCD8BD33
 	SecSoundBPLRefID  int32 = -0x432742D6 // "Secondary Sound_BPL" = 0xBCD8BD2A
+
+	// Spell FX trigger RefIDs (VIHashResourceID of "Spell FX 1-4").
+	// Used by NewPlayAttack → FindTrigger to locate keyframe trigger points,
+	// and by Wait(sub-type 3) → HasTripped to detect swing impact frames.
+	SpellFX1RefID int32 = 0x53A2401B // "Spell FX 1"
+	SpellFX2RefID int32 = 0x53A2401C // "Spell FX 2"
+	SpellFX3RefID int32 = 0x53A2401D // "Spell FX 3"
+	SpellFX4RefID int32 = 0x53A2401E // "Spell FX 4"
 )
+
+// IsSpellFXTrigger returns true if the RefID is a "Spell FX 1-4" trigger.
+func IsSpellFXTrigger(refID int32) bool {
+	return refID >= SpellFX1RefID && refID <= SpellFX4RefID
+}
+
+// SpellFXTriggerIndex returns the 0-3 index for a Spell FX trigger RefID (-1 if not).
+func SpellFXTriggerIndex(refID int32) int {
+	if refID >= SpellFX1RefID && refID <= SpellFX4RefID {
+		return int(refID - SpellFX1RefID)
+	}
+	return -1
+}
 
 // IsSoundTrigger returns true if the RefID is a Primary or Secondary sound trigger.
 func IsSoundTrigger(refID int32) bool {
@@ -240,14 +262,14 @@ type CharModel struct {
 	HasHead    bool       // true if head bone was found
 	// Per-frame skinning matrices (set by applySkeletal, used for bone resolver)
 	lastSkinMatrices []mat4 // skinning matrices from last applySkeletal call
-	IsHumanoid   bool     // true if model uses paired animation indexing (TSlotList or high anim count)
+	IsHumanoid   bool     // true if SkelType == 1 (dual-pair upper/lower body animation)
 	HasTSlotList bool     // true if model has TSlotList (player race with equipment slots)
 	AnimProfile  AnimProfile // per-model animation role → pair index mapping
 	Height       float32    // model height (bbox MaxY - MinY)
 	DefaultScale float32    // ESF model scale (from CSprite.DefaultScale, PS2 VIHSprite+0xD0)
 	Race         int32     // VICSpriteRace enum from ESF CSprite (ver >= 3, default 9)
 	Sex          int32     // VICSpriteSex enum from ESF CSprite (ver >= 3, default 0)
-	SkelType     int32     // VICSpriteSkelType enum: weapon topology (0=unarmed, 2=2H slash, 4=2H blunt, 6=2H pierce)
+	SkelType     int32     // VICSpriteSkelType enum (VICSprite+0x194): 0=simple, 1=humanoid dual-pair, 2=quadruped, 3=flying
 	Skeleton     *Skeleton            // bone hierarchy with bind-pose matrices (nil if no hierarchy)
 	Animations   []*esf.HSpriteAnim  // animations from CSprite (nil for items/weapons)
 	CenterOff    [3]float32          // centering offset (cx, yBottom, cz) for skinning coord-space conversion
@@ -1182,7 +1204,7 @@ func (m *ModelManager) applySkeletal(model *CharModel, modelID int32, entityID u
 			upperSlot = int(actionAnimByte)
 			// lowerSlot stays as animByte (locomotion)
 		}
-		if model.PLSlotToRawPair != nil {
+if model.PLSlotToRawPair != nil {
 			// Resolve upper body from action slot (or loco if no action).
 			if pair, ok := model.PLSlotToRawPair[upperSlot]; ok {
 				upperIdx = pair[0]
@@ -1277,11 +1299,33 @@ func (m *ModelManager) applySkeletal(model *CharModel, modelID int32, entityID u
 			if as.BlendFactor < 1.0 && as.PrevUpperIdx >= 0 {
 				// Blend already in progress — keep prev, replace target.
 			} else {
-				as.PrevUpperIdx = as.UpperIdx
-				as.PrevLowerIdx = as.LowerIdx
-				as.PrevFramePos = as.FramePos
-				as.PrevNumFrames = as.NumFrames
-				as.PrevSlot = int(as.CurSlot)
+				// PS2 paired blend (AddInterpolatedPlayWithSync at 0x00446CC0):
+				// When locomotion is set to the same anim as the action pair,
+				// blend from the action pair's frame position for smooth transition.
+				if as.Controller != nil && as.Controller.PairedBlendFromAction && actionAnimByte != 0 {
+					// Use action pair's animation as blend source
+					actionSlot := int(actionAnimByte)
+					if model.PLSlotToRawPair != nil {
+						if pair, ok := model.PLSlotToRawPair[actionSlot]; ok {
+							as.PrevUpperIdx = pair[0]
+							if pair[1] >= 0 {
+								as.PrevLowerIdx = pair[1]
+							} else {
+								as.PrevLowerIdx = as.LowerIdx
+							}
+						}
+					}
+					as.PrevFramePos = as.FramePos // action pair was driving upper
+					as.PrevNumFrames = as.NumFrames
+					as.PrevSlot = actionSlot
+					as.Controller.PairedBlendFromAction = false
+				} else {
+					as.PrevUpperIdx = as.UpperIdx
+					as.PrevLowerIdx = as.LowerIdx
+					as.PrevFramePos = as.FramePos
+					as.PrevNumFrames = as.NumFrames
+					as.PrevSlot = int(as.CurSlot)
+				}
 				as.BlendFactor = 0
 			}
 			as.BlendDur = 0.25
@@ -1342,10 +1386,15 @@ func (m *ModelManager) applySkeletal(model *CharModel, modelID int32, entityID u
 	}
 	as.FramePos += dt * fps * absSpeed * callerSpeed
 
-	// Check ESF CPlayList PlayOnce flag for the upper body slot.
+	// Check play-once: ESF CPlayList flag, OR controller says action is play-once.
+	// Controller's getPlayOnce() covers all combat/spell slots consistently across
+	// all race models, while ESF PLSlotPlayOnce can vary per model.
 	isPlayOnce := false
 	if model.PLSlotPlayOnce != nil {
 		isPlayOnce = model.PLSlotPlayOnce[int(upperSlotByte)]
+	}
+	if !isPlayOnce && as.Controller != nil && actionAnimByte != 0 {
+		isPlayOnce = as.Controller.IsActionPlayOnce()
 	}
 	as.IsPlayOnce = isPlayOnce || isDeath
 	as.IsDeath = isDeath
@@ -1366,10 +1415,7 @@ func (m *ModelManager) applySkeletal(model *CharModel, modelID int32, entityID u
 		if as.FramePos < 0 {
 			as.FramePos = 0
 		}
-	} else if isPlayOnce || upperSlotByte == model.AnimProfile.CastDamage ||
-		upperSlotByte == model.AnimProfile.CastBuff ||
-		upperSlotByte == model.AnimProfile.Attack1 ||
-		upperSlotByte == model.AnimProfile.Attack2 {
+	} else if isPlayOnce {
 		// Play-once: hold at last frame (PS2: playbackState=3).
 		lastFrame := numFrames - 1
 		if as.FramePos >= lastFrame {
@@ -1392,6 +1438,33 @@ func (m *ModelManager) applySkeletal(model *CharModel, modelID int32, entityID u
 		for as.FramePos < 0 {
 			as.FramePos += numFrames
 		}
+	}
+
+	// PS2 ProcessPlayTiming: check if frame crossed any keyframe triggers.
+	// Trip the corresponding trigger when PrevFrame < keyframe.Time <= FramePos.
+	if model.AnimKeyframes != nil {
+		kfs := model.AnimKeyframes[upperIdx]
+		for _, kf := range kfs {
+			if as.PrevFrame < kf.Time && as.FramePos >= kf.Time {
+				if IsSpellFXTrigger(kf.RefID) {
+					idx := SpellFXTriggerIndex(kf.RefID)
+					if idx >= 0 && idx < 4 {
+						as.SpellFXTripped[idx] = true
+					}
+				} else if IsSoundTrigger(kf.RefID) {
+					ch := SoundChannel(kf.RefID)
+					if ch >= 0 && ch < 2 {
+						as.SoundTripped[ch] = true
+					}
+				}
+			}
+		}
+	}
+
+	// PS2 SetAnimation: reset sound triggers when animation changes.
+	// Track previous upper index; on change, clear sound tripped flags.
+	if as.UpperIdx != upperIdx {
+		as.SoundTripped = [2]bool{}
 	}
 
 	// Advance lower body frame independently when split (PS2 dual-pair).
@@ -2030,12 +2103,95 @@ func (m *ModelManager) SetCameraPos(x, y, z float32) {
 	m.camX, m.camY, m.camZ = x, y, z
 }
 
+// SetWeaponTrail activates a weapon swing trail on an entity.
+// PS2 SetWeaponTrail at 0x00422C60: stores trail ID + color on CSprite.
+// ProcessWeaponTrails (0x004235C0) renders geometry from bone positions.
+// We store the state for the render loop to draw trail lines.
+func (m *ModelManager) SetWeaponTrail(entityID uint32, trailID int32, color [3]float32) {
+	as := m.GetAnimState(entityID)
+	if as == nil {
+		return
+	}
+	as.TrailActive = true
+	as.TrailID = trailID
+	as.TrailColor = color
+	as.TrailStart = time.Now()
+	as.TrailPoints = as.TrailPoints[:0] // reset trail points
+}
+
+// RecordTrailPoint appends the current weapon tip position to the trail buffer.
+// Called per-frame from the render loop after weapon bone transforms are computed.
+func (m *ModelManager) RecordTrailPoint(entityID uint32, wx, wy, wz float32) {
+	as := m.GetAnimState(entityID)
+	if as == nil || !as.TrailActive {
+		return
+	}
+	// Auto-expire trail after 600ms (PS2 trail duration is ~0.5-0.7s per swing).
+	if time.Since(as.TrailStart) > 600*time.Millisecond {
+		as.TrailActive = false
+		as.TrailPoints = as.TrailPoints[:0]
+		return
+	}
+	const maxTrailPts = 12
+	as.TrailPoints = append(as.TrailPoints, [3]float32{wx, wy, wz})
+	if len(as.TrailPoints) > maxTrailPts {
+		as.TrailPoints = as.TrailPoints[len(as.TrailPoints)-maxTrailPts:]
+	}
+}
+
+// GetTrailState returns the active trail state for rendering.
+// Returns (points, color, active). Points are world-space weapon tip positions.
+func (m *ModelManager) GetTrailState(entityID uint32) ([][3]float32, [3]float32, bool) {
+	as := m.GetAnimState(entityID)
+	if as == nil || !as.TrailActive || len(as.TrailPoints) < 2 {
+		return nil, [3]float32{}, false
+	}
+	return as.TrailPoints, as.TrailColor, true
+}
+
 func (m *ModelManager) GetAnimState(entityID uint32) *AnimState {
 	key := uint64(entityID)
 	if as, ok := m.animStates[key]; ok {
 		return as
 	}
 	return nil
+}
+
+// FindSpellFXTrigger finds a "Spell FX N" trigger index for an entity by name.
+// PS2 FindTrigger at 0x004464E8: searches the HSprite trigger array for a matching name hash.
+// Returns (triggerSlot 0-3, true) if the name matches "Spell FX 1-4", (-1, false) otherwise.
+func (m *ModelManager) FindSpellFXTrigger(entityID uint32, triggerName string) (int, bool) {
+	// Map trigger names to slot indices.
+	switch triggerName {
+	case "Spell FX 1":
+		return 0, true
+	case "Spell FX 2":
+		return 1, true
+	case "Spell FX 3":
+		return 2, true
+	case "Spell FX 4":
+		return 3, true
+	}
+	return -1, false
+}
+
+// ResetSpellFXTrigger clears the tripped flag for a trigger slot on an entity.
+// PS2 ResetTrigger at 0x00446550: sets triggerArray[idx*16+4] = 0.
+func (m *ModelManager) ResetSpellFXTrigger(entityID uint32, triggerIdx int) {
+	as := m.GetAnimState(entityID)
+	if as != nil && triggerIdx >= 0 && triggerIdx < 4 {
+		as.SpellFXTripped[triggerIdx] = false
+	}
+}
+
+// HasSpellFXTripped returns true if the trigger at the given slot has fired.
+// PS2 HasTripped at 0x00446538: returns triggerArray[idx*16+4] != 0.
+func (m *ModelManager) HasSpellFXTripped(entityID uint32, triggerIdx int) bool {
+	as := m.GetAnimState(entityID)
+	if as != nil && triggerIdx >= 0 && triggerIdx < 4 {
+		return as.SpellFXTripped[triggerIdx]
+	}
+	return false
 }
 
 // SetEntityController associates a SpriteAnimController with an entity's AnimState.
@@ -2057,9 +2213,9 @@ func (m *ModelManager) GetModelDefaultScale(modelID int32) float32 {
 	return model.DefaultScale
 }
 
-// ModelIsHumanoid returns true if the model has a TSlotList (supports equipment texture
-// swaps, helm attachment, and weapon bone attachment). Non-humanoid models (animals,
-// illusion forms like mouse) return false — weapons should be hidden, not drawn.
+// ModelIsHumanoid returns true if the model's ESF SkelType == 1 (dual-pair humanoid
+// animation with upper/lower body split). Used for animation dispatch, weapon rendering,
+// and equipment attachment decisions.
 func (m *ModelManager) ModelIsHumanoid(modelID int32) bool {
 	model, ok := m.cache[modelID]
 	return ok && model != nil && model.IsHumanoid
@@ -2074,8 +2230,8 @@ func (m *ModelManager) ModelRace(modelID int32) int32 {
 	return -1
 }
 
-// ModelSkelType returns the SkelType for a loaded model (PS2 VICSprite +0x1110).
-// Used to determine weapon attack animation type. Returns 0 if not loaded.
+// ModelSkelType returns the SkelType for a loaded model (PS2 VICSprite+0x194).
+// 0=simple, 1=humanoid dual-pair, 2=quadruped, 3=flying. Returns 0 if not loaded.
 func (m *ModelManager) ModelSkelType(modelID int32) int32 {
 	if model, ok := m.cache[modelID]; ok && model != nil {
 		return model.SkelType

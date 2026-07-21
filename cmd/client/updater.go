@@ -144,15 +144,8 @@ func (c *Client) runUpdateCheck() {
 			barY := screenHeight/2 + 10
 			fillW := int32(float32(barW) * state.progress)
 
-			if c.uiTheme == uiStyleModern {
-				rect := rl.Rectangle{X: float32(barX), Y: float32(barY), Width: float32(barW), Height: float32(barH)}
-				rl.DrawRectangleRounded(rect, 0.3, 4, rl.Color{R: 30, G: 30, B: 50, A: 200})
-				fillRect := rl.Rectangle{X: float32(barX), Y: float32(barY), Width: float32(fillW), Height: float32(barH)}
-				rl.DrawRectangleRounded(fillRect, 0.3, 4, rl.Color{R: 212, G: 192, B: 111, A: 220})
-			} else {
-				rl.DrawRectangle(barX-1, barY-1, barW+2, barH+2, rl.Color{R: 60, G: 60, B: 80, A: 200})
-				rl.DrawRectangle(barX, barY, fillW, barH, rl.Color{R: 212, G: 192, B: 111, A: 220})
-			}
+			rl.DrawRectangle(barX-1, barY-1, barW+2, barH+2, rl.Color{R: 60, G: 60, B: 80, A: 200})
+			rl.DrawRectangle(barX, barY, fillW, barH, rl.Color{R: 212, G: 192, B: 111, A: 220})
 			pctText := fmt.Sprintf("%d%%", int(state.progress*100))
 			c.drawCenteredText(pctText, barY+barH+4, 12, colorDim)
 		}

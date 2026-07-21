@@ -8,7 +8,7 @@ package game
 //   +0x18C0  maxBranchCount (int)
 //   +0x18C8  charge (float)
 // The bolt is rendered as a chain of line segments with random perpendicular
-// offsets, plus up to 3 smaller branching bolts that fork off the main bolt.
+// offsets.
 
 import (
 	"math"
@@ -19,7 +19,6 @@ import (
 
 const (
 	lightningSegments     = 16   // PS2: 17 control points, step=1/16
-	lightningBranchSegs   = 16   // PS2: branches use same VIBolt struct (16 segments)
 	lightningJitterScale  = 2.0  // max perpendicular displacement per segment
 	lightningChargeDecay  = 5.0  // PS2: deltaMs*5*0.001 = 5.0 charge/sec
 	lightningRegenMin     = 0.070 // PS2: min 70ms
@@ -31,14 +30,11 @@ const (
 type LightningBolt struct {
 	Source    [3]float32 // bolt start position
 	Target    [3]float32 // bolt end position
-	Color     [3]float32 // RGB (0-1)
-	Charge    float32    // current charge (1.0 = bright, decays to 0)
-	MaxBranch int        // max branching bolts (0-3, from Fields[3])
+	Color  [3]float32 // RGB (0-1)
+	Charge float32    // current charge (1.0 = bright, decays to 0)
 
 	// Pre-generated bolt shape (offsets perpendicular to bolt axis)
-	mainOffsets   [][2]float32 // [segment][perpAxis1, perpAxis2]
-	branchStart   []int        // which main segment each branch forks from
-	branchOffsets [][][2]float32 // [branch][segment][perpAxis1, perpAxis2]
+	mainOffsets [][2]float32 // [segment][perpAxis1, perpAxis2]
 
 	// Perpendicular basis vectors for the bolt
 	perp1 [3]float32 // perpendicular axis 1
@@ -49,17 +45,13 @@ type LightningBolt struct {
 }
 
 // NewLightningBolt creates a lightning bolt with the given parameters.
-func NewLightningBolt(sx, sy, sz, tx, ty, tz float32, color [3]float32, maxBranch int) *LightningBolt {
-	if maxBranch > 3 {
-		maxBranch = 3
-	}
+func NewLightningBolt(sx, sy, sz, tx, ty, tz float32, color [3]float32) *LightningBolt {
 	lb := &LightningBolt{
-		Source:    [3]float32{sx, sy, sz},
-		Target:    [3]float32{tx, ty, tz},
-		Color:     color,
-		Charge:    1.0,
-		MaxBranch: maxBranch,
-		alive:     true,
+		Source: [3]float32{sx, sy, sz},
+		Target: [3]float32{tx, ty, tz},
+		Color:  color,
+		Charge: 1.0,
+		alive:  true,
 	}
 	lb.computeBasis()
 	lb.regenerate()
@@ -124,25 +116,6 @@ func (lb *LightningBolt) regenerate() {
 		}
 	}
 
-	// Generate branches
-	lb.branchStart = lb.branchStart[:0]
-	lb.branchOffsets = lb.branchOffsets[:0]
-	for b := 0; b < lb.MaxBranch; b++ {
-		// Branch forks from a random main segment (avoid endpoints)
-		forkSeg := 1 + rand.Intn(n-2)
-		lb.branchStart = append(lb.branchStart, forkSeg)
-
-		bOffsets := make([][2]float32, lightningBranchSegs+1)
-		bOffsets[0] = lb.mainOffsets[forkSeg] // starts at fork point
-		for i := 1; i <= lightningBranchSegs; i++ {
-			// Branches diverge from the fork point
-			bOffsets[i] = [2]float32{
-				bOffsets[i-1][0] + (rand.Float32()*2-1)*lightningJitterScale*0.6,
-				bOffsets[i-1][1] + (rand.Float32()*2-1)*lightningJitterScale*0.6,
-			}
-		}
-		lb.branchOffsets = append(lb.branchOffsets, bOffsets)
-	}
 }
 
 // SetEndpoints updates the bolt source and target positions.
@@ -221,41 +194,6 @@ func (lb *LightningBolt) Render() {
 	lb.drawChain(lb.Source, lb.Target, lb.mainOffsets, n, mainColor)
 	// Draw core (slightly offset for glow effect)
 	lb.drawChain(lb.Source, lb.Target, lb.mainOffsets, n, coreColor)
-
-	// Draw branches (dimmer)
-	branchColor := rl.Color{
-		R: uint8(float32(mainColor.R) * 0.6),
-		G: uint8(float32(mainColor.G) * 0.6),
-		B: uint8(float32(mainColor.B) * 0.6),
-		A: uint8(float32(mainColor.A) * 0.5),
-	}
-	for b := 0; b < len(lb.branchStart); b++ {
-		forkT := float32(lb.branchStart[b]) / float32(n)
-		// Branch source = point on main bolt at fork
-		bsx := lb.Source[0] + (lb.Target[0]-lb.Source[0])*forkT
-		bsy := lb.Source[1] + (lb.Target[1]-lb.Source[1])*forkT
-		bsz := lb.Source[2] + (lb.Target[2]-lb.Source[2])*forkT
-		bsx += lb.perp1[0]*lb.mainOffsets[lb.branchStart[b]][0] + lb.perp2[0]*lb.mainOffsets[lb.branchStart[b]][1]
-		bsy += lb.perp1[1]*lb.mainOffsets[lb.branchStart[b]][0] + lb.perp2[1]*lb.mainOffsets[lb.branchStart[b]][1]
-		bsz += lb.perp1[2]*lb.mainOffsets[lb.branchStart[b]][0] + lb.perp2[2]*lb.mainOffsets[lb.branchStart[b]][1]
-
-		// Branch target = perpendicular offset from main bolt direction
-		endT := forkT + 0.3
-		if endT > 1 {
-			endT = 1
-		}
-		btx := lb.Source[0] + (lb.Target[0]-lb.Source[0])*endT
-		bty := lb.Source[1] + (lb.Target[1]-lb.Source[1])*endT
-		btz := lb.Source[2] + (lb.Target[2]-lb.Source[2])*endT
-		lastOff := lb.branchOffsets[b][lightningBranchSegs]
-		btx += lb.perp1[0]*lastOff[0] + lb.perp2[0]*lastOff[1]
-		bty += lb.perp1[1]*lastOff[0] + lb.perp2[1]*lastOff[1]
-		btz += lb.perp1[2]*lastOff[0] + lb.perp2[2]*lastOff[1]
-
-		bSrc := [3]float32{bsx, bsy, bsz}
-		bTgt := [3]float32{btx, bty, btz}
-		lb.drawChain(bSrc, bTgt, lb.branchOffsets[b], lightningBranchSegs, branchColor)
-	}
 }
 
 // drawChain draws a segmented line with perpendicular offsets.
@@ -292,11 +230,11 @@ func NewLightningSystem() *LightningSystem {
 }
 
 // GetOrCreate returns an existing bolt or creates a new one.
-func (ls *LightningSystem) GetOrCreate(key uint64, sx, sy, sz, tx, ty, tz float32, color [3]float32, maxBranch int) *LightningBolt {
+func (ls *LightningSystem) GetOrCreate(key uint64, sx, sy, sz, tx, ty, tz float32, color [3]float32) *LightningBolt {
 	if lb, ok := ls.bolts[key]; ok {
 		return lb
 	}
-	lb := NewLightningBolt(sx, sy, sz, tx, ty, tz, color, maxBranch)
+	lb := NewLightningBolt(sx, sy, sz, tx, ty, tz, color)
 	ls.bolts[key] = lb
 	return lb
 }

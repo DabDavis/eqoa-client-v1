@@ -329,14 +329,8 @@ func (c *Client) drawLoginField(x, y, w, h int32, text string, focused, isPasswo
 		displayText += "|"
 	}
 
-	if c.uiTheme == uiStyleModern {
-		rect := rl.Rectangle{X: float32(x), Y: float32(y), Width: float32(w), Height: float32(h)}
-		rl.DrawRectangleRounded(rect, 0.15, 4, fieldBg)
-		rl.DrawRectangleRoundedLines(rect, 0.15, 4, border)
-	} else {
-		rl.DrawRectangle(x-2, y-2, w+4, h+4, border)
-		rl.DrawRectangle(x, y, w, h, fieldBg)
-	}
+	rl.DrawRectangle(x-2, y-2, w+4, h+4, border)
+	rl.DrawRectangle(x, y, w, h, fieldBg)
 
 	c.drawText(displayText, x+6, y+7, 16, rl.White)
 }

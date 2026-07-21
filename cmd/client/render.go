@@ -346,7 +346,6 @@ func (c *Client) drawWorld() {
 	// Player animation — resolved by AnimationManager (combat, debug, landing).
 	// Returns dual-pair: locoAnim (lower body) + actionAnim (upper body override).
 	playerEquip := entityEquipment(&p, c.modelMgr)
-	c.applyTransmog(playerEquip)
 	playerLocoAnim, playerActionAnim := c.animMgr.ResolvePlayerAnim(gs, &p, c.engine, now)
 
 	c.animMgr.ConsumePendingPlayerHitFX()
@@ -370,10 +369,13 @@ func (c *Client) drawWorld() {
 		}
 		// Draw player weapons (hide in non-humanoid forms like mouse illusion).
 		if c.modelMgr != nil && c.modelMgr.ModelIsHumanoid(playerModelID) {
-			pri, sec, sh := c.applyTransmogWeapons(p.PrimaryWeapon, p.SecondaryWeapon, p.Shield)
-			c.modelMgr.DrawWeapon(int32(pri), playerModelID, p.X, p.Y, p.Z, p.Facing, models.WeaponSlotPrimary)
-			c.modelMgr.DrawWeapon(int32(sec), playerModelID, p.X, p.Y, p.Z, p.Facing, models.WeaponSlotSecondary)
-			c.modelMgr.DrawWeapon(int32(sh), playerModelID, p.X, p.Y, p.Z, p.Facing, models.WeaponSlotShield)
+			c.modelMgr.DrawWeapon(int32(p.PrimaryWeapon), playerModelID, p.X, p.Y, p.Z, p.Facing, models.WeaponSlotPrimary)
+			c.modelMgr.DrawWeapon(int32(p.SecondaryWeapon), playerModelID, p.X, p.Y, p.Z, p.Facing, models.WeaponSlotSecondary)
+			c.modelMgr.DrawWeapon(int32(p.Shield), playerModelID, p.X, p.Y, p.Z, p.Facing, models.WeaponSlotShield)
+			// Record weapon tip position for trail rendering.
+			if wx, wy, wz, ok := c.modelMgr.WeaponPointWorldPos(playerModelID, p.ObjectID, [3]float32{0, 0, 0}, p.X, p.Y, p.Z, p.Facing, models.WeaponSlotPrimary); ok {
+				c.modelMgr.RecordTrailPoint(p.ObjectID, wx, wy, wz)
+			}
 		}
 		// Update bone/weapon emitter positions while player's bone matrices are valid.
 		c.updateEntityEmitterPositions(&p)
@@ -598,7 +600,9 @@ func (c *Client) drawWorld() {
 	// Draw spell visual effects (particles, lightning, sprites).
 	c.drawSpellEffects(gs, camera)
 
-	// NavMesh debug overlay (F7)
+	// Draw weapon swing trails (PS2 ProcessWeaponTrails port).
+	c.drawWeaponTrails(gs)
+
 	if c.navDebug {
 		c.drawNavDebug(gs)
 	}
@@ -1241,7 +1245,7 @@ func (c *Client) triggerSpellAnim(actorObjID uint32, animByte byte) {
 	if c.animMgr == nil {
 		return
 	}
-	// For the local player, use the player combat state.
+	// For the local player, use the player combat state + set action on controller.
 	if c.engine != nil && c.engine.State != nil && actorObjID == c.engine.State.Player.ObjectID {
 		cs := &c.animMgr.playerCombat
 		modelID := int32(c.engine.State.Player.ModelID)
@@ -1250,9 +1254,12 @@ func (c *Client) triggerSpellAnim(actorObjID uint32, animByte byte) {
 		}
 		cs.combatAnim = animByte
 		cs.combatAnimEnd = time.Now().Add(c.animMgr.animDur(modelID, animByte))
-		// Don't set inCombat — spell cast anims should not trigger combat stance.
-		// Combat stance only comes from actual attacks/hits (attackCount changes).
 		cs.lastActivity = time.Now()
+		// Set action on controller so applySkeletal tracks play-once completion
+		// and IsActionFinished() returns true when the anim finishes.
+		if ctrl := c.animMgr.PlayerController(); ctrl != nil {
+			ctrl.SetAction(int(animByte))
+		}
 		return
 	}
 	// For other entities, use the per-entity combat state.
@@ -1276,8 +1283,11 @@ func (c *Client) triggerSpellAnim(actorObjID uint32, animByte byte) {
 	}
 	es.combatAnim = animByte
 	es.combatAnimEnd = time.Now().Add(c.animMgr.animDur(modelID, animByte))
-	// Don't set inCombat — spell cast anims should not trigger combat stance.
 	es.lastActivity = time.Now()
+	// Set action on controller so applySkeletal tracks play-once completion.
+	if ctrl := c.animMgr.EntityController(actorObjID); ctrl != nil {
+		ctrl.SetAction(int(animByte))
+	}
 }
 
 // updateBoneEmitters manages CSprite bone-attached particle emitters for all entities.
@@ -1536,6 +1546,42 @@ func (c *Client) updateWeaponEmitters(gs *game.GameState, ps *game.ParticleSyste
 	}
 }
 
+// drawWeaponTrails renders weapon swing trail lines for all entities with active trails.
+// PS2 ProcessWeaponTrails builds quad strips from bone history; we simplify to line chains
+// with alpha fade from newest (bright) to oldest (transparent).
+func (c *Client) drawWeaponTrails(gs *game.GameState) {
+	if c.modelMgr == nil {
+		return
+	}
+	// Draw trail for player.
+	c.drawEntityTrail(gs.Player.ObjectID)
+	// Draw trails for visible entities.
+	for _, ent := range gs.Entities {
+		c.drawEntityTrail(ent.ObjectID)
+	}
+}
+
+func (c *Client) drawEntityTrail(entityID uint32) {
+	pts, color, active := c.modelMgr.GetTrailState(entityID)
+	if !active || len(pts) < 2 {
+		return
+	}
+	n := len(pts)
+	for i := 1; i < n; i++ {
+		// Alpha fades from oldest (0) to newest (1.0).
+		alpha := float32(i) / float32(n)
+		clr := rl.Color{
+			R: uint8(color[0] * 255 * alpha),
+			G: uint8(color[1] * 255 * alpha),
+			B: uint8(color[2] * 255 * alpha),
+			A: uint8(200 * alpha),
+		}
+		prev := rl.Vector3{X: pts[i-1][0], Y: pts[i-1][1], Z: pts[i-1][2]}
+		cur := rl.Vector3{X: pts[i][0], Y: pts[i][1], Z: pts[i][2]}
+		rl.DrawLine3D(prev, cur, clr)
+	}
+}
+
 // getParticleSystem returns the active ParticleSystem, or nil.
 func (c *Client) getParticleSystem() *game.ParticleSystem {
 	if c.engine == nil || c.engine.SpellFX == nil {
@@ -1544,133 +1590,43 @@ func (c *Client) getParticleSystem() *game.ParticleSystem {
 	return c.engine.SpellFX.Particles
 }
 
-func portalCentroidVec(p esf.ZoneRoomPortal) (float32, float32, float32) {
-	if len(p.Vertices) == 0 {
-		return 0, 0, 0
-	}
-	var sx, sy, sz float32
-	for _, v := range p.Vertices {
-		sx += v.X
-		sy += v.Y
-		sz += v.Z
-	}
-	n := float32(len(p.Vertices))
-	return sx / n, sy / n, sz / n
-}
-
-// drawNavDebug renders navmesh triangles and current path as 3D wireframes.
+// drawNavDebug renders current grid path as 3D wireframes.
 func (c *Client) drawNavDebug(gs *game.GameState) {
+	p := &gs.Player
+
+	if !c.engine.CombatEngaged || c.targetObjectID == 0 {
+		return
+	}
+	ent, ok := gs.Entities[c.targetObjectID]
+	if !ok {
+		return
+	}
+
 	var zt *terrain.ZoneTerrain
 	if c.terrainLoader != nil && c.terrainZoneIdx >= 0 {
 		zt = c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
 	}
-	if zt == nil || zt.Nav == nil {
-		return
-	}
 
-	p := &gs.Player
-	navClr := rl.Color{R: 0, G: 100, B: 255, A: 80}
+	playerPos := rl.Vector3{X: p.X, Y: p.Y + 1, Z: p.Z}
+	targetPos := rl.Vector3{X: ent.X, Y: ent.Y + 1, Z: ent.Z}
+	rl.DrawLine3D(playerPos, targetPos, rl.Color{R: 0, G: 255, B: 0, A: 120})
 
-	// Draw walkable navmesh triangles near player (within 100 units)
-	const drawRange = float32(100)
-	for _, t := range zt.Nav.Tris {
-		dx := t.CX - p.X
-		dz := t.CZ - p.Z
-		if dx*dx+dz*dz > drawRange*drawRange {
-			continue
-		}
-		// Offset Y slightly above ground to avoid z-fighting
-		yo := float32(0.15)
-		v0 := rl.Vector3{X: t.X0, Y: t.Y0 + yo, Z: t.Z0}
-		v1 := rl.Vector3{X: t.X1, Y: t.Y1 + yo, Z: t.Z1}
-		v2 := rl.Vector3{X: t.X2, Y: t.Y2 + yo, Z: t.Z2}
-		rl.DrawLine3D(v0, v1, navClr)
-		rl.DrawLine3D(v1, v2, navClr)
-		rl.DrawLine3D(v2, v0, navClr)
-	}
-
-	// Draw actor obstacle footprints as red rectangles
-	if zt != nil {
-		obsClr := rl.Color{R: 255, G: 50, B: 50, A: 60}
-		for _, obs := range zt.Obstacles {
-			dx := obs.CX - p.X
-			dz := obs.CZ - p.Z
-			if dx*dx+dz*dz > 100*100 {
-				continue
+	if c.navGridPath != nil {
+		prev := playerPos
+		pathClr := rl.Color{R: 0, G: 255, B: 100, A: 255}
+		for i, wp := range c.navGridPath {
+			wpy := p.Y + 0.5
+			if zt != nil {
+				if h, ok := zt.SampleHeight(wp.X, wp.Z, p.Y); ok { wpy = h + 0.5 }
 			}
-			yo := float32(0.2)
-			rl.DrawLine3D(
-				rl.Vector3{X: obs.MinX, Y: p.Y + yo, Z: obs.MinZ},
-				rl.Vector3{X: obs.MaxX, Y: p.Y + yo, Z: obs.MinZ}, obsClr)
-			rl.DrawLine3D(
-				rl.Vector3{X: obs.MaxX, Y: p.Y + yo, Z: obs.MinZ},
-				rl.Vector3{X: obs.MaxX, Y: p.Y + yo, Z: obs.MaxZ}, obsClr)
-			rl.DrawLine3D(
-				rl.Vector3{X: obs.MaxX, Y: p.Y + yo, Z: obs.MaxZ},
-				rl.Vector3{X: obs.MinX, Y: p.Y + yo, Z: obs.MaxZ}, obsClr)
-			rl.DrawLine3D(
-				rl.Vector3{X: obs.MinX, Y: p.Y + yo, Z: obs.MaxZ},
-				rl.Vector3{X: obs.MinX, Y: p.Y + yo, Z: obs.MinZ}, obsClr)
-			// Door probing removed from render — too expensive (36 CalcFit rays per frame)
-		}
-	}
-
-	// Draw portal doorways as cyan wireframes
-	if zt != nil && len(zt.Rooms) > 0 {
-		portalClr := rl.Color{R: 0, G: 255, B: 255, A: 120}
-		for _, room := range zt.Rooms {
-			for _, portal := range room.Portals {
-				if len(portal.Vertices) < 2 {
-					continue
-				}
-				// Only draw portals near player
-				cx, cy, cz := portalCentroidVec(portal)
-				ddx := cx - p.X
-				ddz := cz - p.Z
-				if ddx*ddx+ddz*ddz > 150*150 {
-					continue
-				}
-				// Draw portal polygon edges
-				for vi := 0; vi < len(portal.Vertices); vi++ {
-					v0 := portal.Vertices[vi]
-					v1 := portal.Vertices[(vi+1)%len(portal.Vertices)]
-					rl.DrawLine3D(
-						rl.Vector3{X: v0.X, Y: v0.Y, Z: v0.Z},
-						rl.Vector3{X: v1.X, Y: v1.Y, Z: v1.Z},
-						portalClr,
-					)
-				}
-				// Sphere at centroid
-				rl.DrawSphere(rl.Vector3{X: cx, Y: cy, Z: cz}, 0.2, portalClr)
+			pos := rl.Vector3{X: wp.X, Y: wpy, Z: wp.Z}
+			rl.DrawLine3D(prev, pos, pathClr)
+			if i == c.navGridIdx {
+				rl.DrawSphere(pos, 0.3, rl.Color{R: 255, G: 255, B: 0, A: 255})
+			} else if i > c.navGridIdx {
+				rl.DrawSphere(pos, 0.15, pathClr)
 			}
-		}
-	}
-
-	// Draw grid path debug
-	if c.engine.CombatEngaged && c.targetObjectID != 0 {
-		if ent, ok := gs.Entities[c.targetObjectID]; ok {
-			playerPos := rl.Vector3{X: p.X, Y: p.Y + 1, Z: p.Z}
-			targetPos := rl.Vector3{X: ent.X, Y: ent.Y + 1, Z: ent.Z}
-			rl.DrawLine3D(playerPos, targetPos, rl.Color{R: 0, G: 255, B: 0, A: 120})
-
-			if c.navGridPath != nil {
-				prev := playerPos
-				pathClr := rl.Color{R: 0, G: 255, B: 100, A: 255}
-				for i, wp := range c.navGridPath {
-					wpy := p.Y + 0.5
-					if zt != nil {
-						if h, ok := zt.SampleHeight(wp.X, wp.Z, p.Y); ok { wpy = h + 0.5 }
-					}
-					pos := rl.Vector3{X: wp.X, Y: wpy, Z: wp.Z}
-					rl.DrawLine3D(prev, pos, pathClr)
-					if i == c.navGridIdx {
-						rl.DrawSphere(pos, 0.3, rl.Color{R: 255, G: 255, B: 0, A: 255})
-					} else if i > c.navGridIdx {
-						rl.DrawSphere(pos, 0.15, pathClr)
-					}
-					prev = pos
-				}
-			}
+			prev = pos
 		}
 	}
 }

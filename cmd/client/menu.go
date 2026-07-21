@@ -514,8 +514,9 @@ func (c *Client) menuCrossAction(gs *game.GameState) {
 			// LFG: toggle registration
 			c.engine.SendLFGToggle(!gs.LFGRegistered)
 		}
-	case 5: // Settings — all interactions handled by mouse click in drawSettingsGraphics
-	case 6: // Music
+	case 5: // Guild
+	case 6: // Settings — all interactions handled by mouse click in drawSettingsGraphics
+	case 7: // Music
 		idx := c.menuRow + c.menuScroll
 		if idx >= 0 && idx < len(titleBGMTracks) {
 			track := titleBGMTracks[idx]
@@ -540,7 +541,7 @@ func (c *Client) drawMenu() {
 	// Tab bar — scrolling wheel when tabs exceed panel width.
 	tabY := menuYPos() + menuHdrH
 	rl.DrawRectangle(menuXPos()+1, tabY, menuW-2, menuTabH, rl.Color{R: 30, G: 28, B: 40, A: 255})
-	tabs := []string{"Menu", "Inventory", "Character", "Nearby", "Social", "Settings", "Music", "Lore"}
+	tabs := []string{"Menu", "Inventory", "Character", "Nearby", "Social", "Guild", "Settings", "Music", "Lore"}
 	if c.menuTab < 0 || c.menuTab >= len(tabs) {
 		c.menuTab = 0
 	}
@@ -730,8 +731,7 @@ const (
 )
 
 // drawEquipPreview renders the player's 3D character model preview.
-// Delegates to uiCharPreview widget. Transmog overrides are applied
-// inside uiCharPreview via the EquipmentState (same as before).
+// Delegates to uiCharPreview widget.
 func (c *Client) drawEquipPreview(x, y, w, h int32) {
 	gs := c.engine.State
 	if gs == nil {
@@ -799,26 +799,6 @@ func (c *Client) drawMenuInventory(startY, contentH int32) {
 		rl.DrawRectangleLines(pvX, pvY, pvW, pvH, rl.Color{R: 60, G: 55, B: 80, A: 255})
 		c.drawEquipPreview(pvX+2, pvY+2, pvW-4, pvH-22)
 
-		// Transmog toggle button at bottom of preview panel
-		tmBtnY := pvY + pvH - 20
-		tmBtnW := pvW - 4
-		tmLabel := "Transmog"
-		tmColor := rl.Color{R: 200, G: 180, B: 100, A: 220}
-		if c.transmogOpen {
-			tmColor = rl.Color{R: 255, G: 220, B: 100, A: 255}
-		}
-		tmHover := mx >= pvX+2 && mx < pvX+2+tmBtnW && my >= tmBtnY && my < tmBtnY+18
-		tmBg := rl.Color{R: 30, G: 30, B: 45, A: 255}
-		if tmHover {
-			tmBg = rl.Color{R: 50, G: 50, B: 70, A: 255}
-		}
-		rl.DrawRectangle(pvX+2, tmBtnY, tmBtnW, 18, tmBg)
-		tmW := c.measureText(tmLabel, 10)
-		c.drawText(tmLabel, pvX+2+(tmBtnW-tmW)/2, tmBtnY+3, 10, tmColor)
-		if tmHover && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
-			c.transmogOpen = !c.transmogOpen
-		}
-
 		previewW = pvW + 6 // panel width + gap
 	}
 
@@ -826,13 +806,9 @@ func (c *Client) drawMenuInventory(startY, contentH int32) {
 	listLeftX := menuXPos() + menuPad + previewW
 	listW := menuW - menuPad*2 - previewW
 
-	// ── Equipped tab: grid layout or transmog panel ──────────────────
+	// ── Equipped tab: grid layout ──────────────────
 	if c.invSubTab == 0 {
-		if c.transmogOpen {
-			c.drawTransmogPanel(listLeftX, startY, listW, listH, mx, my)
-		} else {
-			c.drawEquippedGrid(items, listLeftX, startY, listW, listH, mx, my)
-		}
+		c.drawEquippedGrid(items, listLeftX, startY, listW, listH, mx, my)
 		return
 	}
 
@@ -2374,13 +2350,6 @@ func (c *Client) drawSettingsGraphics(y, rowX, rowW, mx, my int32, clicked bool,
 	if resolutionPresets == nil {
 		buildResolutionPresets()
 	}
-
-	// --- UI Theme ---
-	themeIdx := int(c.uiTheme)
-	if c.uiRadioGroup(px, y, "UI Theme", []string{"Modern", "Classic"}, &themeIdx) {
-		c.uiTheme = uiStyle(themeIdx)
-	}
-	y += 18 + rowH + 8
 
 	// --- Window Mode ---
 	if c.uiRadioGroup(px, y, "Window Mode", windowModeLabels[:], &c.windowMode) {

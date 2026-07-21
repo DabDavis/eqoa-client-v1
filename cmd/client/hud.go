@@ -1043,7 +1043,7 @@ func (c *Client) drawSpellEffects(gs *game.GameState, camera rl.Camera3D) {
 			// Primary bolt
 			key := uint64(casterID)<<32 | uint64(targetID)
 			activeLightningKeys[key] = true
-			bolt := c.lightningSystem.GetOrCreate(key, sx, sy, sz, dx, dy, dz, color, int(fx.LightningMaxBranch))
+			bolt := c.lightningSystem.GetOrCreate(key, sx, sy, sz, dx, dy, dz, color)
 			bolt.SetEndpoints(sx, sy, sz, dx, dy, dz)
 			bolt.Color = color
 			if fx.LightningFlashed {
@@ -1055,7 +1055,7 @@ func (c *Client) drawSpellEffects(gs *game.GameState, camera rl.Camera3D) {
 				lx, ly, lz := c.resolveBonePos(gs, casterID, 1)
 				key2 := key ^ 0x1 // distinct key for secondary bolt
 				activeLightningKeys[key2] = true
-				bolt2 := c.lightningSystem.GetOrCreate(key2, lx, ly, lz, dx, dy, dz, color, int(fx.LightningMaxBranch))
+				bolt2 := c.lightningSystem.GetOrCreate(key2, lx, ly, lz, dx, dy, dz, color)
 				bolt2.SetEndpoints(lx, ly, lz, dx, dy, dz)
 				bolt2.Color = color
 				if fx.LightningFlashed {

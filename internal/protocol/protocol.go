@@ -152,7 +152,7 @@ const (
 const (
 	OpcodeBuddyRemove       GameOpcode = 0x0369 // Buddy remove (client)
 	OpcodeBuddyListEntry    GameOpcode = 0x03D5 // Buddy entry (server)
-	OpcodeBuddyOnlineStatus GameOpcode = 0x03D6 // Buddy online/offline notification (server)
+	OpcodeCollectionRemove  GameOpcode = 0x03D6 // PS2: zigzag key → tree remove (inventory/quest/buddy)
 	OpcodeBuddyListFull     GameOpcode = 0x03D7 // Buddy list full
 	OpcodeAddBuddyFailed    GameOpcode = 0x03D8 // Add buddy failed
 )
@@ -198,20 +198,20 @@ const (
 const (
 	OpcodeAdminCode                     GameOpcode = 0x0700 // Admin Code
 	OpcodeServerLoginResponse           GameOpcode = 0x0728 // Post-auth world entry (server)
-	OpcodeBadLoginPassword              GameOpcode = 0x0729 // Bad Login
+	OpcodeNPCInteractResult             GameOpcode = 0x0729 // PS2: NPC interaction result (entityID+actionType+name)
 	OpcodeNotSubscribed                 GameOpcode = 0x072B // Not Subscribed
 	OpcodeReconnectWorldEntry           GameOpcode = 0x0758 // Reconnect world entry (server)
 	OpcodeTarget                        GameOpcode = 0x0760 // Target
 	OpcodeTargetInformation             GameOpcode = 0x0761 // Target Info
-	OpcodeBuddyInvite                   GameOpcode = 0x076F // Buddy Invite
+	OpcodeBuffNotification              GameOpcode = 0x076F // PS2: Buff/debuff applied (buffID+name, sends ack 0x0368)
 	OpcodeGroupInviteAcceptedMessage    GameOpcode = 0x0770 // Group Accept Msg
 	OpcodeBuddyListStuff                GameOpcode = 0x0771 // Buddy List Stuff
 	OpcodeCreateGroup                   GameOpcode = 0x0772 // Display Group
-	OpcodeGroupInviteResponse           GameOpcode = 0x0773 // Group Invite
+	OpcodeNPCInteractResult2            GameOpcode = 0x0773 // PS2: NPC interaction result (same handler as 0x0729)
 	OpcodeResourceUpdate                GameOpcode = 0x0775 // Resource Update
-	OpcodeDisconnectNoError             GameOpcode = 0x0777 // Disconnect
+	OpcodeCombatEnd                     GameOpcode = 0x0777 // PS2: Combat end / target clear (no data, resets combat)
 	OpcodeOutMatched                    GameOpcode = 0x077A // Outmatched
-	OpcodeServerAssignment              GameOpcode = 0x0790 // Server/world assignment (server)
+	OpcodeStatsUpdate                   GameOpcode = 0x0790 // PS2: XP/stats update (int64+int32+int64, triggers UI refresh)
 	OpcodeEntityUpdateAudio             GameOpcode = 0x07A1 // Entity update + stop audio (server)
 	OpcodeEntityUpdateMinimal           GameOpcode = 0x07A2 // Entity update minimal (server)
 	OpcodeChatMessage                   GameOpcode = 0x07A3 // Chat message (server)
@@ -303,7 +303,7 @@ var opcodeNames = map[GameOpcode]string{
 	0x00DB: "DamageIndication", 0x00EC: "ForceDisconnect",
 	0x00F8: "PlayerSpeed", 0x00FC: "EntityStateRefresh",
 	0x00FD: "EntityDataUpdate", 0x00FE: "ClearSpellBar", 0x00FF: "FullEntityRefresh",
-	0x0369: "BuddyRemove", 0x03D5: "BuddyListEntry", 0x03D6: "BuddyOnlineStatus",
+	0x0369: "BuddyRemove", 0x03D5: "BuddyListEntry", 0x03D6: "CollectionRemove",
 	0x03D7: "BuddyListFull", 0x03D8: "AddBuddyFailed",
 	0x0468: "GuildInfo", 0x0579: "GuildWorldEntry",
 	0x057A: "GuildInviteStuff",
@@ -312,13 +312,13 @@ var opcodeNames = map[GameOpcode]string{
 	0x062F: "ServerDisbandGroup", 0x069A: "RemoveGroupMember",
 	0x069C: "GroupStuff", 0x069E: "GroupChat",
 	0x0700: "AdminCode", 0x0728: "ServerLoginResponse",
-	0x0729: "BadLoginPassword", 0x072B: "NotSubscribed",
+	0x0729: "NPCInteractResult", 0x072B: "NotSubscribed",
 	0x0758: "ReconnectWorldEntry",
 	0x0760: "Target", 0x0761: "TargetInformation",
-	0x076F: "BuddyInvite", 0x0770: "GroupInviteAccepted",
-	0x0771: "BuddyListStuff", 0x0772: "CreateGroup", 0x0773: "GroupInviteResponse",
-	0x0775: "ResourceUpdate", 0x0777: "DisconnectNoError", 0x077A: "OutMatched",
-	0x0790: "ServerAssignment",
+	0x076F: "BuffNotification", 0x0770: "GroupInviteAccepted",
+	0x0771: "BuddyListStuff", 0x0772: "CreateGroup", 0x0773: "NPCInteractResult2",
+	0x0775: "ResourceUpdate", 0x0777: "CombatEnd", 0x077A: "OutMatched",
+	0x0790: "StatsUpdate",
 	0x07A1: "EntityUpdateAudio", 0x07A2: "EntityUpdateMinimal",
 	0x07A3: "ChatMessage", 0x07A4: "LoggedInElsewhereDC",
 	0x07B0: "ZoneTransferInit", 0x07B2: "ZoneTransferConfirm",

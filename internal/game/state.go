@@ -65,6 +65,16 @@ type ServerInfo struct {
 	IP         string
 }
 
+// GuildMember represents one member in the guild roster.
+// PS2: 0x44 (68) bytes per member in a binary tree at entity+0x288.
+type GuildMember struct {
+	CharID int64
+	Name   string
+	Level  int
+	Class  int
+	Online bool
+}
+
 // CharInfo holds character data from the character select list.
 type CharInfo struct {
 	ServerID uint32
@@ -187,6 +197,11 @@ type Entity struct {
 	// NPCType from state channel offsets 145-146 (uint16 LE).
 	// 0x8000=NPC, 0x8100=merchant, 0x8006=quest giver, 0x8008=guild board, etc.
 	NPCType uint16
+
+	// Experience from StatsUpdate opcode 0x0790.
+	// PS2: stored at entity+0x4F0F0 (int64) and +0x4F100 (int64 max).
+	Experience    int64
+	ExperienceMax int64
 
 	// PS2 VIWalkControl interpolation (InitParms exponential decay + velocity dead reckoning).
 	// smoothRate values from InitParms disassembly (25 live instances confirmed).
@@ -374,6 +389,7 @@ type GameState struct {
 	PlayerHitTime       time.Time // last time player took damage (for hit reaction anim)
 	PlayerSwingTime     time.Time // last time server confirmed player melee swing (CastingCombat source==SELF)
 	PlayerInCombat      bool      // one-shot: server confirmed player auto-attack (consumed by animation layer)
+	CombatEnded         bool      // PS2 0x0777: server explicitly ended combat (consumed by animation layer)
 	PendingPlayerHitFX  int       // queued hit FX count (consumed by applySkeletal at swing impact)
 	HitFXTarget         uint32    // target ObjectID for pending hit FX
 	LastAutoAttackEvent time.Time // last CastingCombat auto-attack involving player (combat-end detection)
@@ -428,8 +444,20 @@ type GameState struct {
 	QuestProgressF    [4]float32 // quest progress float values
 
 	// Zone transfer state (from opcodes 0x07B0/0x07B2)
-	ZoneTransferActive bool   // true during zone loading
-	ZoneTransferZone   string // target zone path
+	ZoneTransferActive     bool   // true during zone loading
+	ZoneTransferZone       string // target zone path
+	ZoneTransferState      int    // PS2 state machine: 0=idle, 1-5=phases
+	ZoneTransferProxyCount int    // number of zone proxies received in sub-type 2
+	PendingZoneIdx         int    // PS2 entity+0x4F0E8: zone index about to be loaded
+
+	// Quest journal (PS2 opcode 0x1206 sub-types 0x80-0x89)
+	QuestJournal []QuestJournalEntry
+
+	// Guild state (PS2 opcode 0x0468 sub-types)
+	GuildName    string        // from sub-type 1 (0x80 blob UTF-16)
+	GuildMOTD    string        // from sub-type 1 (0x200 blob UTF-16)
+	GuildMembers []GuildMember // from sub-type 3 (member list)
+	GuildLeader  bool          // from sub-type 13/14 (leader status)
 
 	// NPC interaction (from opcode 0x001C)
 	NPCInteractionType int // 18=info, 16=trainer, 3=merchant, 4=blacksmith, 6=quest, 7=banker
@@ -558,8 +586,8 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleErrorMessage(msg)
 	case protocol.OpcodeGroupChat:
 		gs.handleGroupChat(msg)
-	case protocol.OpcodeGroupInviteResponse:
-		gs.handleGroupInvite(msg)
+	case protocol.OpcodeNPCInteractResult2:
+		gs.handleNPCInteractResult(msg)
 	case protocol.OpcodeCreateGroup:
 		gs.handleCreateGroup(msg)
 	case protocol.OpcodeRemoveGroupMember:
@@ -664,6 +692,8 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleCastingCombat(msg)
 	case protocol.OpcodeSkillBarAck:
 		gs.handleSkillBarAck(msg)
+	case protocol.OpcodeNPCInteractResult:
+		gs.handleNPCInteractResult(msg)
 
 	// Item durability / blacksmith
 	case protocol.OpcodeAdjustItemHP:
@@ -708,10 +738,10 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 	// Social / Guild
 	case protocol.OpcodeBuddyListEntry:
 		gs.handleBuddyListEntry(msg)
-	case protocol.OpcodeBuddyOnlineStatus:
+	case protocol.OpcodeCollectionRemove:
 		gs.handleBuddyOnlineStatus(msg)
-	case protocol.OpcodeBuddyInvite:
-		gs.handleBuddyInvite(msg)
+	case protocol.OpcodeBuffNotification:
+		gs.handleBuffNotification(msg)
 	case protocol.OpcodeAddBuddyFailed:
 		gs.handleAddBuddyFailed(msg)
 	case protocol.OpcodeBuddyListStuff:
@@ -742,8 +772,8 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleReconnectWorldEntry(msg)
 	case protocol.OpcodeWorldEntry:
 		gs.handleWorldEntry(msg)
-	case protocol.OpcodeServerAssignment:
-		gs.handleServerAssignment(msg)
+	case protocol.OpcodeStatsUpdate:
+		gs.handleStatsUpdate(msg)
 	case protocol.OpcodeZoneTransferInit:
 		gs.handleZoneTransferInit(msg)
 	case protocol.OpcodeZoneTransferConfirm:
@@ -768,7 +798,11 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleAdminShutdown(msg)
 
 	// Disconnect opcodes — log prominently for debugging
-	case protocol.OpcodeDisconnectNoError, protocol.OpcodeCharacterModifiedDisconnect,
+	case protocol.OpcodeCombatEnd:
+		gs.handleCombatEnd(msg)
+
+	// Disconnect opcodes — log prominently for debugging
+	case protocol.OpcodeCharacterModifiedDisconnect,
 		protocol.OpcodeDisconnectClient, protocol.OpcodeLoggedInFromAnotherLocationDC:
 		log.Printf("*** SERVER DISCONNECT: opcode=0x%04X dataLen=%d ***", uint16(opcode), len(msg.Data()))
 		if len(msg.Data()) > 2 {
@@ -1172,6 +1206,11 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 	reader.Read7BitEncodedInt64()                     // PS2: +0x40 Base max stat
 	worldID, _ := reader.Read7BitEncodedInt64()       // PS2: +0x44 World ID
 	newWorld := byte(worldID)
+	// PS2 continent correction: worldID 2 (Odus) maps to 3 (shared with Lavastorm).
+	// Mega-function: if (entity->worldID - 2U < 2) entity->worldID = 3;
+	if newWorld == 2 {
+		newWorld = 3
+	}
 	if newWorld != gs.Player.World {
 		gs.WorldChanged = true
 		gs.PendingWorld = newWorld
@@ -2285,10 +2324,13 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 		ent.Animation = data[58]
 	}
 
-	// When entity is idle (anim=0), zero velocity regardless of what the
-	// server sends. Sandstorm sends stale velocity bytes even on stop updates,
-	// which causes dead-reckoning to slide entities past their stop position.
-	if ent.Animation == 0 {
+	// PS2: locomotion animation is derived from velocity (UpdateLocomotion),
+	// NOT from the state channel animation byte.
+	// For remote PLAYERS: animation byte is authoritative (0=idle means stopped).
+	// Sandstorm sends stale velocity bytes on stop, so zero velocity when idle.
+	// For NPCs: animation byte is always 0 (server doesn't set it), so don't
+	// zero velocity — let the animation system derive locomotion from movement.
+	if ent.Animation == 0 && ent.IsPlayer {
 		ent.VelX = 0
 		ent.VelY = 0
 		ent.VelZ = 0
@@ -3113,39 +3155,9 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 			ent.LastDamageTime = time.Now()
 		}
 
-		// Signal attack animation + hit FX on damage source.
-		// Sandstorm sends multiple DamageIndications per swing cycle (bard songs,
-		// DoTs, multi-hits) but only the first per cycle should trigger a swing anim
-		// and hit effect. Throttle to once per 3 seconds (auto-attack interval is 4-6s).
-		if sourceID == gs.PlayerObjectID && targetID != gs.PlayerObjectID && dmg < 0 {
-			// Count attack swings from DamageIndication. Sandstorm sends one
-			// DamageIndication per melee swing, plus extras for procs (damage/heal).
-			// Use a short per-swing throttle (0.4s) to separate swings within a round,
-			// while still allowing multi-swing rounds (2 for PAL/SK, 4 for DW).
-			// Proc damage arrives in the same burst but is typically smaller — the 0.4s
-			// window groups proc DIs with their triggering swing.
-			if time.Since(gs.Player.LastAttackAnimTime) > 400*time.Millisecond {
-				gs.Player.AttackCount++
-				gs.Player.LastAttackAnimTime = time.Now()
-			}
-			// PS2 func_00BC76A0 + func_00CBE0A8: play the resolved combat spell FX.
-			// CombatAttackFXHash is set per-frame by the animation manager from
-			// resolveCombatAttackType (class/level/weapon → Attack1-4 / Range1-4).
-			// Throttle to once per auto-attack round (~3s).
-			if gs.SpellFXSys != nil && time.Since(gs.LastMeleeHitFX) > 3*time.Second {
-				fxHash := gs.CombatAttackFXHash
-				if fxHash == 0 {
-					fxHash = 0xDA9BEA14 // fallback: "Attack4"
-				}
-				gs.LastMeleeHitFX = time.Now()
-				gs.SpellFXSys.Play(fxHash, 0, sourceID, targetID)
-			}
-		}
-		if sourceID != gs.PlayerObjectID && dmg < 0 {
-			if ent, ok := gs.Entities[sourceID]; ok {
-				ent.AttackCount++
-			}
-		}
+		// PS2 DamageIndication handler (0x00BD2D70) only queues floating damage
+		// text — it does NOT trigger attack animations or spell FX. Attack anims
+		// are driven entirely by CastingCombat → spell FX PlayAttack events.
 
 		// Spawn floating damage/heal text above target (victim)
 		var fx, fy, fz float32
@@ -3395,19 +3407,9 @@ func (gs *GameState) handleCastingCombat(msg *protocol.Message) {
 	off += 4
 	animHash := binary.LittleEndian.Uint32(payload[off : off+4])
 
-	// Disambiguate extra data: entity ObjectIDs vs hit damage values.
-	// If a value matches a known entity, it's a secondary AoE target.
-	// Otherwise it's a per-hit damage value.
-	var secondaryTargets []uint32
-	var hitDamages []uint32
-	for _, val := range extraValues {
-		isEntity := val == gs.PlayerObjectID || gs.Entities[val] != nil
-		if isEntity {
-			secondaryTargets = append(secondaryTargets, val)
-		} else {
-			hitDamages = append(hitDamages, val)
-		}
-	}
+	// PS2 func_00BD3738 treats ALL extra data as secondary target entity IDs.
+	// Damage values come from DamageIndication (0x00DB), not CastingCombat.
+	secondaryTargets := extraValues
 
 	casterName := gs.resolveObjectName(casterID)
 	targetName := gs.resolveObjectName(targetID)
@@ -3423,35 +3425,15 @@ func (gs *GameState) handleCastingCombat(msg *protocol.Message) {
 	if len(secondaryTargets) > 0 {
 		logMsg += fmt.Sprintf(" secondaryTargets=%d", len(secondaryTargets))
 	}
-	if len(hitDamages) > 0 {
-		logMsg += fmt.Sprintf(" hitDamages=%v", hitDamages)
-	}
 	log.Printf("%s", logMsg)
 	gs.SpellFX.LogEffect(animHash, casterName, targetName)
 
-	// Spawn floating damage text for multi-hit damage values
-	for _, dmg := range hitDamages {
-		if dmg == 0 {
-			continue
-		}
-		var fx, fy, fz float32
-		if targetID == gs.PlayerObjectID {
-			fx, fy, fz = gs.Player.X, gs.Player.Y, gs.Player.Z
-		} else if ent, ok := gs.Entities[targetID]; ok {
-			fx, fy, fz = ent.X, ent.Y, ent.Z
-		}
-		gs.FloatingTexts = append(gs.FloatingTexts, FloatingText{
-			Text:      fmt.Sprintf("-%d", dmg),
-			X:         fx,
-			Y:         fy,
-			Z:         fz,
-			SpawnTime: time.Now(),
-		})
-	}
+	// PS2: floating damage text comes from DamageIndication (0x00DB), not CastingCombat.
 
-	// Track when server confirms a player melee swing (for attack animation).
-	// Auto-attacks have timer >= 3000ms. Spells have timer=0 or small timer.
-	timerMs := uint16(timerVal) // safe: game timers always < 65536ms
+	// === Sandstorm adaptations (NOT in PS2 CastingCombat handler) ===
+	// PS2 retail sends CastingCombat at cast START. Sandstorm sends at cast END.
+	// These extra tracking fields support Sandstorm's timing model.
+	timerMs := uint16(timerVal)
 	if casterID == gs.PlayerObjectID && timerMs >= 3000 {
 		gs.PlayerSwingTime = time.Now()
 		gs.PlayerInCombat = true
@@ -3485,15 +3467,27 @@ func (gs *GameState) handleCastingCombat(msg *protocol.Message) {
 	// Start the runtime spell effect driver (timed event playback).
 	// PS2 func_00BD3738: resolves caster/target to actor indices, looks up animHash
 	// via VIDictionary::FindTyped(type=21=SpellEffect), calls VISpellEffectSystem::Play.
+	// PS2 calls Play unconditionally for ALL CastingCombat (auto-attacks, spells, procs).
+	// Attack animations are driven by spell FX PlayAttack events, NOT DamageIndication.
+	//
+	// Cast timing: Sandstorm sends CastingCombat at cast COMPLETION. We backdate
+	// triggerTime so Wait(sub-type 2) expires immediately.
 	casterKnown := casterID == gs.PlayerObjectID || gs.Entities[casterID] != nil
 	targetKnown := targetID == gs.PlayerObjectID || gs.Entities[targetID] != nil
 	if gs.SpellFXSys != nil && casterKnown && targetKnown {
-		gs.SpellFXSys.Play(animHash, timerMs, casterID, targetID)
-		// Also play spell FX on secondary AoE targets
+		var fxStart time.Time
+		if timerMs > 0 && timerMs < 3000 {
+			if casterID == gs.PlayerObjectID && !gs.CastStartTime.IsZero() {
+				fxStart = gs.CastStartTime
+			} else {
+				fxStart = time.Now().Add(-time.Duration(timerMs) * time.Millisecond)
+			}
+		}
+		gs.SpellFXSys.Play(animHash, timerMs, casterID, targetID, fxStart)
 		for _, secTarget := range secondaryTargets {
 			secKnown := secTarget == gs.PlayerObjectID || gs.Entities[secTarget] != nil
 			if secKnown {
-				gs.SpellFXSys.Play(animHash, timerMs, casterID, secTarget)
+				gs.SpellFXSys.Play(animHash, timerMs, casterID, secTarget, fxStart)
 			}
 		}
 	}
@@ -3777,9 +3771,10 @@ func (gs *GameState) tryParseLFGEntry(data []byte) bool {
 	return true
 }
 
-// handleBuddyOnlineStatus handles opcode 0x03D6 — buddy online/offline notification.
-// Format: 2-byte opcode + uint32(buddyCharID) + byte(status).
-// Status 0x03 appears to indicate "online". Sent when a buddy logs in or out.
+// handleCollectionRemove handles opcode 0x03D6.
+// PS2: reads zigzag varint key, searches binary tree at entity+0x2C70, removes entry.
+// Sandstorm sends this as buddy online/offline (charID + status byte).
+// Dual-purpose: PS2 uses it for data collection removal, Sandstorm for buddy notifications.
 func (gs *GameState) handleBuddyOnlineStatus(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) < 7 { // 2 opcode + 4 charID + 1 status
@@ -3819,6 +3814,8 @@ func (gs *GameState) handleGuildInfo(msg *protocol.Message) {
 			motd, _ = reader.ReadStringUnicode(int(motdLen))
 		}
 		log.Printf("GuildInfo: guild=%q motd=%q", guildName, motd)
+		gs.GuildName = guildName
+		gs.GuildMOTD = motd
 
 		// Add MOTD to chat log if non-empty
 		if motd != "" {
@@ -3844,6 +3841,66 @@ func (gs *GameState) handleGuildInfo(msg *protocol.Message) {
 			trailHex = fmt.Sprintf("%X", trail)
 		}
 		log.Printf("GuildInfo: player=%q charID=%d trailing=%s", name, charID, trailHex)
+
+	case 0x02:
+		// PS2 sub-type 2: Clear guild — set hasGuild=0, clear name+MOTD+members
+		log.Printf("GuildInfo: sub=2 CLEAR GUILD")
+		gs.GuildName = ""
+		gs.GuildMOTD = ""
+		gs.GuildMembers = nil
+		gs.GuildLeader = false
+
+	case 0x04:
+		// PS2 sub-type 4: Member remove — zigzag memberID → remove from list
+		memberID, _ := reader.Read7BitEncodedInt64()
+		log.Printf("GuildInfo: sub=4 MEMBER_REMOVE id=%d", memberID)
+		// Remove from member list
+		for i, m := range gs.GuildMembers {
+			if m.CharID == memberID {
+				gs.GuildMembers = append(gs.GuildMembers[:i], gs.GuildMembers[i+1:]...)
+				break
+			}
+		}
+
+	case 0x05:
+		// PS2 sub-type 5: Guild chat — uint32(senderID) + blob(0x200 message)
+		if reader.Remaining() < 4 {
+			return
+		}
+		senderID, _ := reader.ReadUint32()
+		msgText := ""
+		if reader.Remaining() > 0 {
+			remaining := reader.Remaining()
+			if remaining > 512 {
+				remaining = 512
+			}
+			msgBytes, _ := reader.ReadBytes(remaining)
+			msgText = decodeUTF16LE(msgBytes)
+		}
+		senderName := gs.resolveObjectName(senderID)
+		log.Printf("GuildChat: sender=0x%08X(%s) msg=%q", senderID, senderName, msgText)
+		if msgText != "" {
+			gs.addChatMessage(fmt.Sprintf("[Guild] %s: %s", senderName, msgText), ChatGuild)
+		}
+
+	case 0x06:
+		gs.addChatMessage("You have been promoted.", ChatGuild)
+	case 0x07, 0x08:
+		gs.addChatMessage("Guild rank changed.", ChatGuild)
+	case 0x09:
+		gs.addChatMessage("You have been demoted.", ChatGuild)
+	case 0x0A, 0x0B, 0x0C:
+		gs.addChatMessage("Guild notification.", ChatGuild)
+	case 0x0D:
+		// PS2: set guildLeader = 1
+		gs.GuildLeader = true
+		gs.addChatMessage("You are now the guild leader.", ChatGuild)
+	case 0x0E:
+		// PS2: set guildLeader = 0
+		gs.GuildLeader = false
+		gs.addChatMessage("Guild leadership transferred.", ChatGuild)
+	case 0x10:
+		gs.addChatMessage("Guild notification.", ChatGuild)
 
 	default:
 		log.Printf("GuildInfo: unknown sub-type 0x%02X len=%d", subType, len(data))

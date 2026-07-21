@@ -5,13 +5,18 @@ import "math/rand"
 // SpriteAnimController manages per-entity animation state with priority-gated
 // replacement, matching the PS2 VICSprite::SetAnimation behavior (0x00422D78).
 //
-// PS2 architecture: SetLocomotion and SetAction both call SetAnimation with
-// pair=0 for skeletal sprites. The VIHSprite internally handles per-bone
-// priority blending between locomotion and action layers. Our Go implementation
-// uses an explicit dual-pair model (pair 0 = locomotion, pair 1 = action) that
-// achieves the same visual result: action drives upper body, locomotion drives
-// lower body. The priority gating logic (accept if empty, finished, or
-// newPri >= curPri) matches the PS2 exactly.
+// PS2 architecture (verified from MIPS disassembly of SetAction at 0x00421770
+// and SetLocomotion at 0x00421AA0): BOTH functions call SetAnimation TWICE for
+// humanoid (skelType==1) — first with pair=0, then pair=1. The unified priority
+// system inside SetAnimation determines which pair(s) accept the animation.
+// For non-humanoid (skelType!=1), a single call with pair=0 is made.
+//
+// This means an attack animation (priority 5) called via SetAction will be
+// accepted on BOTH pairs (since attack priority > locomotion priority 2),
+// producing a full-body attack. Locomotion called via SetLocomotion will be
+// accepted on pair 0 but rejected on pair 1 if a higher-priority action is
+// playing. The VIHSprite per-bone-group blending then uses the channel
+// assignments to control which bones each pair drives.
 //
 // PS2 CPlayList: 66 entries at VICSprite+0x1B8, 52 bytes each.
 // Entry layout (verified from EE memory dump at 0x010DE918):
@@ -29,29 +34,11 @@ import "math/rand"
 //   +0x2C int32    groupRef         (-1 = none)
 //   +0x30 int32    sentinel         (-1 for valid entries)
 //
-// Priority values at +0x00/+0x04 are set during PS2 initialization and
-// VARY by character model (verified: 32 humanoid VICSprites have different
-// priority sets). Not stored in ESF CPlayList (type 0x2910). Source unknown
-// — likely computed from bone-group channel assignments or model properties.
-// SetDefaultEntries (0x004251C0) fills uninitialized slots by copying from
-// templates: slot 0 (idle) for locomotion, slots 22/23 (attack) for combat.
-//
-// SetAnimPriorities (0x004259F8) sets per-slot CHANNEL indices at +0x24/+0x28
-// (NOT the priority floats). Channels 0-8 control per-bone-group blend
-// priority on PS2 (channel 2=legs, 5=full body, 6=upper body, 7-8=override).
-// Our dual-pair model approximates this: pair 0=locomotion(legs),
-// pair 1=action(upper body).
-//
-// Priority values extracted from EE memory dump: multiple humanoid VICSprites
-// cross-referenced. CPlayList at +0x01B8, 52-byte entries, pair 0 priority
-// at entry+0x00 (float32). PS2 uses slt (signed integer compare) on raw
-// IEEE 754 bit patterns — works correctly because all values are positive
-// floats whose bit patterns preserve magnitude ordering.
-//
-// Pair 1 (action layer) priority is always 1.0 for all humanoid animations
-// on PS2. Since our dual-pair model separates locomotion and action into
-// different pairs (no cross-pair competition), we use pair 0 priorities for
-// both pairs to get correct relative ordering within each pair.
+// SetAnimPriorities (0x004259F8) sets per-slot CHANNEL indices at +0x24/+0x28.
+// Channels 0-8 control per-bone-group blend priority on PS2:
+//   0=special idle, 1=battle stance, 2=locomotion, 3=jump/swim-attack,
+//   4=hit stun/emotes, 5=combat, 6=mounted/upper, 7=death(p0), 8=death(p1).
+// PS2 uses slt (signed integer compare) on these values — higher = higher priority.
 
 // AnimPair identifies which animation pair (locomotion or action).
 type AnimPair int
@@ -74,12 +61,22 @@ type SpriteAnimController struct {
 	pairs       [2]PairState
 	isHumanoid  bool
 	idleTimer   float32 // seconds in idle for periodic special idle (PS2: animTimerA)
-	idleTarget  float32 // random target: 20 + rand(20) seconds (PS2: GetTime() + 20000 + rand()%20000)
+	idleTarget  float32 // random target: 20-40s (PS2: GetTime() + 20000 + rand()%20000)
 	CallerSpeed float32 // locomotion speed multiplier (PS2: sprite[432])
-	InCombat    bool    // true while entity is in combat (PS2: animTimerB gating)
-	combatTimer float32 // seconds since last combat activity (PS2: animTimerB, 5s threshold)
+	InCombat    bool    // true while entity is in combat (used by callers for battle stance/BGM)
+	combatTimer float32 // seconds since last combat activity (PS2: combatIdleTimer, 5s threshold)
 	IsDead      bool    // death flag (PS2: VICSprite+0x1168, forces death animation)
 	blendActive [2]bool // per-pair blend tracking (PS2: HasRemainingPlayback per play entry)
+
+	// PS2 paired blend: when locomotion pair is set to same anim as action pair,
+	// blend source should be the action pair's current frame position.
+	// PS2: skelType==1 && pair==0 && pair1_animID==newAnimID → AddInterpolatedPlayWithSync.
+	PairedBlendFromAction bool
+
+	// TriggerResetPending is set when a new animation is accepted, signaling
+	// that sound/FX triggers should be reset. PS2: FindTrigger×4 + ResetTrigger×4
+	// inside SetAnimation after acceptance (0x00423310). Cleared by caller.
+	TriggerResetPending bool
 }
 
 // NewSpriteAnimController creates a controller for the given model type.
@@ -97,137 +94,175 @@ func NewSpriteAnimController(isHumanoid bool) *SpriteAnimController {
 
 // randomIdleTarget returns a random special idle threshold in seconds.
 // PS2: animTimerA = VIScene::GetTime() + 20000 + rand()%20000 (absolute ms).
-// As relative duration this is 20 + rand(20) seconds — exact match.
+// rand()%20000 gives 0-19999, so total = 20000-39999ms = 20.0-39.999s.
+// Go rand.Intn(20000) gives 0-19999 → /1000 gives 0.0-19.999.
 func randomIdleTarget() float32 {
-	return 20.0 + float32(rand.Intn(20))
+	return 20.0 + float32(rand.Intn(20000))/1000.0
 }
 
-// SetLocomotion sets the locomotion (pair 0) animation.
-// PS2 combat idle override (animTimerB at VICSprite+0x11B8):
-//   - If animID==0 (idle requested) and entity is in combat with timer < 5s,
-//     force animID=17 (combat idle) instead. PS2 also forces combat idle
-//     when VIScene::GetTime() < 5001 (first 5s of scene life — startup guard).
-//     We skip the startup guard (negligible impact).
+// SetLocomotion sets the locomotion animation.
+// PS2 (0x00421AA0): for humanoid (skelType==1), calls SetAnimation TWICE —
+// first with pair=0, then pair=1. The priority system determines acceptance.
+// For non-humanoid: single call with pair=0.
 func (c *SpriteAnimController) SetLocomotion(animID int) {
-	// PS2 Phase 2: combat idle override.
-	// Force combat idle when idle requested during active combat.
-	if animID == 0 && c.InCombat && c.isHumanoid && c.combatTimer < 5.0 {
-		animID = 17 // combat idle (VICSpriteAnimID 17)
+	if c.isHumanoid {
+		c.setAnimation(animID, PairLocomotion)
+		c.setAnimation(animID, PairAction)
+	} else {
+		c.setAnimation(animID, PairLocomotion)
+	}
+}
+
+// SetAction sets the action animation.
+// PS2 (0x00421770): for humanoid (skelType==1), calls SetAnimation TWICE —
+// first with pair=0, then pair=1. For non-humanoid: single call with pair=0.
+// Death guard: when dead, PS2's SetAnimation forces animID=14 inside, but
+// we pre-reject non-death anims here as a fast path (same net result).
+func (c *SpriteAnimController) SetAction(animID int) {
+	if c.IsDead {
+		if c.isHumanoid && animID != 14 {
+			return
+		}
+		if !c.isHumanoid && animID != 15 {
+			return
+		}
+	}
+	if c.isHumanoid {
+		c.setAnimation(animID, PairLocomotion)
+		c.setAnimation(animID, PairAction)
+	} else {
+		c.setAnimation(animID, PairAction)
+	}
+}
+
+// ClearAction resets pair 1 to empty (no action playing).
+// PS2 dual-call: if pair 0 was set to the same animation (from SetAction driving
+// both pairs), clear it too so locomotion can reclaim pair 0.
+func (c *SpriteAnimController) ClearAction() {
+	actionAnim := c.pairs[PairAction].AnimID
+	c.pairs[PairAction] = PairState{AnimID: -1}
+	if actionAnim >= 0 && c.pairs[PairLocomotion].AnimID == actionAnim {
+		c.pairs[PairLocomotion] = PairState{AnimID: -1}
+	}
+}
+
+// setAnimation implements PS2 SetAnimation (0x00422D78) — the unified entry
+// point that both SetLocomotion and SetAction call on both pairs. All animation
+// overrides (combat idle, swim/mounted, death) happen inside this function,
+// matching PS2 exactly. The priority system uses per-pair channel values from
+// the CPlayList to determine acceptance.
+func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) {
+	p := &c.pairs[pair]
+
+	// --- PS2 Phase 1: Special idle override (0x422D88) ---
+	// When specialIdleTimer expired and idle requested → force special idle.
+	// PS2 checks inside SetAnimation; Go handles externally via UpdateIdleTimer.
+	// Functionally equivalent — the timer fires and SetLocomotion(15) is called.
+
+	// --- PS2 Phase 2: Combat idle override (0x422DB8) ---
+	// If animID==0 (idle) and combat timer < 5s → force animID=17 (combat idle).
+	// PS2 also checks GetTime() < 5001 as startup guard (skipped — negligible).
+	if animID == 0 && c.isHumanoid && c.combatTimer < 5.0 {
+		animID = 17
 	}
 
-	// PS2 Phase 3: death state override.
+	// --- PS2 Phase 3a: Swim/mounted combat override (0x422E60) ---
+	// When combat animID (0x16-0x35, not 0x22) and other pair has swim/mounted,
+	// force animID=44 (mounted attack). Prevents standing attack while swimming.
+	if c.isHumanoid && animID >= 0x16 && animID <= 0x35 && animID != 0x22 {
+		otherPair := PairAction
+		if pair == PairAction {
+			otherPair = PairLocomotion
+		}
+		otherAnimID := c.pairs[otherPair].AnimID
+		if otherAnimID == 12 || otherAnimID == 13 || otherAnimID == 44 {
+			animID = 44
+		}
+	}
+
+	// --- PS2 Phase 3b: Death override (0x422EC8) ---
+	// When isDead, force animID=14 unconditionally.
 	if c.IsDead && c.isHumanoid {
 		animID = 14
 	}
 
-	// Locomotion pair always accepts — no priority gating.
-	// PS2: locomotion is directly set every frame from movement state.
-	// Priority gating only applies to the action pair.
-	p := &c.pairs[PairLocomotion]
-	if p.AnimID == animID {
-		return // same anim, no change
-	}
-	p.AnimID = animID
-	p.Priority = c.getAnimPriority(animID)
-	p.PlayOnce = c.getPlayOnce(animID)
-	p.Finished = false
-}
-
-// SetAction sets the action (pair 1) animation.
-// PS2 Phase 3 death-state guard: when entity is dead, reject combat animations.
-// This prevents attack swings from overriding the death pose — important because
-// death anims are loops (playOnce=false), so the "playing → always accept" rule
-// in setAnimation would otherwise let combat animations through.
-func (c *SpriteAnimController) SetAction(animID int) {
-	if c.IsDead {
-		// Only allow death animation through when dead.
-		if c.isHumanoid {
-			// CPlayList slot 14 = death.
-			if animID != 14 {
-				return
-			}
-		} else {
-			// Non-humanoid: only allow death (F8 ID 5).
-			if animID != 5 {
-				return
-			}
-		}
-	}
-	c.setAnimation(animID, PairAction)
-}
-
-// ClearAction resets pair 1 to empty (no action playing).
-func (c *SpriteAnimController) ClearAction() {
-	c.pairs[PairAction] = PairState{AnimID: -1}
-}
-
-// setAnimation implements PS2 SetAnimation priority gating (0x00422D78).
-//
-// PS2 two-stage accept/reject (from decompilation):
-//   Stage 1 (blend active): IsBlendComplete check → if blend in progress,
-//     compare priorities. Higher/equal → FreezePlayback + ErasePlay.
-//     Lower → reject.
-//   Stage 2 (normal): IsPlaybackStopped check.
-//     Still playing: priority comparison (slt on float bits) → reject if lower.
-//     Stopped/finished: priority gating + idle guard.
-//
-// Both playing AND stopped animations are protected by priority on PS2.
-// Locomotion (0.2) cannot interrupt attacks (0.4). Only equal or higher
-// priority animations (death=1.0, other attacks=0.4) can interrupt.
-func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) {
-	p := &c.pairs[pair]
-
-	// PS2 Stage 1: FreezePlayback (0x00446FD8).
-	// During active blend, compare priorities. Higher/equal → freeze current
-	// animation at its current frame and allow replacement. Lower → reject.
-	// PS2: IsBlendComplete → if not complete, slt priority comparison,
-	// then FreezePlayback(current) + ErasePlay(prev).
+	// --- PS2 Stage 1: Blend-active check (0x422ED8) ---
+	// During active blend (IsBlendComplete==false), compare priorities.
+	// Higher/equal → FreezePlayback + ErasePlay. Lower → reject.
 	if c.blendActive[pair] && c.isHumanoid {
-		newPri := c.getAnimPriority(animID)
+		newPri := c.getAnimPriorityForPair(animID, pair)
 		if newPri < p.Priority {
-			return // lower priority rejected during blend
+			return
 		}
-		// Equal or higher priority: freeze current pose, allow replacement.
 		c.blendActive[pair] = false
 	}
 
-	// Same animation already set (playing or finished) → no change.
-	// PS2: playing same anim → return -1; stopped same anim → STAGE2 reject.
+	// --- PS2: Same-animID rejection (0x423174) ---
+	// If new == current and playHandle != -1 → return 0 (no change).
 	if p.AnimID == animID {
 		return
 	}
 
-	// PS2 Stage 2: IsPlaybackStopped check + priority gating.
+	// --- PS2 Stage 2: Priority gating (0x422F9C..0x423068) ---
 	switch {
 	case p.AnimID == -1:
 		// Empty pair → always accept.
+
 	case !p.Finished:
-		// Still playing (IsPlaybackStopped returns false).
-		// PS2: slt priority comparison on playing animations — reject if
-		// new priority is strictly lower than current. Equal or higher accepts.
-		// This means attacks (0.4) can't be interrupted by locomotion (0.2),
-		// but CAN be interrupted by death (1.0) or another attack (0.4).
-		newPri := c.getAnimPriority(animID)
+		// Still playing: slt priority comparison → reject if strictly lower.
+		newPri := c.getAnimPriorityForPair(animID, pair)
 		if newPri < p.Priority {
 			return
 		}
+
 	default:
-		// Stopped/finished play-once (IsPlaybackStopped returns true).
-		// PS2: priority gating applies.
-		// PS2 additional rule: idle (animID 0) can never replace a stopped anim.
-		if animID == 0 {
-			return
-		}
-		newPri := c.getAnimPriority(animID)
-		if newPri < p.Priority {
-			return
-		}
+		// Stopped/finished (IsPlaybackStopped returns true).
+		// PS2 priority gate at 0x423068: rejection requires
+		//   (stopped_flag != 1 OR IsPlaybackStopped == false)
+		// For truly stopped, this is FALSE → no priority rejection.
+		// PS2 accepts ANY animation over a stopped one.
 	}
 
+	// --- PS2: Paired blend detection (0x00423260) ---
+	// When humanoid pair=0 and pair 1 has same animID: use
+	// AddInterpolatedPlayWithSync for smooth cross-pair blend.
+	if c.isHumanoid && pair == PairLocomotion && c.pairs[PairAction].AnimID == animID {
+		c.PairedBlendFromAction = true
+	} else if pair == PairLocomotion {
+		c.PairedBlendFromAction = false
+	}
+
+	// --- PS2: Combat timer update (0x423120) ---
+	// Reset combatIdleTimer for combat anims, EXCLUDING spell-related slots.
+	// PS2: (animID 22-43 OR 50-53) AND NOT (31,32,33,35,37,38,39) → reset.
+	if c.isHumanoid && isCombatTimerAnim(animID) {
+		c.combatTimer = 0
+	}
+
+	// --- Accept animation ---
 	p.AnimID = animID
-	p.Priority = c.getAnimPriority(animID)
+	p.Priority = c.getAnimPriorityForPair(animID, pair)
 	p.PlayOnce = c.getPlayOnce(animID)
 	p.Finished = false
+
+	// --- PS2: Trigger reset (0x423310) ---
+	// FindTrigger×4 + ResetTrigger×4 after acceptance. Clears sound/FX
+	// event triggers so they can fire again on the new animation.
+	c.TriggerResetPending = true
+}
+
+// isCombatTimerAnim returns true if the animID should reset the combat idle timer.
+// PS2 SetAnimation (0x423120): resets combatIdleTimer for combat anims 22-43 + 50-53,
+// EXCLUDING spell-related slots: 31, 32, 33, 35, 37, 38, 39.
+func isCombatTimerAnim(animID int) bool {
+	if (animID >= 22 && animID <= 43) || (animID >= 50 && animID <= 53) {
+		switch animID {
+		case 31, 32, 33, 35, 37, 38, 39:
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // Resolve returns the current animation IDs for locomotion and action.
@@ -245,6 +280,11 @@ func (c *SpriteAnimController) Resolve() (locoID, actionID int) {
 // has completed (held at last frame).
 func (c *SpriteAnimController) IsActionFinished() bool {
 	return c.pairs[PairAction].Finished
+}
+
+// IsActionPlayOnce returns true if the current action animation is play-once.
+func (c *SpriteAnimController) IsActionPlayOnce() bool {
+	return c.pairs[PairAction].PlayOnce
 }
 
 // IsActionActive returns true if an action animation is playing and not finished.
@@ -268,8 +308,13 @@ func (c *SpriteAnimController) LocoAnimID() int {
 
 // MarkActionFinished is called by applySkeletal when a play-once action
 // animation's time reaches its duration.
+// PS2 dual-call: if pair 0 has the same animation (from SetAction driving
+// both pairs), mark it finished too so locomotion can replace it.
 func (c *SpriteAnimController) MarkActionFinished() {
 	c.pairs[PairAction].Finished = true
+	if c.pairs[PairLocomotion].AnimID == c.pairs[PairAction].AnimID {
+		c.pairs[PairLocomotion].Finished = true
+	}
 }
 
 // SetBlendActive sets the per-pair blend-active flag. Called from applySkeletal
@@ -282,15 +327,11 @@ func (c *SpriteAnimController) SetBlendActive(pair AnimPair, active bool) {
 // Update advances frame-rate-dependent timers. Called once per frame from
 // applySkeletal with the frame delta time.
 func (c *SpriteAnimController) Update(dt float32) {
-	// Advance combat idle timer (PS2: animTimerB, 5000ms threshold).
-	// When InCombat is cleared, combatTimer keeps counting. After 5s it
-	// expires and idle is allowed again (combat idle override in SetLocomotion
-	// checks combatTimer < 5.0).
-	if c.InCombat {
-		c.combatTimer = 0
-	} else {
-		c.combatTimer += dt
-	}
+	// PS2 combat idle timer: combatIdleTimer is set to GetTime() inside
+	// SetAnimation when a combat anim is accepted (see isCombatTimerAnim).
+	// The timer advances by dt each frame. In SetAnimation, combat idle is
+	// forced when combatTimer < 5.0 (PS2: GetTime() - combatIdleTimer < 5000).
+	c.combatTimer += dt
 }
 
 // UpdateIdleTimer tracks idle time and returns a special idle animation ID
@@ -323,15 +364,22 @@ func (c *SpriteAnimController) ResetIdleTimer() {
 	c.idleTarget = randomIdleTarget()
 }
 
-// getAnimPriority returns the pair 0 priority for a given VICSpriteAnimID.
-// We use pair 0 priorities for both locomotion and action pairs since our
-// dual-pair model doesn't have cross-pair competition (PS2 pair 1 is always
-// 1.0, which would mean zero gating on actions).
-func (c *SpriteAnimController) getAnimPriority(animID int) float32 {
+// getAnimPriorityForPair returns the priority for a given animID and pair.
+// PS2 stores per-pair priorities at CPlayList[animID*0x34 + pair*4].
+// These are integer channel indices (0-8) compared via slt.
+func (c *SpriteAnimController) getAnimPriorityForPair(animID int, pair AnimPair) float32 {
 	if c.isHumanoid {
+		if pair == PairAction {
+			return humanoidPair1Priority(animID)
+		}
 		return humanoidPriority(animID)
 	}
 	return nonHumanoidPriority(animID)
+}
+
+// getAnimPriority returns the priority for the given animID using pair 0 (default).
+func (c *SpriteAnimController) getAnimPriority(animID int) float32 {
+	return c.getAnimPriorityForPair(animID, PairLocomotion)
 }
 
 // getPlayOnce returns whether the animation plays once (true) or loops (false).
@@ -347,41 +395,68 @@ func (c *SpriteAnimController) getPlayOnce(animID int) bool {
 	return nonHumanoidPlayOnce(animID)
 }
 
-// --- Humanoid animation priority table ---
-// Indexed by ESF CPlayList slot number. Priority values from PS2 EE memory
-// dump (cross-referenced across multiple humanoid VICSprites). NOTE: values
-// vary slightly by character model — this table uses the most common values.
-//   0.2 (lowest): locomotion — idle, walk, run, swim, fall, landing, strafe
-//   0.4 (medium): combat attacks, spells, hit reactions
-//   0.6 (high-medium): spell channel (slot 30)
-//   1.0 (highest): death, special idle, battle stance, emotes
-var humanoidSlotPriority = map[int]float32{
-	// Locomotion — low priority (0.2)
-	0: 0.2, 1: 0.2, 2: 0.2, 3: 0.2, 4: 0.2, 5: 0.2,
-	6: 0.2, 7: 0.2, 10: 0.2, 11: 0.2, 12: 0.2, 13: 0.2,
-	// Death, special idle — high priority (1.0)
-	14: 1.0, // death
-	15: 1.0, // special idle (plays to completion)
-	17: 1.0, // battle stance (loops — PS2 pair0 priority is 1.0)
-	// Combat actions — medium priority (0.4)
-	18: 0.4, 19: 0.4, 20: 0.4, 21: 0.4, // 1HS/2HS attack variants
-	22: 0.4, 23: 0.4, 24: 0.4, 25: 0.4, 26: 0.4, 27: 0.4,
-	28: 0.4, 29: 0.4, 30: 0.6, 31: 0.4, 32: 0.4, // 30=spellChannel (0.6)
-	33: 0.4, 34: 0.3, 35: 0.4, 36: 0.4, // 34=hitStun (0.3, below attacks so it can't interrupt swings)
-	40: 0.4, 41: 0.4, 42: 0.4,
-	// Spells — medium priority (0.4)
-	37: 0.4, 38: 0.4, 39: 0.4,
-	// Emotes — high priority (1.0)
-	43: 1.0, 44: 1.0, 45: 1.0, 46: 0.4, 47: 0.4, 48: 0.4,
-	51: 0.4, 52: 0.4, // crafting
-	56: 1.0, 57: 1.0, 60: 1.0, 61: 1.0,
+// --- Humanoid animation priority tables ---
+// From PS2 SetAnimPriorities (0x004259F8) — writes channel indices to all 66
+// CPlayList entries. These are the SAME for all humanoid VICSprites.
+// PS2 uses slt (signed integer compare) on these values — higher = higher priority.
+// Channels 0-8: 0=lowest (special idle), 2=locomotion, 5=combat, 7=death, 8=death(pair1).
+
+// humanoidPair0Channel maps CPlayList slot → pair 0 (locomotion layer) channel.
+var humanoidPair0Channel = map[int]int{
+	0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2,
+	7: 3, 8: 3, 9: 3, 10: 2, 11: 2, 12: 2, 13: 2,
+	14: 7, // death
+	15: 0, // special idle (lowest — anything can interrupt)
+	16: 1, // battle stance (pair0=1, very low)
+	17: 2, // combat idle
+	18: 6, // mounted combat
+	22: 5, 23: 5, 24: 5, 25: 5, 26: 5, 27: 5, 28: 5, 29: 5,
+	30: 5, 31: 5, 32: 5, 33: 5,
+	34: 4, // hit stun (below attacks at 5, above loco at 2)
+	35: 5, 36: 5,
+	37: 5, 38: 5, 39: 5, // spells
+	40: 5, 41: 5, 42: 5,
+	43: 5, 44: 5, 45: 5, 46: 5,
+	50: 5, 51: 5, 52: 5, 53: 5,
+	56: 4, 57: 4, 59: 4, 60: 4, 61: 4, 63: 4, 64: 4, 65: 4,
+}
+
+// humanoidPair1Channel maps CPlayList slot → pair 1 (action layer) channel.
+var humanoidPair1Channel = map[int]int{
+	0: 2, 1: 6, 2: 6, 3: 6, 4: 6, 5: 6, 6: 6,
+	7: 7, 8: 3, 9: 3, 10: 6, 11: 6, 12: 6, 13: 6,
+	14: 8, // death (highest)
+	15: 0, // special idle
+	16: 1, // battle stance
+	17: 1, // combat idle (pair1 low — allows action to override)
+	18: 7, // mounted combat
+	22: 5, 23: 5, 24: 5, 25: 5, 26: 5, 27: 5, 28: 5, 29: 5,
+	30: 5, 31: 5, 32: 5, 33: 5,
+	34: 4, // hit stun
+	35: 5, 36: 5,
+	37: 5, 38: 5, 39: 5,
+	40: 5, 41: 5, 42: 5,
+	43: 7, 44: 7, // emotes (high on pair1)
+	45: 5, 46: 5,
+	50: 5, 51: 5, 52: 6, 53: 6,
+	56: 4, 57: 4, 59: 4, 60: 4, 61: 4, 63: 4, 64: 4, 65: 4,
 }
 
 func humanoidPriority(animID int) float32 {
-	if p, ok := humanoidSlotPriority[animID]; ok {
-		return p
+	ch, ok := humanoidPair0Channel[animID]
+	if !ok {
+		ch = 2
 	}
-	return 0.2 // default: lowest priority
+	return float32(ch)
+}
+
+// humanoidPair1Priority returns pair 1 priority for action layer.
+func humanoidPair1Priority(animID int) float32 {
+	ch, ok := humanoidPair1Channel[animID]
+	if !ok {
+		ch = 5
+	}
+	return float32(ch)
 }
 
 // humanoidPlayOnce determines play-once behavior for ESF CPlayList slot numbers.
@@ -422,9 +497,8 @@ func humanoidPlayOnce(animID int) bool {
 //   5(death)→15, 6(special)→17, 7(stance)→16, 8(atk1)→8,
 //   9(atk2)→9, 10(hit)→10, 11(cast)→11
 //
-// Our nhAnim* constants use F8 IDs (verified on Sandstorm). Priority values
-// below are from the most common creature pattern (14 of 47 instances),
-// mapped from CPlayList slots to F8 IDs by animation name.
+// nhAnim* constants are CPlayList slot numbers (verified from ESF scan).
+// Slots 8/9/16 do NOT exist on SkelType 0/2/3 models — attacks at 22/23.
 //
 // PS2 creature priorities vary by creature type (9 distinct patterns found).
 // Battle stance and idle-battle are always 1.0; idle is always 0.0; other
@@ -435,41 +509,41 @@ func humanoidPlayOnce(animID int) bool {
 // for these since entity attacks are controlled by AttackAnimEnd timers.
 
 func nonHumanoidPriority(animID int) float32 {
-	// animID values are CPlayList slots (not F8 indices).
-	// P0 values from PS2 creature CPlayList (most common pattern, 14 of 47 instances).
+	// animID values are CPlayList slots (verified from ESF scan of SkelType 0/2/3).
+	// Creature CPlayList slots: 0,1,2,3,4,5,6,7,10,11,12,13,14,15,17,22,23,30,34,37-39,43,44
 	switch animID {
 	case 0:
-		return 0.0 // Idle (P0=0.0)
+		return 0.0 // Idle
 	case 1:
-		return 0.2 // Walk (P0=0.2)
+		return 0.2 // Walk
 	case 2:
-		return 0.4 // WalkBackward (P0=0.4)
+		return 0.4 // WalkBackward
 	case 3:
-		return 0.4 // Run (P0=0.4)
+		return 0.4 // Run
 	case 4, 5:
-		return 0.4 // Strafe/StrafeBack (P0=0.4)
+		return 0.4 // Strafe/StrafeBack
 	case 6:
-		return 0.4 // Turn (P0=0.4)
+		return 0.4 // Turn
 	case 7:
-		return 1.0 // JumpLand (P0=1.0)
-	case 8, 9:
-		return 0.2 // Attack1/2 (P0=0.2)
-	case 10:
-		return 0.1 // HitReaction (below attacks so it can't interrupt swings)
-	case 11:
-		return 0.4 // SpellCast (P0=0.4)
+		return 1.0 // JumpLand
 	case 12, 13:
-		return 0.4 // Swim/SwimFast (P0=0.4)
+		return 0.4 // Swim/SwimFast
 	case 14:
-		return 1.0 // Emote (P0=1.0)
+		return 1.0 // Emote
 	case 15:
-		return 0.6 // Death (P0=0.6)
-	case 16:
-		return 1.0 // BattleStance (P0=1.0)
+		return 0.6 // Death
 	case 17:
-		return 0.2 // Special (P0=0.2)
-	case 18:
-		return 1.0 // IdleBattle (P0=1.0)
+		return 1.0 // BattleStance/Special
+	case 22, 23:
+		return 0.2 // Attack1/2
+	case 30:
+		return 0.2 // Attack extra
+	case 34:
+		return 0.1 // HitReaction
+	case 37, 38, 39:
+		return 0.4 // SpellCast
+	case 43, 44:
+		return 1.0 // Emote3/4
 	default:
 		return 0.2
 	}
@@ -481,19 +555,22 @@ func nonHumanoidPlayOnce(animID int) bool {
 	//   All others including attacks/hit/spell = false (loop, server-controlled).
 	// Our client keeps attack/hit/spell as play-once because entity combat
 	// is time-gated by AttackAnimEnd / LastDamageTime timers.
-	// animID values are now CPlayList slots (not F8 indices).
+	// animID values are CPlayList slots (verified from ESF scan of SkelType 0/2/3).
+	// PS2 CPlayList PlayOnce: 7=JumpLand(1), 14=Emote(1), 15=Death(1), all others=0.
+	// Go override: attacks/hit/spell are play-once because our server doesn't
+	// send explicit animation-stop commands like SOE's did.
 	switch animID {
 	case 7: // JumpLand — play once (PS2: playOnce=1)
-		return true
-	case 8, 9: // Attack1/2 — play once (PS2: loop, but our timers need it)
-		return true
-	case 10: // HitReaction — play once (PS2: loop, but our timers need it)
-		return true
-	case 11: // SpellCast — play once (PS2: loop, but our timers need it)
 		return true
 	case 14: // Emote — play once (PS2: playOnce=1)
 		return true
 	case 15: // Death — play once (PS2: playOnce=1)
+		return true
+	case 22, 23, 30: // Attack — play once (PS2: loop, but Go needs timer-gated end)
+		return true
+	case 34: // HitReaction — play once (PS2: loop, but Go needs timer-gated end)
+		return true
+	case 37, 38, 39: // SpellCast — play once (PS2: loop, but Go needs timer-gated end)
 		return true
 	default:
 		return false

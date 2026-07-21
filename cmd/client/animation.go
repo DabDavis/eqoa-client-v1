@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"math"
 	"time"
 
 	"github.com/eqoa/client/internal/game"
@@ -27,17 +28,24 @@ const (
 	animBattleStance   = 17 // fighting stance
 	animHitStun        = 34 // hit reaction
 
-	// Combat attacks — PS2 SetAttackAction CPlayList indices.
-	// All attack slots (22-44) exist on all model types.
-	animAttack1 = 22 // first attack (unarmed slot 0)
-	animAttack2 = 23 // second attack (unarmed slot 1)
-	animAttack3 = 24 // third attack
-	animAttack4 = 25 // fourth attack
+	// Combat attacks — CPlayList slots. Semantics VERIFIED VISUALLY via animviewer
+	// (HumanM export, 2026-07-21). Naming reflects what each slot actually shows:
+	//   22=unarmed offhand  23=unarmed mainhand  24=slash offhand  25=slash mainhand
+	//   26=2H slash  27=poke offhand  28=poke mainhand  29=2H poke  30=shield bash
+	//   40=slash quad 3rd (offhand)  41=slash quad 4th (mainhand)  42=2H smash  43=kick
+	//   44=swim attack  50-53=monk1-4
+	animAttack1 = 22 // unarmed offhand swing
+	animAttack2 = 23 // unarmed mainhand swing
+	animAttack3 = 24 // slash offhand swing
+	animAttack4 = 25 // slash mainhand swing
+	animShieldBash = 30 // shield bash
+	animKick       = 43 // kick (hand-to-hand)
 
-	// Spell casting
-	animSpellDamage = 37 // damage spell cast
-	animSpellAlt    = 38 // spell cast alt
-	animSpellBuff   = 39 // spell buff
+	// Spell casting (37/38/39 = cast spell 1/2/3, verified via animviewer)
+	animSpellDamage = 37 // cast spell1 (damage)
+	animSpellAlt    = 38 // cast spell2 (alt)
+	animSpellBuff   = 39 // cast spell3 (buff)
+	animThrow       = 36 // throw (alchemy potion / thrown weapon)
 
 	// Emotes (72+ anim models; 64-anim models lack 60/61)
 	animEmoteWave  = 56
@@ -45,52 +53,57 @@ const (
 	animEmotePoint = 60
 	animEmoteCheer = 61
 
-	// Non-humanoid (monster) CPlayList slots (must match PS2 creature CPlayList table).
-	// Previously used F8 debug indices; corrected to CPlayList slots after PLSlotToRaw dispatch fix.
-	nhAnimAttack1      = 8  // CL slot 8: Attack1
-	nhAnimAttack2      = 9  // CL slot 9: Attack2
-	nhAnimHitStun      = 10 // CL slot 10: HitReaction
-	nhAnimCastSpell    = 11 // CL slot 11: SpellCast
+	// Non-humanoid (monster) CPlayList slots — verified against ESF CPlayList scan.
+	// Slots 8, 9, 16 do NOT exist on SkelType 0/2/3 models.
+	nhAnimAttack1      = 22 // CL slot 22: Attack1 (same slot as humanoid)
+	nhAnimAttack2      = 23 // CL slot 23: Attack2 (same slot as humanoid)
+	nhAnimHitStun      = 34 // CL slot 34: HitReaction (universal across all SkelTypes)
+	nhAnimCastSpell    = 37 // CL slot 37: SpellCast (universal across all SkelTypes)
 	nhAnimDeath        = 15 // CL slot 15: Death
-	nhAnimBattleStance = 16 // CL slot 16: BattleStance
+	nhAnimBattleStance = 17 // CL slot 17: BattleStance/Special (slot 16 doesn't exist)
 	nhAnimSpecialIdle  = 17 // CL slot 17: Special
 )
 
-// weaponAttackAnims maps VICSpriteAttackType → [Primary(s=0), Alt(s=0)] CPlayList slots.
-// PS2 alternates between SetAttackAction (0x00421820) and SetAttackAltAction (0x00421960)
-// on successive swings. Single-wield always uses attackSlot=0 (right hand).
-// Keys match ParsedItem.AttackType from MemoryDump / eqoa.db items table.
-var weaponAttackAnims = map[int][]byte{
-	0:  {23, 25},     // safety fallback (PS2 default is type 11, not 0)
-	1:  {25, 41},     // 1H Slash (sword): Primary=25, Alt=41
-	2:  {26, 42},     // 2H Slash (greatsword): Primary=26, Alt=42
-	3:  {41, 28},     // 1H Blunt (mace): Primary=41, Alt=28
-	4:  {42, 29},     // 2H Blunt (maul): Primary=42, Alt=29
-	5:  {28, 25},     // Hand-to-Hand (fist): Primary=28, Alt=25
-	6:  {29, 26},     // 2H Pierce (spear): Primary=29, Alt=26
-	7:  {31, 31},     // Bow
-	8:  {35, 35},     // Throwing: Primary=35, Alt=35
-	9:  {33, 33},     // Crossbow
-	10: {36, 36},     // Spell/Wand
-	11: {23, 25},     // Dagger: Primary=23, Alt=25
+// deriveLocomotion implements PS2 VIWalkControl::UpdateLocomotion (0x00487178)
+// for remote entities. The PS2 CLIENT derives locomotion animation from entity
+// velocity — it never reads the state channel animation byte for rendering.
+// Returns a CPlayList slot: 0=idle, 1=walk, 3=run, 12=swim.
+func deriveLocomotion(ent *game.Entity) byte {
+	// Use velocity to determine movement state.
+	speed := float32(math.Sqrt(float64(ent.VelX*ent.VelX + ent.VelZ*ent.VelZ)))
+	if speed < 0.5 {
+		return 0 // idle
+	}
+	// PS2 InitParms: walkSpeed=4.417, runSpeed=8.833. Threshold ~6.5 separates.
+	if speed < 6.5 {
+		return animWalk // CPlayList slot 1
+	}
+	return animRun // CPlayList slot 3
 }
 
-// weaponAttackAnimsDW is the dual-wield variant combining both PS2 functions.
-// 4-entry arrays: [Primary(s=0), Primary(s=1), Alt(s=0), Alt(s=1)] for full
-// 4-swing cycle. PS2 alternates right/left hand AND Primary/Alt per swing.
-var weaponAttackAnimsDW = map[int][]byte{
-	0:  {22, 23, 24, 25},     // safety fallback — offhand first
-	1:  {24, 25, 40, 41},     // 1H Slash: left/right × Primary/Alt
-	2:  {26, 42},             // 2H Slash (not dual-wielded)
-	3:  {40, 41, 27, 28},     // 1H Blunt: left/right × Primary/Alt
-	4:  {42, 29},             // 2H Blunt (not dual-wielded)
-	5:  {27, 28, 24, 25},     // Hand-to-Hand: left/right × Primary/Alt
-	6:  {29, 26},             // 2H Pierce (not dual-wielded)
-	7:  {31, 31},             // Bow
-	8:  {35, 32, 35, 32},     // Throwing: right(35)/left(32) hand throws
-	9:  {33, 33},             // Crossbow
-	10: {36, 36},             // Spell/Wand
-	11: {22, 23, 24, 25},     // Dagger: left/right × Primary/Alt
+// weaponAttackAnims maps VICSpriteAttackType → [Pri(s=0), Pri(s=1), Alt(s=0), Alt(s=1)].
+// Verified against PS2 SetAttackAction (0x00421820) and SetAttackAltAction (0x00421960)
+// jump tables at 0x004EA8B0 and 0x004EA8E0.
+// s=0 is right hand (primary weapon), s=1 is left hand (secondary/offhand).
+// Keys match ParsedItem.AttackType from MemoryDump / eqoa.db items table.
+// Slot semantics verified visually via animviewer (HumanM, 2026-07-21):
+//   22/23=unarmed off/main   24/25=slash off/main   26=2H slash
+//   27/28=poke off/main   29=2H poke   31=bow   33=crossbow   36=throw
+//   37-39=cast   40/41=slash-quad 3rd/4th (off/main)   42=2H smash
+// Rosetta stone: type 1 {25,24,41,40} = slash quad (off,main,off3rd,main4th) — correct.
+var weaponAttackAnims = map[int][4]byte{
+	0:  {23, 22, 25, 24}, // safety fallback → unarmed then slash
+	1:  {25, 24, 41, 40}, // 1H Slash (sword) — VERIFIED (Rosetta stone)
+	2:  {26, 26, 42, 42}, // 2H Slash (greatsword): pri 2H-slash, alt 2H-smash
+	3:  {28, 27, 25, 24}, // 1H Blunt (mace) → poke primary [CONFIRM in-game: poke vs slash]
+	4:  {42, 42, 29, 29}, // 2H Blunt (maul): pri 2H-smash, alt 2H-poke
+	5:  {23, 22, 43, 43}, // Hand-to-Hand (fist) → unarmed, kick alt (was poke/slash) [monk 50-53 = future variety]
+	6:  {29, 29, 26, 26}, // 2H Pierce (spear): pri 2H-poke, alt 2H-slash
+	7:  {31, 31, 31, 31}, // Bow — shoot
+	8:  {36, 36, 36, 36}, // Throwing → throw (was 35/32 = non-existent slots → idle fallback!)
+	9:  {33, 33, 33, 33}, // Crossbow — shoot
+	10: {37, 37, 38, 38}, // Spell/Wand → cast spell1/2 (was 36 = potion-throw, wrong)
+	11: {28, 27, 41, 40}, // Dagger (pierce) → poke primary [CONFIRM in-game: poke vs slash]
 }
 
 // combatAnimSet defines the animation bytes for a model type's combat actions.
@@ -480,6 +493,14 @@ func (am *AnimationManager) ConsumePendingPlayerHitFX() int {
 	return n
 }
 
+// PlayerCombatActivity marks the player as in combat with recent activity.
+// Called by spell FX PlayAttack to keep combat state alive (replaces the
+// role that DamageIndication AttackCount++ previously served).
+func (am *AnimationManager) PlayerCombatActivity() {
+	am.playerCombat.inCombat = true
+	am.playerCombat.lastActivity = time.Now()
+}
+
 // PlayerController returns the player's SpriteAnimController (nil if not created yet).
 func (am *AnimationManager) PlayerController() *models.SpriteAnimController {
 	return am.playerController
@@ -608,19 +629,17 @@ func (am *AnimationManager) resolveAnim(ctrl *models.SpriteAnimController, now t
 			}
 		} else {
 			// Global humanoid weapon attack table (PS2 SetAttackAction).
-			atkTable := weaponAttackAnims
-			if dw {
-				atkTable = weaponAttackAnimsDW
+			// Attack anims now driven by spell FX PlayAttack; this path is
+			// retained as fallback but rarely fires (AttackCount not incremented from DI).
+			atkType := p.weaponAttackType
+			if atkType < 0 {
+				atkType = 11 // unarmed default
 			}
-			if p.weaponAttackType >= 0 {
-				attackAnims = atkTable[p.weaponAttackType]
-				if attackAnims == nil {
-					attackAnims = atkTable[11]
-				}
-			} else if p.shield != 0 && p.primaryWeapon != 0 {
-				attackAnims = atkTable[3] // 1H blunt: primary hand fallback
+			if anims, ok := weaponAttackAnims[atkType]; ok {
+				attackAnims = anims[:]
 			} else {
-				attackAnims = atkTable[11] // unarmed (PS2 DetachItem default = type 11)
+				a := weaponAttackAnims[11]
+				attackAnims = a[:]
 			}
 		}
 		// Limit attack anims by class: casters/healers (7-14) only get single primary.
@@ -701,6 +720,22 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		gs.PlayerInCombat = false
 	}
 
+	// PS2 opcode 0x0777: server explicitly ended combat.
+	// Clear all combat state immediately instead of waiting for 5s timeout.
+	if gs.CombatEnded {
+		gs.CombatEnded = false
+		am.playerCombat.inCombat = false
+		am.playerCombat.combatAnim = 0
+		am.InCombat = false
+		am.CombatEngaged = false
+		engine.InCombat = false
+		engine.CombatEngaged = false
+		engine.AttackSent = false
+		ctrl.InCombat = false
+		ctrl.ClearAction()
+		log.Printf("COMBAT: server ended combat (opcode 0x0777)")
+	}
+
 	// Set controller dead/combat flags.
 	ctrl.IsDead = gs.Player.Dead || gs.Player.HPFlag == 3
 	ctrl.InCombat = am.playerCombat.inCombat
@@ -731,7 +766,7 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		class:              gs.Player.Class,
 		level:              gs.Player.Level,
 		isPC:               true,
-		weaponAttackType:   am.getWeaponAttackType(gs),
+		weaponAttackType:   am.GetWeaponAttackType(gs),
 		parsedItems:        gs.ParsedItems,
 		showBattleStance:   am.InCombat,
 		serverDrivenCombat: true,
@@ -872,8 +907,11 @@ func (am *AnimationManager) ResolveEntityAnim(ent *game.Entity, now time.Time) (
 	ctrl.IsDead = ent.HPFlag == 3
 	ctrl.InCombat = es.inCombat
 
-	// Server animation byte → CPlayList slot mapping.
-	baseLoco := ent.Animation
+	// PS2 VIWalkControl::UpdateLocomotion: derive locomotion from entity velocity.
+	// The PS2 CLIENT never reads the state channel animation byte for locomotion —
+	// it runs UpdateLocomotion on every entity which computes animation from movement.
+	// Walk speed threshold from PS2 InitParms: walkSpeed=4.417, runSpeed=8.833.
+	baseLoco := deriveLocomotion(ent)
 
 	// Route through resolveAnim → resolveCombat → controller.
 	am.resolveAnim(ctrl, now, animParams{
@@ -976,11 +1014,11 @@ func getWeaponAttackTypeFromItems(items []game.ParsedItem) int {
 	return 11
 }
 
-// getWeaponAttackType returns the AttackType of the equipped weapon.
+// GetWeaponAttackType returns the AttackType of the equipped weapon.
 // Slot 12=primary, 14=secondary, 15=twohand.
 // Returns 11 (dagger/unarmed) if no weapon equipped — matches PS2 DetachItem
 // which resets attackType to 11 (VICSpriteAttackType default).
-func (am *AnimationManager) getWeaponAttackType(gs *game.GameState) int {
+func (am *AnimationManager) GetWeaponAttackType(gs *game.GameState) int {
 	if gs == nil {
 		return 11
 	}

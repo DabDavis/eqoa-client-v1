@@ -50,13 +50,20 @@ type Engine struct {
 	facingResolver FacingResolver // set by visual client for entity facing angle
 
 	// PlayAttack callback (set by visual client for spell effect animation triggers)
-	playAttackCB func(actorObjID uint32, animPair int32)
+	playAttackCB func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32)
 
 	// SetAction callback (set by visual client for cast/action animation triggers)
 	setActionCB func(actorObjID uint32, actionType int32)
 
 	// IsActionComplete callback (set by visual client for Wait sub-type 0)
 	isActionCompleteCB func(actorObjID uint32) bool
+
+	// Trigger callbacks for spell FX HasTripped (Wait sub-type 3)
+	findTriggerCB  func(actorObjID uint32, triggerName string) (int, bool)
+	resetTriggerCB func(actorObjID uint32, triggerIdx int)
+	hasTrippedCB   func(actorObjID uint32, triggerIdx int) bool
+	isCSpriteCB    func(actorObjID uint32) bool
+	weaponTrailCB  func(actorObjID uint32, trailID int32, color [3]float32)
 
 	// 0x40 position send throttle — PS2 runs at 30fps and sends 0x40 at ~6/s
 	// (~every 5 frames). Visual client at 60fps must NOT queue per frame.
@@ -142,7 +149,7 @@ func (e *Engine) SetFacingResolver(resolve FacingResolver) {
 
 // SetPlayAttackCallback sets a callback for PlayAttack spell events (type 15).
 // Called with (actorObjID, animPairIndex) when a spell effect triggers an attack animation.
-func (e *Engine) SetPlayAttackCallback(cb func(actorObjID uint32, animPair int32)) {
+func (e *Engine) SetPlayAttackCallback(cb func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32)) {
 	e.playAttackCB = cb
 }
 
@@ -156,6 +163,22 @@ func (e *Engine) SetSetActionCallback(cb func(actorObjID uint32, actionType int3
 // PS2 checks VICSprite::IsActionComplete — returns true when play-once action finishes.
 func (e *Engine) SetIsActionCompleteCallback(cb func(actorObjID uint32) bool) {
 	e.isActionCompleteCB = cb
+}
+
+// SetTriggerCallbacks sets the FindTrigger/ResetTrigger/HasTripped/IsCSprite/WeaponTrail
+// callbacks for the PS2 spell FX trigger and weapon trail systems.
+func (e *Engine) SetTriggerCallbacks(
+	find func(actorObjID uint32, triggerName string) (int, bool),
+	reset func(actorObjID uint32, triggerIdx int),
+	hasTripped func(actorObjID uint32, triggerIdx int) bool,
+	isCSprite func(actorObjID uint32) bool,
+	weaponTrail func(actorObjID uint32, trailID int32, color [3]float32),
+) {
+	e.findTriggerCB = find
+	e.resetTriggerCB = reset
+	e.hasTrippedCB = hasTripped
+	e.isCSpriteCB = isCSprite
+	e.weaponTrailCB = weaponTrail
 }
 
 // loadSpellFXAuto tries ISO first, then assetsDir for SPELLFX loading.
@@ -194,6 +217,11 @@ func (e *Engine) Tick() {
 				e.SpellFX.OnPlayAttack = e.playAttackCB
 				e.SpellFX.OnSetAction = e.setActionCB
 				e.SpellFX.IsActionComplete = e.isActionCompleteCB
+				e.SpellFX.FindTrigger = e.findTriggerCB
+				e.SpellFX.ResetTrigger = e.resetTriggerCB
+				e.SpellFX.HasTripped = e.hasTrippedCB
+				e.SpellFX.IsCSprite = e.isCSpriteCB
+				e.SpellFX.SetWeaponTrail = e.weaponTrailCB
 				e.SpellFX.Audio = e.Audio
 				// Load spell sounds from SPELLFX file if audio available
 				if e.Audio != nil && sfx.File() != nil {

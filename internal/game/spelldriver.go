@@ -122,6 +122,16 @@ type SpellEventDriver struct {
 	projectileInitDist   float32          // initial caster-to-target distance (for speed calc)
 	projectileEvent      *esf.SpellEvent  // source event for field access during flight
 
+	// PS2 actionNodeID at +0x34. Return value from SetAttackAction/SetAttackAltAction.
+	// Used by Wait(sub-type 0) to check IsActionComplete for the specific action.
+	// -1 = no action set (Wait type 0 clears immediately when -1).
+	actionNodeID int // PS2 VISpellEventDriver+0x34
+
+	// PS2 VISpellEventDriver animNodes[4] at +0x38..+0x44.
+	// Set by NewPlayAttack via FindTrigger("Spell FX 1-4").
+	// Checked by Wait(sub-type 3) via HasTripped.
+	animNodes [4]int // trigger indices (-1 = not set)
+
 	// Lightning state (phase 2)
 	lightningActive  bool
 	lightningStart   time.Time
@@ -163,9 +173,11 @@ func (d *SpellEventDriver) resolveGlobalID(localID int32) int32 {
 
 func newSpellEventDriver(eff *SpellEffectDriver, events []esf.SpellEvent, actorID uint32, listIndex int) *SpellEventDriver {
 	return &SpellEventDriver{
-		effDriver: eff,
-		events:    events,
-		listIndex: listIndex,
+		effDriver:    eff,
+		events:       events,
+		listIndex:    listIndex,
+		actionNodeID: -1,
+		animNodes:    [4]int{-1, -1, -1, -1},
 		actorID:   actorID,
 	}
 }
@@ -269,13 +281,15 @@ func (d *SpellEventDriver) processWait(now time.Time) {
 	switch d.waitSubType {
 	case 0:
 		// Wait for actor action completion.
-		// PS2: GetActorSpritePtr → check state==5 → IsActionComplete(sprite, actionID).
-		if d.effDriver.system != nil && d.effDriver.system.IsActionComplete != nil {
+		// PS2: if actionNodeID == -1, clear immediately (no action to wait for).
+		// Otherwise: GetActorSpritePtr → check state==5 → IsActionComplete(sprite, actionNodeID).
+		if d.actionNodeID == -1 {
+			d.waitEvent = nil
+		} else if d.effDriver.system != nil && d.effDriver.system.IsActionComplete != nil {
 			if d.effDriver.system.IsActionComplete(d.actorID) {
 				d.waitEvent = nil
 			}
 		} else {
-			// No callback — complete immediately (fallback).
 			d.waitEvent = nil
 		}
 
@@ -295,11 +309,32 @@ func (d *SpellEventDriver) processWait(now time.Time) {
 
 	case 3:
 		// Wait for actor condition with Fields[2] as timeout.
-		// PS2: checks actor state + condition (Fields[1] indexes animNodes[]),
-		// then falls through to timer check using Fields[2].
-		// We lack actor state, so use Fields[2] as pure timeout.
-		// PS2: slt comparison, so Fields[2]=0 clears immediately (0 < any positive elapsed).
-		if int64(d.waitDuration) < elapsedMS {
+		// PS2 at 0x0047A370: checks sprite->state==5 AND HasTripped(sprite, animNodes[Fields[1]])
+		// If sprite is not a CSprite (state!=5) or actorID==-1, wait clears immediately.
+		// If CSprite: HasTripped OR Fields[2] timeout.
+		sys := d.effDriver.system
+
+		// PS2 fast-clear: non-CSprite actors skip HasTripped entirely.
+		isCSprite := true
+		if sys != nil && sys.IsCSprite != nil {
+			isCSprite = sys.IsCSprite(d.actorID)
+		}
+		if !isCSprite {
+			d.waitEvent = nil
+			break
+		}
+
+		cleared := false
+		if sys != nil && sys.HasTripped != nil {
+			nodeIdx := int(d.waitEvent.event.Fields[1])
+			if nodeIdx >= 0 && nodeIdx < 4 {
+				triggerIdx := d.animNodes[nodeIdx]
+				if triggerIdx >= 0 {
+					cleared = sys.HasTripped(d.actorID, triggerIdx)
+				}
+			}
+		}
+		if cleared || int64(d.waitDuration) < elapsedMS {
 			d.waitEvent = nil
 		}
 
@@ -1276,13 +1311,44 @@ func (d *SpellEventDriver) newPlayAttack(ev *esf.SpellEvent) {
 	//     1 → SetAttackAction(slot=1)    — secondary weapon, primary swing
 	//     2 → SetAttackAltAction(slot=0) — primary weapon, alt swing
 	//     3 → SetAttackAltAction(slot=1) — secondary weapon, alt swing
-	//   Fields[1] = target actor ID (for PlayDirectedAttack orientation)
-	//   Floats[0-2] = target position XYZ (for PlayDirectedAttack)
-	// PS2 also finds and clears "Spell FX 1-4" sub-sprite slots (cosmetic cleanup).
+	//   Fields[1] = weapon trail attachment ID (passed to SetWeaponTrail)
+	//   Floats[0-2] = weapon trail color RGB (passed to SetWeaponTrail as VIColor32F)
 	animPair := ev.Fields[0]
+	trailColor := [3]float32{ev.Floats[0], ev.Floats[1], ev.Floats[2]}
+	trailID := ev.Fields[1]
 
-	if d.effDriver.system != nil && d.effDriver.system.OnPlayAttack != nil {
-		d.effDriver.system.OnPlayAttack(d.actorID, animPair)
+	sys := d.effDriver.system
+	if sys == nil {
+		return
+	}
+
+	// Trigger attack animation.
+	// PS2 stores SetAttackAction return value as actionNodeID for Wait(type 0).
+	if sys.OnPlayAttack != nil {
+		sys.OnPlayAttack(d.actorID, animPair, trailColor, trailID)
+		d.actionNodeID = 0 // 0 = "action set" (vs -1 = "no action")
+	}
+
+	// PS2 SetWeaponTrail: stores trail attachment ID + RGBA color on CSprite.
+	// ProcessWeaponTrails renders trail geometry from consecutive bone positions.
+	if sys.SetWeaponTrail != nil {
+		sys.SetWeaponTrail(d.actorID, trailID, trailColor)
+	}
+
+	// PS2: Find and reset "Spell FX 1-4" trigger points on the actor's HSprite.
+	// These triggers fire at animation keyframes. Wait(sub-type 3) checks HasTripped
+	// on these indices to know when the swing animation has reached its impact point.
+	triggerNames := [4]string{"Spell FX 1", "Spell FX 2", "Spell FX 3", "Spell FX 4"}
+	for i := 0; i < 4; i++ {
+		d.animNodes[i] = -1
+		if sys.FindTrigger != nil {
+			if idx, ok := sys.FindTrigger(d.actorID, triggerNames[i]); ok {
+				d.animNodes[i] = idx
+				if sys.ResetTrigger != nil {
+					sys.ResetTrigger(d.actorID, idx)
+				}
+			}
+		}
 	}
 }
 
@@ -1396,7 +1462,7 @@ func newSpellEffectDriver(effect *esf.SpellEffect, caster, target uint32, ps *Pa
 // Port of VISpellEffectDriver::Trigger at 0x0047AC90.
 // PS2: Trigger() calls AddSpellEventDriver(eventLists[0], casterActorID) — only Caster.
 // Target/Area event drivers are created on-demand by PlayTargetProjectile/Lightning/Instant.
-func (d *SpellEffectDriver) Trigger(durationMS, flags int) {
+func (d *SpellEffectDriver) Trigger(durationMS, flags int, startTime time.Time) {
 	if len(d.eventDrivers) > 0 {
 		return
 	}
@@ -1404,7 +1470,10 @@ func (d *SpellEffectDriver) Trigger(durationMS, flags int) {
 	if d.casterObjID == 0xFFFFFFFF {
 		return
 	}
-	d.triggerTime = time.Now()
+	if startTime.IsZero() {
+		startTime = time.Now()
+	}
+	d.triggerTime = startTime
 	d.triggerDurMS = durationMS
 	d.triggerFlags = flags
 
@@ -1505,8 +1574,9 @@ type SpellEffectSystem struct {
 	Audio AudioPlayer
 
 	// PlayAttack callback — visual client sets this to receive animation triggers.
-	// Called with (actorObjID, animPairIndex). One-shot, no active event created.
-	OnPlayAttack func(actorObjID uint32, animPair int32)
+	// Called with (actorObjID, animPairIndex, trailColor, trailID). One-shot.
+	// PS2 also calls SetWeaponTrail with color from Floats[0-2] and ID from Fields[1].
+	OnPlayAttack func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32)
 
 	// SetAction callback — visual client sets this to receive action/cast animation triggers.
 	// PS2 NewSetAction calls VICSprite::SetAction(actor, Fields[0], Floats[0]).
@@ -1516,6 +1586,29 @@ type SpellEffectSystem struct {
 	// IsActionComplete callback — PS2 Wait sub-type 0 checks actor animation state.
 	// Returns true when the actor's play-once action animation has finished.
 	IsActionComplete func(actorObjID uint32) bool
+
+	// FindTrigger finds the trigger index for a named trigger on an actor's HSprite.
+	// PS2 FindTrigger at 0x004464E8: linear search trigger array for name hash match.
+	// Returns (index, true) if found, (-1, false) if not.
+	FindTrigger func(actorObjID uint32, triggerName string) (int, bool)
+
+	// ResetTrigger clears the tripped flag for a trigger at the given index.
+	// PS2 ResetTrigger at 0x00446550: sets triggerArray[idx*16+4] = 0.
+	ResetTrigger func(actorObjID uint32, triggerIdx int)
+
+	// HasTripped returns true if the trigger at the given index has fired.
+	// PS2 HasTripped at 0x00446538: returns triggerArray[idx*16+4] != 0.
+	HasTripped func(actorObjID uint32, triggerIdx int) bool
+
+	// IsCSprite returns true if the actor is a CSprite (skeletal model with equipment).
+	// PS2 checks sprite->state == 5. Non-CSprite actors (creatures, SimpleSprites)
+	// skip HasTripped in Wait type 3 and clear immediately.
+	IsCSprite func(actorObjID uint32) bool
+
+	// SetWeaponTrail callback — visual client sets this to activate weapon swing trails.
+	// PS2 SetWeaponTrail at 0x00422C60: stores trail ID and color on the CSprite.
+	// ProcessWeaponTrails renders trail geometry from bone positions across frames.
+	SetWeaponTrail func(actorObjID uint32, trailID int32, color [3]float32)
 }
 
 // NewSpellEffectSystem creates a new spell effect system.
@@ -1530,7 +1623,9 @@ func NewSpellEffectSystem(db *SpellFXDB) *SpellEffectSystem {
 // effectID = SpellEffect DictID (animHash from CastingCombat 0x00B1).
 // castTimeMS = cast duration in ms (0 for instant).
 // casterObjID/targetObjID = entity ObjectIDs.
-func (sys *SpellEffectSystem) Play(effectID uint32, castTimeMS uint16, casterObjID, targetObjID uint32) {
+// startTime = when the cast began (zero = now). Allows backdating triggerTime
+// so Wait(sub-type 2) expires relative to actual cast start, not arrival time.
+func (sys *SpellEffectSystem) Play(effectID uint32, castTimeMS uint16, casterObjID, targetObjID uint32, startTime time.Time) {
 	if sys == nil || sys.db == nil {
 		return
 	}
@@ -1557,7 +1652,7 @@ func (sys *SpellEffectSystem) Play(effectID uint32, castTimeMS uint16, casterObj
 
 	driver := newSpellEffectDriver(se, casterObjID, targetObjID, sys.Particles, sys.ResolvePos, sys.ResolveBone, sys.ResolveFacing, sys)
 	// PS2 Play() at 0x0047BCA8: Trigger(castTime, 10000) — flags hardcoded to 0x2710
-	driver.Trigger(int(castTimeMS), 10000)
+	driver.Trigger(int(castTimeMS), 10000, startTime)
 	sys.drivers = append(sys.drivers, driver)
 }
 
