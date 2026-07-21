@@ -178,10 +178,16 @@ Nginx serves from `/home/sdg/www/tpacks.art/eqoa/eqoa/`:
 
 **Always use `deploy.sh`** for normal updates. It builds both platforms, generates the manifest, and pushes to the update server in one step.
 
+Update-server Basic Auth creds are **injected at build time** (`-ldflags -X main.updateUser/updatePass`), not hardcoded. Set them via the git-ignored secrets file before deploying:
+
 ```bash
 cd /home/sdg/claude-eqoa/go-eqoa-client-v1
+cp scripts/.deploy-secrets.example scripts/.deploy-secrets   # first time only, then edit
+source scripts/.deploy-secrets
 ./scripts/deploy.sh
 ```
+
+The scripts fail fast if `EQOA_UPDATE_USER`/`EQOA_UPDATE_PASS` are unset. Note: the creds still end up embedded in the shipped binary (strings-extractable) — the client authenticates to a public download endpoint, so this Basic Auth is a soft scraping gate, not a real secret. Real integrity = SHA-256 check (+ future signing).
 
 The client is a single binary — all assets are read from the EQOA Frontiers ISO at runtime. No fonts, asset folders, or archives needed.
 

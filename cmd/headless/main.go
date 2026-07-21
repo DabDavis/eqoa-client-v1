@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -16,11 +18,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/eqoa/client/internal/game"
 )
+
+// gameMu serializes all GameState access in this dev tool. Unlike the shipped
+// client (where Tick and every read run on the single render goroutine), the
+// headless REPL touches GameState from several goroutines: the 100ms tick loop
+// (writes via ProcessPacket), the stdin/TCP command handlers, and long-running
+// command goroutines (track/interp/auction). Hold gameMu around any GameState
+// access — but never across a time.Sleep, or the tick loop would stall.
+var gameMu sync.Mutex
 
 // lastTargetID tracks the most recently targeted ObjectID (set by target command).
 var lastTargetID uint32
@@ -57,38 +68,43 @@ func main() {
 	engine.AutoConnect = *autoConnect
 	engine.AssetsDir = *assetsDir
 
-	// Auto-select character when list arrives
+	// Auto-select is handled on the tick goroutine below (folded in so it no
+	// longer races the tick loop's GameState writes).
+	autoSelectIdx := -1
 	if *autoSelect > 0 {
-		charIdx := *autoSelect - 1
-		go func() {
-			for {
-				time.Sleep(200 * time.Millisecond)
-				gs := engine.State
-				if gs.Phase == game.PhaseCharSelect && len(gs.Characters) > charIdx {
-					log.Printf("Auto-selecting character %d: %s", *autoSelect, gs.Characters[charIdx].Name)
-					gs.SelectCharacter(charIdx)
-					// CharacterInWorld is sent automatically by handleMemoryDump
-					// in state.go after the server's MemoryDump response is fully
-					// processed. Sending it early confuses Sandstorm and prevents
-					// entity state channels from being delivered.
-					return
-				}
-			}
-		}()
+		autoSelectIdx = *autoSelect - 1
 	}
+	autoSelectDone := false
 
-	// Start tick loop (100ms interval) — also monitors combat/state events
+	// Start tick loop (100ms interval) — also monitors combat/state events.
+	// The whole iteration runs under gameMu so GameState is never mutated while
+	// a command handler reads it.
 	ticker := time.NewTicker(100 * time.Millisecond)
 	var lastDICount, lastCCCount int
 	var lastCombatLog time.Time
 	go func() {
 		for range ticker.C {
+			gameMu.Lock()
 			engine.Tick()
+
+			// Auto-select the character once the list arrives (same goroutine as
+			// Tick, so no race on Phase/Characters).
+			gs := engine.State
+			if !autoSelectDone && autoSelectIdx >= 0 &&
+				gs.Phase == game.PhaseCharSelect && len(gs.Characters) > autoSelectIdx {
+				autoSelectDone = true
+				log.Printf("Auto-selecting character %d: %s", autoSelectIdx+1, gs.Characters[autoSelectIdx].Name)
+				gs.SelectCharacter(autoSelectIdx)
+				// CharacterInWorld is sent automatically by handleMemoryDump in
+				// state.go after the server's MemoryDump response is fully
+				// processed. Sending it early confuses Sandstorm and prevents
+				// entity state channels from being delivered.
+			}
 
 			// Live combat monitor — prints DamageIndication, CastingCombat, and
 			// state diffs to stdout so they scroll in the interactive console.
-			gs := engine.State
 			if gs == nil || gs.Phase != game.PhaseInWorld {
+				gameMu.Unlock()
 				continue
 			}
 
@@ -108,6 +124,7 @@ func main() {
 
 			// CastingCombat count tracking
 			_ = lastCCCount
+			gameMu.Unlock()
 		}
 	}()
 
@@ -146,18 +163,11 @@ func main() {
 						continue
 					}
 					fmt.Fprintf(c, "> %s\n", line)
-					// Capture stdout during command by temporarily redirecting
-					oldStdout := os.Stdout
-					r, w, _ := os.Pipe()
-					os.Stdout = w
-					handleCommand(engine, line)
-					w.Close()
-					os.Stdout = oldStdout
-					var buf [4096]byte
-					n, _ := r.Read(buf[:])
-					r.Close()
-					if n > 0 {
-						c.Write(buf[:n])
+					// Run under gameMu and capture the command's stdout (see
+					// runCommandCapture) so the os.Stdout swap can't race the
+					// tick loop's printing.
+					if out := runCommandCapture(engine, line); len(out) > 0 {
+						c.Write(out)
 					}
 				}
 			}(conn)
@@ -171,13 +181,57 @@ func main() {
 		if line == "" {
 			continue
 		}
-		handleCommand(engine, line)
+		runCommand(engine, line)
 	}
 
 	// If stdin closes (piped input), keep running so the tick loop continues
 	select {}
 }
 
+// runCommand executes a command from the stdin REPL, holding gameMu.
+func runCommand(engine *game.Engine, line string) {
+	gameMu.Lock()
+	defer gameMu.Unlock()
+	handleCommand(engine, line)
+}
+
+// runCommandCapture executes a command from the TCP command port and returns
+// whatever it printed to stdout. os.Stdout is a process-global, so the swap is
+// done under gameMu — the same lock the tick loop and stdin REPL hold while
+// printing — which keeps it from racing (or misrouting tick output into the
+// capture pipe). The pipe is drained concurrently so large output neither
+// truncates nor deadlocks on a full pipe buffer.
+func runCommandCapture(engine *game.Engine, line string) []byte {
+	gameMu.Lock()
+	defer gameMu.Unlock()
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		handleCommand(engine, line)
+		return nil
+	}
+	os.Stdout = w
+
+	var out bytes.Buffer
+	drained := make(chan struct{})
+	go func() { io.Copy(&out, r); close(drained) }()
+
+	handleCommand(engine, line)
+
+	os.Stdout = oldStdout
+	w.Close()
+	<-drained
+	r.Close()
+	return out.Bytes()
+}
+
+// handleCommand dispatches one REPL/TCP command. The caller MUST hold gameMu
+// (see runCommand / the TCP handler) — this serializes GameState access against
+// the tick loop and other handlers, and lets the TCP path swap os.Stdout under
+// the same lock. Commands that sleep or spawn long-running goroutines release
+// gameMu around the blocking part (see "sleep", "fight", "quit", track/interp/
+// auction), always re-acquiring it before returning.
 func handleCommand(engine *game.Engine, line string) {
 	parts := strings.Fields(line)
 	cmd := strings.ToLower(parts[0])
@@ -260,7 +314,11 @@ func handleCommand(engine *game.Engine, line string) {
 				secs = v
 			}
 		}
+		// Pure REPL-pacing delay — touches no GameState. Release gameMu so the
+		// tick loop keeps running (heartbeats, packet processing) while we wait.
+		gameMu.Unlock()
 		time.Sleep(time.Duration(secs * float64(time.Second)))
+		gameMu.Lock()
 
 	case "status":
 		gs := engine.State
@@ -303,7 +361,9 @@ func handleCommand(engine *game.Engine, line string) {
 			return
 		}
 		fmt.Printf("Connecting to server %d: %s\n", n, gs.Servers[n-1].Name)
-		go engine.ConnectToGameServer(n - 1)
+		// Run inline (not `go`): ConnectToGameServer is quick and is designed to
+		// run on the owning goroutine — spawning it raced Phase/StatusMsg writes.
+		engine.ConnectToGameServer(n - 1)
 
 	case "chars":
 		gs := engine.State
@@ -937,8 +997,10 @@ func handleCommand(engine *game.Engine, line string) {
 			firstFrame := true
 
 			for time.Since(start).Seconds() < durationS {
+				gameMu.Lock()
 				ent, ok := gs.Entities[trackID]
 				if !ok {
+					gameMu.Unlock()
 					fmt.Printf("  [track] Entity %d despawned\n", trackID)
 					break
 				}
@@ -979,13 +1041,16 @@ func handleCommand(engine *game.Engine, line string) {
 						ent.VelX, ent.VelZ, gap,
 						ent.Animation, ageMs, intervalMsF)
 				}
+				gameMu.Unlock()
 
 				time.Sleep(time.Duration(intervalMs) * time.Millisecond)
 			}
 			if f != nil {
 				f.Close()
 			}
+			gameMu.Lock()
 			gs.DebugEntityMovement = false
+			gameMu.Unlock()
 			fmt.Printf("Tracking %q complete. CSV at /tmp/track_%s.csv\n", trackName, strings.ReplaceAll(trackName, " ", "_"))
 		}()
 
@@ -1050,6 +1115,7 @@ func handleCommand(engine *game.Engine, line string) {
 			startTime := time.Now()
 
 			for frame := 0; time.Since(startTime) < 30*time.Second; frame++ {
+				gameMu.Lock()
 				gs.InterpolateEntities(dt)
 
 				for id, ent := range gs.Entities {
@@ -1107,6 +1173,7 @@ func handleCommand(engine *game.Engine, line string) {
 						}
 					}
 				}
+				gameMu.Unlock()
 
 				// Periodic report
 				if time.Since(lastReport) > reportInterval {
@@ -1261,25 +1328,32 @@ func handleCommand(engine *game.Engine, line string) {
 				delayMs = n
 			}
 		}
-		fmt.Printf("Fight sequence: slot=%d count=%d delay=%dms target=0x%08X\n", slot, count, delayMs, lastTargetID)
+		tgt := lastTargetID
+		fmt.Printf("Fight sequence: slot=%d count=%d delay=%dms target=0x%08X\n", slot, count, delayMs, tgt)
 
 		// Step 1: Target + flush 0x40 to propagate target to server
-		engine.SendTarget(lastTargetID)
+		engine.SendTarget(tgt)
 		engine.ForcePositionFlush()
 		fmt.Println("  [1] Target + 0x40 flush sent")
 
-		// Step 2: Wait for server to process 0x40 with target
+		// Step 2: Wait for server to process 0x40 with target. Release gameMu so
+		// the tick loop keeps running during the wait.
+		gameMu.Unlock()
 		time.Sleep(500 * time.Millisecond)
+		gameMu.Lock()
 
 		// Step 3: Send attack to start auto-attack
-		engine.SendAttack(lastTargetID)
+		engine.SendAttack(tgt)
 		fmt.Println("  [2] Attack sent")
 
-		// Step 4: Cast spells with delays for cooldowns
+		// Step 4: Cast spells with delays for cooldowns. Runs after this handler
+		// releases gameMu, so it takes the lock around each engine call.
 		go func() {
 			for i := 0; i < count; i++ {
 				time.Sleep(time.Duration(delayMs) * time.Millisecond)
-				engine.SendCast(slot, lastTargetID)
+				gameMu.Lock()
+				engine.SendCast(slot, tgt)
+				gameMu.Unlock()
 				fmt.Printf("  [%d] Cast slot %d sent\n", i+3, slot)
 			}
 			fmt.Println("Fight sequence complete")
@@ -1735,14 +1809,23 @@ func handleCommand(engine *game.Engine, line string) {
 			go func() {
 				for page := 2; page <= 20; page++ {
 					time.Sleep(2 * time.Second)
-					if gs.AuctionLastListing == 0 || len(gs.AuctionItems) >= gs.AuctionTotalCount {
+					gameMu.Lock()
+					done := gs.AuctionLastListing == 0 || len(gs.AuctionItems) >= gs.AuctionTotalCount
+					cursor := gs.AuctionLastListing
+					if !done {
+						engine.SendAuctionNextPage()
+					}
+					gameMu.Unlock()
+					if done {
 						break
 					}
-					engine.SendAuctionNextPage()
-					fmt.Printf("Auction: fetching page %d (cursor=%d)...\n", page, gs.AuctionLastListing)
+					fmt.Printf("Auction: fetching page %d (cursor=%d)...\n", page, cursor)
 				}
 				time.Sleep(2 * time.Second)
-				fmt.Printf("Auction: complete — %d/%d items loaded\n", len(gs.AuctionItems), gs.AuctionTotalCount)
+				gameMu.Lock()
+				loaded, total := len(gs.AuctionItems), gs.AuctionTotalCount
+				gameMu.Unlock()
+				fmt.Printf("Auction: complete — %d/%d items loaded\n", loaded, total)
 			}()
 		} else {
 			// Default: fetch page 1 (or show cached)
@@ -1826,7 +1909,11 @@ func handleCommand(engine *game.Engine, line string) {
 	case "quit":
 		game.PrintOpcodeStats()
 		engine.SendDisconnect()
-		time.Sleep(200 * time.Millisecond) // let disconnect flush
+		// Release gameMu so the tick loop can actually flush the disconnect
+		// during this wait (that's the whole point of the delay).
+		gameMu.Unlock()
+		time.Sleep(200 * time.Millisecond)
+		gameMu.Lock()
 		gs := engine.State
 		if gs.Conn != nil {
 			gs.Conn.Close()

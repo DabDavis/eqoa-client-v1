@@ -2070,12 +2070,12 @@ func (gs *GameState) decodePlayerState(data []byte) {
 		gs.Player.World = data[17]
 	}
 
-	// HPFlag: offset 26 (1=alive, 3=dead)
-	gs.Player.HPFlag = data[26]
-
-	// HP bar: offset 27 (0-255)
-	gs.Player.HP = data[27]
-	gs.Player.MaxHP = 255
+	// HP: offset 26 flag (1=alive, 3=dead), offset 27 bar (0-255).
+	if len(data) >= 28 {
+		gs.Player.HPFlag = data[26]
+		gs.Player.HP = data[27]
+		gs.Player.MaxHP = 255
+	}
 
 	// ModelID: offset 28-31 (uint32 LE) — changes during form/illusion spells.
 	// PS2 pcap verified: server changes this from e.g. 0x70D898C6 (Human male) to
@@ -2367,15 +2367,17 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 	}
 
 	// HP bar: offset 26 (HP flag: 1=alive, 3=dead), offset 27 (0-255 proportional)
-	oldHP := ent.HP
-	ent.HP = data[27]
-	ent.MaxHP = 255
-	hpFlag := data[26]
-	if oldHP != 0 && (ent.HP != oldHP || hpFlag != ent.HPFlag) {
-		log.Printf("ENTITY HP CHANGED ch=%d %q objID=0x%08X: hp=%d→%d flag=%d→%d",
-			channel, ent.Name, ent.ObjectID, oldHP, ent.HP, ent.HPFlag, hpFlag)
+	if len(data) >= 28 {
+		oldHP := ent.HP
+		ent.HP = data[27]
+		ent.MaxHP = 255
+		hpFlag := data[26]
+		if oldHP != 0 && (ent.HP != oldHP || hpFlag != ent.HPFlag) {
+			log.Printf("ENTITY HP CHANGED ch=%d %q objID=0x%08X: hp=%d→%d flag=%d→%d",
+				channel, ent.Name, ent.ObjectID, oldHP, ent.HP, ent.HPFlag, hpFlag)
+		}
+		ent.HPFlag = hpFlag
 	}
-	ent.HPFlag = hpFlag
 
 	// ModelID: offset 27-30 (uint32 LE)
 	if len(data) >= 32 {

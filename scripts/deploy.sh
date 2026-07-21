@@ -10,11 +10,17 @@ DIST_DIR="$PROJECT_DIR/dist"
 
 cd "$PROJECT_DIR"
 
+# Update-server HTTP Basic Auth credentials — injected at build time, never
+# hardcoded in source. Export these before running (e.g. from a git-ignored
+# secrets file: `source scripts/.deploy-secrets`).
+: "${EQOA_UPDATE_USER:?Set EQOA_UPDATE_USER (update-server basic-auth user)}"
+: "${EQOA_UPDATE_PASS:?Set EQOA_UPDATE_PASS (update-server basic-auth pass)}"
+
 BUILD_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
 BUILD_VERSION="$(date +%Y%m%d)-${BUILD_HASH}"
 # Changelog: last 5 commit subjects for update popup (newlines as \n for JSON)
 CHANGELOG="$(git log -5 --format='- %s' 2>/dev/null | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}' | sed 's/\\n$//' || echo '')"
-LDFLAGS="-s -w -X main.BuildVersion=${BUILD_VERSION}"
+LDFLAGS="-s -w -X main.BuildVersion=${BUILD_VERSION} -X main.updateUser=${EQOA_UPDATE_USER} -X main.updatePass=${EQOA_UPDATE_PASS}"
 
 echo "=== Deploy v${BUILD_VERSION} ==="
 
@@ -106,4 +112,4 @@ fi
 # Verify
 echo ""
 echo "=== Deployed v${BUILD_VERSION} ==="
-curl -s -u eqoa:'REDACTED' https://texturepacks.art/eqoa/manifest.json | head -1
+curl -s -u "${EQOA_UPDATE_USER}:${EQOA_UPDATE_PASS}" https://texturepacks.art/eqoa/manifest.json | head -1

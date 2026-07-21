@@ -83,9 +83,11 @@ type Loader struct {
 	Regions   *esf.WorldRegions   // biome region IDs per zone proxy (for ambient sounds)
 	zones     []*esf.ObjInfo
 
-	mu        sync.Mutex
-	loaded    map[int]*loadedZone   // proxyIdx → loaded zone
-	loadQueue chan loadRequest       // serialized load queue
+	mu            sync.Mutex
+	loaded        map[int]*loadedZone // proxyIdx → loaded zone
+	loadQueue     chan loadRequest    // serialized load queue
+	workerStopped chan struct{}       // closed by loadWorker when it exits
+	closed        bool                // set by Close(); rejects further loads
 
 	// Zone overlays: proxyIdx → standalone ESF file replacing that zone.
 	overlays map[int]*esf.ObjFile
@@ -361,6 +363,10 @@ func (l *Loader) FindNearbyZones(x, z, radius float32) []int {
 // Loading is serialized (one at a time) because esf.ObjFile is not goroutine-safe.
 func (l *Loader) EnsureZoneLoaded(proxyIndex int) {
 	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return // loader discarded (world switch) — ignore late load requests
+	}
 	if l.loaded == nil {
 		l.loaded = make(map[int]*loadedZone)
 	}
@@ -373,15 +379,18 @@ func (l *Loader) EnsureZoneLoaded(proxyIndex int) {
 
 	// Start the serialized loader goroutine if not already running.
 	needStart := l.loadQueue == nil
-	if l.loadQueue == nil {
+	if needStart {
 		l.loadQueue = make(chan loadRequest, 32)
+		l.workerStopped = make(chan struct{})
 	}
+	queue := l.loadQueue
+	stopped := l.workerStopped
 	l.mu.Unlock()
 
 	if needStart {
-		go l.loadWorker()
+		go l.loadWorker(queue, stopped)
 	}
-	l.loadQueue <- loadRequest{proxyIndex: proxyIndex, lz: lz}
+	queue <- loadRequest{proxyIndex: proxyIndex, lz: lz}
 }
 
 type loadRequest struct {
@@ -390,8 +399,11 @@ type loadRequest struct {
 }
 
 // loadWorker processes zone loads one at a time to avoid concurrent ObjFile access.
-func (l *Loader) loadWorker() {
-	for req := range l.loadQueue {
+// It ranges over its own queue and signals stopped on exit so Close() can wait
+// for any in-flight load to finish before closing file handles.
+func (l *Loader) loadWorker(queue chan loadRequest, stopped chan struct{}) {
+	defer close(stopped)
+	for req := range queue {
 		terrain, err := l.loadZone(req.proxyIndex)
 		// Release ESF object cache after each zone load — parsed objects are no longer
 		// needed once terrain data is extracted. Saves ~86MB from GC pointer scanning.
@@ -410,6 +422,45 @@ func (l *Loader) loadWorker() {
 			log.Printf("terrain: zone %d ready — %d tris in %d tiles", req.proxyIndex, terrain.NumTris, len(terrain.Tiles))
 		}
 	}
+}
+
+// Close stops the async load worker and releases the underlying ESF file
+// handles (the world file plus any zone overlays). Call it when a Loader is
+// discarded — e.g. on world switch — to avoid leaking OS file handles and the
+// loadWorker goroutine. Safe to call more than once.
+func (l *Loader) Close() {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	l.closed = true
+	queue := l.loadQueue
+	stopped := l.workerStopped
+	l.loadQueue = nil
+	l.mu.Unlock()
+
+	// Stop the worker and wait for any in-flight zone load to finish before
+	// closing file handles — the worker streams object data from l.file.
+	if queue != nil {
+		close(queue)
+	}
+	if stopped != nil {
+		<-stopped
+	}
+
+	l.mu.Lock()
+	if l.file != nil {
+		l.file.Close()
+		l.file = nil
+	}
+	for idx, ov := range l.overlays {
+		if ov != nil {
+			ov.Close()
+		}
+		delete(l.overlays, idx)
+	}
+	l.mu.Unlock()
 }
 
 // UnloadZone removes a loaded zone. Caller must also clean up GPU resources.

@@ -1,1 +1,4 @@
 client-dev
+
+# Deploy secrets — update-server credentials, never commit.
+scripts/.deploy-secrets

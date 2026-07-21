@@ -938,6 +938,14 @@ func (r *Renderer) resetZoneSlot(zs *zoneSlot) {
 	for i := range zs.groups {
 		rl.UnloadMesh(&zs.groups[i].Mesh)
 	}
+	// Unload GPU textures uploaded for this zone. Without this, evicted
+	// zones leak VRAM — texture memory grows monotonically as the player
+	// streams zones over a long session.
+	for _, tex := range zs.texCache {
+		if tex.ID > 0 {
+			rl.UnloadTexture(tex)
+		}
+	}
 	zs.groups = nil
 	zs.built = false
 	zs.prepared = false

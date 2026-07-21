@@ -69,7 +69,7 @@ func presencePing(username string) {
 	if err != nil {
 		return
 	}
-	req.SetBasicAuth(updateUser, updatePass)
+	setUpdateAuth(req)
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -232,8 +232,9 @@ type Client struct {
 	loginPass     string
 	loginFocus    int    // 0=username, 1=password, 2=remember checkbox
 	loginRemember bool   // "Remember me" checkbox state
-	loginError    string // error message from last attempt
-	loginBusy      bool   // true while auth goroutine running
+	loginError    string // error message from last attempt (main goroutine only)
+	loginBusy      bool   // true while auth goroutine running (main goroutine only)
+	loginResultCh  chan loginResult // auth goroutine → main goroutine handoff
 	loginWantsExit  bool // true when window close requested
 	loginWantsTitle bool // true when back arrow clicked (return to title)
 	assetsDir      string // saved for engine creation after login
@@ -602,6 +603,7 @@ func main() {
 			client.attemptLogin()
 			// Spin until engine is created or login fails (draw a status frame each tick)
 			for !rl.WindowShouldClose() && client.engine == nil && !client.loginWantsExit {
+				client.pollLoginResult()
 				rl.BeginDrawing()
 				client.loadScrAngle += 60.0 * rl.GetFrameTime()
 				client.drawLoadingScreen(client.loadScrAngle)
@@ -641,6 +643,7 @@ func main() {
 
 			// Login screen with landscape background
 			for !rl.WindowShouldClose() && !client.loginWantsExit && client.engine == nil {
+				client.pollLoginResult()
 				client.handleLoginInput()
 				client.audioSys.UpdateBGM()
 				client.audioSys.UpdateAmbient()

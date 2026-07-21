@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"runtime/debug"
 	"time"
 
 	"github.com/eqoa/client/internal/network"
@@ -21,6 +22,7 @@ type Engine struct {
 	started     bool
 	password     string
 	sessionToken []byte // 32-byte token from TCP auth
+	startupCh    chan startupResult // off-thread startup I/O → main goroutine (#4)
 	tickCount    int
 	whoToken       byte   // Who list request token (increments by 2)
 	TargetObjectID uint32 // Current target ObjectID (sent in 0x40 position updates)
@@ -230,9 +232,34 @@ func (e *Engine) Tick() {
 				e.State.SpellFXSys = e.SpellFX
 			}
 		}
-		go e.StartupSequence()
+		// Kick off startup I/O off-thread. The blocking auth/patch/connect runs
+		// in a goroutine, but its results are applied to GameState on the main
+		// goroutine (applyStartupResult) so Phase/Conn/StatusMsg/AccountID are
+		// never written concurrently with the game loop. (#4)
+		gs := e.State
+		gs.Phase = PhaseConnecting
+		gs.StatusMsg = "Connecting..."
+		e.startupCh = make(chan startupResult, 1)
+		ch := e.startupCh
+		serverIP, authPort, gamePort, patchPort := gs.ServerIP, gs.AuthPort, gs.GamePort, gs.PatchPort
+		username, password := gs.Username, e.password
+		accountID, token := gs.AccountID, e.sessionToken
+		go func() {
+			ch <- runStartupIO(serverIP, authPort, gamePort, patchPort, username, password, accountID, token)
+		}()
 		return
 	}
+
+	// Apply the startup result once it arrives — on the main goroutine.
+	if e.startupCh != nil {
+		select {
+		case res := <-e.startupCh:
+			e.startupCh = nil
+			e.applyStartupResult(res)
+		default:
+		}
+	}
+
 	if e.State.Conn != nil {
 		e.DrainIncoming()
 	}
@@ -313,62 +340,81 @@ func (e *Engine) Tick() {
 	}
 }
 
-// StartupSequence runs the auth → patch → UDP connection flow.
-// Should be called in a goroutine.
-func (e *Engine) StartupSequence() {
-	gs := e.State
+// startupResult is the outcome of the off-thread startup I/O (auth → patch →
+// UDP connect). It is applied to GameState on the main goroutine by
+// applyStartupResult, so those fields are never written concurrently with the
+// game loop. (#4)
+type startupResult struct {
+	conn         *network.Connection
+	accountID    uint32
+	sessionToken []byte
+	statusMsg    string // terminal status text (error on failure)
+	ok           bool
+}
 
-	// Step 1: TCP Auth (skip if pre-authenticated via login screen)
-	if gs.AccountID != 0 && e.sessionToken != nil {
-		log.Printf("Skipping TCP auth (pre-authenticated, accountID=%d)", gs.AccountID)
+// runStartupIO runs the blocking auth → patch → UDP connection flow off the
+// main goroutine. It only touches its arguments and locals — never GameState —
+// and returns the result for the main goroutine to apply. Must run in a
+// goroutine (network.Login/CheckPatch block).
+func runStartupIO(serverIP string, authPort, gamePort, patchPort int, username, password string, accountID uint32, sessionToken []byte) startupResult {
+	// Step 1: TCP Auth (skip if pre-authenticated via login screen).
+	if accountID != 0 && sessionToken != nil {
+		log.Printf("Skipping TCP auth (pre-authenticated, accountID=%d)", accountID)
 	} else {
-		gs.Phase = PhaseAuth
-		gs.StatusMsg = "Authenticating..."
-
 		log.Printf("=== Step 1: TCP Auth ===")
-		accountID, sessionToken, err := network.Login(gs.ServerIP, gs.AuthPort, gs.Username, e.password)
+		aid, tok, err := network.Login(serverIP, authPort, username, password)
 		if err != nil {
-			gs.StatusMsg = fmt.Sprintf("Auth failed: %v", err)
 			log.Printf("Auth failed: %v", err)
-			return
+			return startupResult{statusMsg: fmt.Sprintf("Auth failed: %v", err)}
 		}
-		gs.AccountID = accountID
-		e.sessionToken = sessionToken
+		accountID, sessionToken = aid, tok
 		log.Printf("Auth success: accountID=%d, token=%d bytes", accountID, len(sessionToken))
 	}
 
-	// Step 2: Patch check
+	// Step 2: Patch check.
 	log.Printf("=== Step 2: Patch Check ===")
-	serverIP, err := network.CheckPatch(gs.ServerIP, gs.PatchPort)
-	if err != nil {
+	if _, err := network.CheckPatch(serverIP, patchPort); err != nil {
 		log.Printf("Patch check failed (non-fatal): %v", err)
-		serverIP = gs.ServerIP // Fallback to configured IP
 	}
-	_ = serverIP // We already know the server IP
-	log.Printf("Patch check complete, server IP: %s", gs.ServerIP)
+	log.Printf("Patch check complete, server IP: %s", serverIP)
 
-	// Step 3: UDP connection to login endpoint (0xFFFE)
+	// Step 3: UDP connection to login endpoint (0xFFFE).
 	log.Printf("=== Step 3: UDP Login ===")
-	gs.Phase = PhaseConnecting
-	gs.StatusMsg = "Connecting to game server..."
-
-	conn, err := network.NewConnection(gs.ServerIP, gs.GamePort, 0xFFFE) // Login endpoint
+	conn, err := network.NewConnection(serverIP, gamePort, 0xFFFE)
 	if err != nil {
-		gs.StatusMsg = fmt.Sprintf("UDP connect failed: %v", err)
 		log.Printf("UDP connect failed: %v", err)
-		return
+		return startupResult{statusMsg: fmt.Sprintf("UDP connect failed: %v", err)}
 	}
-	gs.Conn = conn
 
-	// Start receive loop
+	// Start receive loop and send initial login messages (DiscVersion +
+	// Authenticate). These touch only the local conn, not GameState.
 	go conn.RecvLoop()
-
-	// Send initial login messages (DiscVersion + Authenticate)
-	conn.SendInitialPacket(protocol.GameVersionEQOAFrontiers, gs.Username, e.sessionToken)
+	conn.SendInitialPacket(protocol.GameVersionEQOAFrontiers, username, sessionToken)
 	log.Printf("Sent initial login packet to 0xFFFE")
 
+	return startupResult{
+		conn:         conn,
+		accountID:    accountID,
+		sessionToken: sessionToken,
+		statusMsg:    "Waiting for server list...",
+		ok:           true,
+	}
+}
+
+// applyStartupResult applies the off-thread startup outcome to GameState. Runs
+// on the main goroutine (called from Tick), so Conn/Phase/StatusMsg/AccountID
+// are written without racing the game loop or its readers. (#4)
+func (e *Engine) applyStartupResult(res startupResult) {
+	gs := e.State
+	if !res.ok {
+		gs.StatusMsg = res.statusMsg
+		return
+	}
+	gs.AccountID = res.accountID
+	e.sessionToken = res.sessionToken
+	gs.Conn = res.conn
 	gs.Phase = PhaseAuth
-	gs.StatusMsg = "Waiting for server list..."
+	gs.StatusMsg = res.statusMsg
 }
 
 // DrainIncoming processes all pending incoming packets (non-blocking).
@@ -386,6 +432,27 @@ func (e *Engine) DrainIncoming() {
 			return
 		}
 	}
+}
+
+// dispatchIncoming routes one received message to its handler, recovering
+// from any panic so a single malformed packet cannot crash the client.
+// Handlers index into variable-length wire data, so a short packet that
+// slips past a length check would otherwise take down the whole client.
+func (gs *GameState) dispatchIncoming(msg *protocol.Message) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC recovered in packet handler (type=0x%04X, len=%d): %v\n%s",
+				msg.Type, len(msg.Data()), r, debug.Stack())
+		}
+	}()
+
+	if msg.Type.IsStateChannel() && !msg.Type.IsReliable() {
+		// State channel message — already XOR-decoded by ProcessIncoming.
+		gs.HandleStateChannel(byte(msg.Type), msg)
+		return
+	}
+	// Reliable/unreliable game message.
+	gs.HandleMessage(msg)
 }
 
 // ProcessPacket handles a single received packet.
@@ -413,14 +480,7 @@ func (e *Engine) ProcessPacket(pkt *network.ReceivedPacket) {
 	messages := gs.Conn.ProcessIncoming(pkt)
 
 	for _, msg := range messages {
-		if msg.Type.IsStateChannel() && !msg.Type.IsReliable() {
-			// State channel message - already XOR-decoded by ProcessIncoming
-			gs.HandleStateChannel(byte(msg.Type), msg)
-			continue
-		}
-
-		// Reliable/unreliable game message
-		gs.HandleMessage(msg)
+		gs.dispatchIncoming(msg)
 	}
 
 	// Auto-transition: after server list, connect to first game server (once).

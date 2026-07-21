@@ -199,24 +199,39 @@ func (c *Client) handleLoginInput() {
 	}
 }
 
-// attemptLogin runs TCP auth in a goroutine and creates the engine on success.
+// loginResult is the auth goroutine's handoff to the main goroutine: exactly
+// one is sent per attemptLogin. Keeping engine/loginBusy/loginError on the main
+// goroutine (see pollLoginResult) avoids data races on those fields.
+type loginResult struct {
+	engine *game.Engine
+	err    string
+}
+
+// attemptLogin runs TCP auth in a goroutine and delivers the result over
+// c.loginResultCh. The main loop drains it via pollLoginResult — the goroutine
+// never touches c.engine/loginBusy/loginError directly.
 func (c *Client) attemptLogin() {
 	c.loginBusy = true
 	c.loginError = ""
 
+	// Capture everything the goroutine needs up front — it must not read Client
+	// fields concurrently with the main goroutine.
 	user := c.loginUser
 	pass := c.loginPass
 	assetsDir := c.assetsDir
+	isoPath := c.isoPath
+	audio := c.audioSys
 	serverIP := c.serverIP
-
 	remember := c.loginRemember
+
+	ch := make(chan loginResult, 1)
+	c.loginResultCh = ch
 
 	go func() {
 		accountID, sessionToken, err := network.Login(serverIP, sandstormAuthPort, user, pass)
 		if err != nil {
-			c.loginError = fmt.Sprintf("Login failed: %v", err)
-			c.loginBusy = false
 			log.Printf("Login failed: %v", err)
+			ch <- loginResult{err: fmt.Sprintf("Login failed: %v", err)}
 			return
 		}
 
@@ -242,13 +257,31 @@ func (c *Client) attemptLogin() {
 			user, pass, accountID, sessionToken,
 		)
 		engine.AssetsDir = assetsDir
-		engine.ISOPath = c.isoPath
-		engine.Audio = c.audioSys
+		engine.ISOPath = isoPath
+		engine.Audio = audio
 		engine.State.DebugEntityMovement = true
 
-		c.engine = engine
-		c.loginBusy = false
+		ch <- loginResult{engine: engine}
 	}()
+}
+
+// pollLoginResult applies a pending auth result (if any) on the main goroutine.
+// Call it each frame while waiting for login. Non-blocking.
+func (c *Client) pollLoginResult() {
+	if c.loginResultCh == nil {
+		return
+	}
+	select {
+	case res := <-c.loginResultCh:
+		c.loginResultCh = nil
+		c.loginBusy = false
+		if res.err != "" {
+			c.loginError = res.err
+		} else {
+			c.engine = res.engine
+		}
+	default:
+	}
 }
 
 // drawLoginScreen renders the username/password login form.

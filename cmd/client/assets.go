@@ -401,6 +401,14 @@ func (c *Client) switchWorldTerrain(worldID byte) {
 	c.safeValid = false
 	c.zoneParticlesSpawned = false
 
+	// Close the previous world's loader — stops its load worker goroutine and
+	// releases the old world ESF file handle (plus any overlay handles). Without
+	// this, every world switch leaks a goroutine and an OS file handle. (#5)
+	if c.terrainLoader != nil {
+		c.terrainLoader.Close()
+		c.terrainLoader = nil
+	}
+
 	f, err := c.openAssetESF(esfName)
 	if err != nil {
 		log.Printf("switchWorldTerrain: %v — falling back to no terrain", err)

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"syscall"
 	"time"
@@ -32,9 +33,32 @@ const (
 	manifestURL     = updateBaseURL + "/manifest.json"
 	updateTimeout   = 15 * time.Second
 	downloadTimeout = 5 * time.Minute
-	updateUser      = "eqoa"
-	updatePass      = "REDACTED"
 )
+
+// updateUser/updatePass are the update-server HTTP Basic Auth credentials.
+// They are injected at build time via -ldflags (see scripts/deploy.sh), not
+// hardcoded here — this keeps them out of source control and lets them be
+// rotated without a code change. Empty by default (e.g. a local `go build`),
+// in which case setUpdateAuth sends no Authorization header.
+//
+// NOTE: build-time injection only removes the creds from git. They are still
+// embedded in the shipped binary and remain strings-extractable. Because the
+// client must authenticate to what is effectively a public download endpoint,
+// this Basic Auth is a soft gate against casual scraping, not a real secret.
+// Actual update integrity comes from the SHA-256 check (and future binary
+// signing — see the open #6 item).
+var (
+	updateUser string
+	updatePass string
+)
+
+// setUpdateAuth attaches the update-server Basic Auth header when credentials
+// were injected at build time. With empty creds it sends no header.
+func setUpdateAuth(req *http.Request) {
+	if updateUser != "" || updatePass != "" {
+		req.SetBasicAuth(updateUser, updatePass)
+	}
+}
 
 // updateManifest is the JSON served by the update server.
 type updateManifest struct {
@@ -54,14 +78,40 @@ type manifestFile struct {
 	SHA256 string `json:"sha256"`    // expected hash
 }
 
-// updateState tracks the updater UI state.
+// updateState tracks the updater UI state. All fields are written by the
+// background checkForUpdate goroutine and read by the runUpdateCheck render
+// loop, so every access goes through mu. (Torn reads of the string fields
+// could otherwise crash the client.)
 type updateState struct {
+	mu          sync.Mutex
 	status      string  // status text shown on screen
 	progress    float32 // 0..1 download progress
 	done        bool    // check complete (proceed to title/login)
 	err         string  // error message (non-fatal, proceed anyway)
 	needRestart bool    // binary was replaced, user should restart
 	changelog   string  // changelog from manifest (shown on restart prompt)
+}
+
+func (s *updateState) setStatus(v string)   { s.mu.Lock(); s.status = v; s.mu.Unlock() }
+func (s *updateState) setErr(v string)       { s.mu.Lock(); s.err = v; s.mu.Unlock() }
+func (s *updateState) setProgress(v float32) { s.mu.Lock(); s.progress = v; s.mu.Unlock() }
+func (s *updateState) setDone()              { s.mu.Lock(); s.done = true; s.mu.Unlock() }
+
+// markInstalled sets status, changelog, and needRestart together so the render
+// loop never observes needRestart=true before the changelog is populated.
+func (s *updateState) markInstalled(changelog string) {
+	s.mu.Lock()
+	s.status = "Update installed!"
+	s.changelog = changelog
+	s.needRestart = true
+	s.mu.Unlock()
+}
+
+// snapshot returns a consistent copy of all display fields.
+func (s *updateState) snapshot() (status string, progress float32, done bool, errMsg string, needRestart bool, changelog string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status, s.progress, s.done, s.err, s.needRestart, s.changelog
 }
 
 // verifyISOPath checks that the ISO path is a valid EQOA Frontiers disc image.
@@ -125,7 +175,11 @@ func (c *Client) runUpdateCheck() {
 	go checkForUpdate(state, c.assetsDir)
 
 	// Draw update screen until check completes
-	for !rl.WindowShouldClose() && !state.done && !state.needRestart {
+	for !rl.WindowShouldClose() {
+		status, progress, done, errMsg, needRestart, _ := state.snapshot()
+		if done || needRestart {
+			break
+		}
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.Color{R: 10, G: 10, B: 20, A: 255})
 
@@ -134,25 +188,25 @@ func (c *Client) runUpdateCheck() {
 		}
 
 		// Status text
-		c.drawCenteredText(state.status, screenHeight/2-20, 16, colorGoldWarm)
+		c.drawCenteredText(status, screenHeight/2-20, 16, colorGoldWarm)
 
 		// Progress bar (during download)
-		if state.progress > 0 && state.progress < 1 {
+		if progress > 0 && progress < 1 {
 			barW := int32(300)
 			barH := int32(12)
 			barX := screenWidth/2 - barW/2
 			barY := screenHeight/2 + 10
-			fillW := int32(float32(barW) * state.progress)
+			fillW := int32(float32(barW) * progress)
 
 			rl.DrawRectangle(barX-1, barY-1, barW+2, barH+2, rl.Color{R: 60, G: 60, B: 80, A: 200})
 			rl.DrawRectangle(barX, barY, fillW, barH, rl.Color{R: 212, G: 192, B: 111, A: 220})
-			pctText := fmt.Sprintf("%d%%", int(state.progress*100))
+			pctText := fmt.Sprintf("%d%%", int(progress*100))
 			c.drawCenteredText(pctText, barY+barH+4, 12, colorDim)
 		}
 
 		// Error (non-fatal)
-		if state.err != "" {
-			c.drawCenteredText(state.err, screenHeight/2+40, 12, rl.Color{R: 255, G: 100, B: 100, A: 200})
+		if errMsg != "" {
+			c.drawCenteredText(errMsg, screenHeight/2+40, 12, rl.Color{R: 255, G: 100, B: 100, A: 200})
 		}
 
 		c.drawCenteredText(fmt.Sprintf("v%s", BuildVersion), screenHeight-20, 10, colorDim)
@@ -160,8 +214,12 @@ func (c *Client) runUpdateCheck() {
 		rl.EndDrawing()
 	}
 
+	// Take a final consistent snapshot for the post-loop decisions (the worker
+	// may still be running its deferred setDone).
+	_, _, _, _, needRestart, changelog := state.snapshot()
+
 	// Verify ISO path is valid — if missing/invalid, open the ISO prompt.
-	if !state.needRestart {
+	if !needRestart {
 		isoErr := verifyISOPath(c.isoPath)
 		if isoErr != "" {
 			log.Printf("ISO check: %s — opening ISO prompt", isoErr)
@@ -179,11 +237,11 @@ func (c *Client) runUpdateCheck() {
 	}
 
 	// Binary was replaced — show changelog then auto-restart
-	if state.needRestart {
+	if needRestart {
 		// Parse changelog lines, sanitize non-ASCII for font rendering
 		var changeLines []string
-		if state.changelog != "" {
-			sanitized := sanitizeASCII(state.changelog)
+		if changelog != "" {
+			sanitized := sanitizeASCII(changelog)
 			changeLines = strings.Split(sanitized, "\n")
 		}
 
@@ -262,17 +320,17 @@ func authGet(httpClient *http.Client, url string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(updateUser, updatePass)
+	setUpdateAuth(req)
 	return httpClient.Do(req)
 }
 
 func checkForUpdate(state *updateState, assetsDir string) {
-	defer func() { state.done = true }()
+	defer state.setDone()
 
 	// Dev builds skip auto-updater for rapid iteration.
 	if gmEnabled() {
 		log.Println("Dev build — skipping auto-update check")
-		state.status = "Dev build"
+		state.setStatus("Dev build")
 		return
 	}
 
@@ -281,8 +339,8 @@ func checkForUpdate(state *updateState, assetsDir string) {
 	resp, err := authGet(client, manifestURL)
 	if err != nil {
 		log.Printf("Update check failed: %v", err)
-		state.status = "Update server unreachable"
-		state.err = "Continuing with current version..."
+		state.setStatus("Update server unreachable")
+		state.setErr("Continuing with current version...")
 		time.Sleep(1500 * time.Millisecond)
 		return
 	}
@@ -290,7 +348,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 
 	if resp.StatusCode != 200 {
 		log.Printf("Update check: HTTP %d", resp.StatusCode)
-		state.status = "No updates available"
+		state.setStatus("No updates available")
 		time.Sleep(1 * time.Second)
 		return
 	}
@@ -298,8 +356,8 @@ func checkForUpdate(state *updateState, assetsDir string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("Update check: read body: %v", err)
-		state.status = "Update check failed"
-		state.err = "Continuing with current version..."
+		state.setStatus("Update check failed")
+		state.setErr("Continuing with current version...")
 		time.Sleep(1500 * time.Millisecond)
 		return
 	}
@@ -307,8 +365,8 @@ func checkForUpdate(state *updateState, assetsDir string) {
 	var manifest updateManifest
 	if err := json.Unmarshal(body, &manifest); err != nil {
 		log.Printf("Update check: bad manifest: %v", err)
-		state.status = "Update check failed"
-		state.err = "Continuing with current version..."
+		state.setStatus("Update check failed")
+		state.setErr("Continuing with current version...")
 		time.Sleep(1500 * time.Millisecond)
 		return
 	}
@@ -322,7 +380,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 
 	// Compare versions
 	if manifest.Version == BuildVersion || manifest.Version == "" {
-		state.status = "Client is up to date"
+		state.setStatus("Client is up to date")
 		time.Sleep(1 * time.Second)
 		return
 	}
@@ -339,20 +397,20 @@ func checkForUpdate(state *updateState, assetsDir string) {
 
 	if downloadURL == "" {
 		log.Printf("Update: no download URL for %s", runtime.GOOS)
-		state.status = "No update for this platform"
+		state.setStatus("No update for this platform")
 		time.Sleep(1500 * time.Millisecond)
 		return
 	}
 
 	// Download new binary
-	state.status = fmt.Sprintf("Downloading update %s...", manifest.Version)
+	state.setStatus(fmt.Sprintf("Downloading update %s...", manifest.Version))
 	log.Printf("Update: downloading %s", downloadURL)
 
 	dlClient := &http.Client{Timeout: downloadTimeout}
 	dlResp, err := authGet(dlClient, downloadURL)
 	if err != nil {
 		log.Printf("Update download failed: %v", err)
-		state.err = "Download failed, continuing with current version..."
+		state.setErr("Download failed, continuing with current version...")
 		time.Sleep(2 * time.Second)
 		return
 	}
@@ -360,7 +418,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 
 	if dlResp.StatusCode != 200 {
 		log.Printf("Update download: HTTP %d", dlResp.StatusCode)
-		state.err = "Download failed, continuing with current version..."
+		state.setErr("Download failed, continuing with current version...")
 		time.Sleep(2 * time.Second)
 		return
 	}
@@ -369,7 +427,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 	exePath, err := os.Executable()
 	if err != nil {
 		log.Printf("Update: can't find self: %v", err)
-		state.err = "Update failed"
+		state.setErr("Update failed")
 		time.Sleep(2 * time.Second)
 		return
 	}
@@ -380,7 +438,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 	tmpFile, err := os.Create(tmpPath)
 	if err != nil {
 		log.Printf("Update: can't create temp file: %v", err)
-		state.err = "Update failed (write permission?)"
+		state.setErr("Update failed (write permission?)")
 		time.Sleep(2 * time.Second)
 		return
 	}
@@ -400,13 +458,13 @@ func checkForUpdate(state *updateState, assetsDir string) {
 				tmpFile.Close()
 				os.Remove(tmpPath)
 				log.Printf("Update: write error: %v", writeErr)
-				state.err = "Update failed (disk error)"
+				state.setErr("Update failed (disk error)")
 				time.Sleep(2 * time.Second)
 				return
 			}
 			downloaded += int64(n)
 			if totalBytes > 0 {
-				state.progress = float32(downloaded) / float32(totalBytes)
+				state.setProgress(float32(downloaded) / float32(totalBytes))
 			}
 		}
 		if readErr == io.EOF {
@@ -416,7 +474,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 			tmpFile.Close()
 			os.Remove(tmpPath)
 			log.Printf("Update: download error: %v", readErr)
-			state.err = "Download interrupted, continuing with current version..."
+			state.setErr("Download interrupted, continuing with current version...")
 			time.Sleep(2 * time.Second)
 			return
 		}
@@ -429,7 +487,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 		if gotHash != expectedHash {
 			os.Remove(tmpPath)
 			log.Printf("Update: hash mismatch: got %s expected %s", gotHash, expectedHash)
-			state.err = "Update verification failed"
+			state.setErr("Update verification failed")
 			time.Sleep(2 * time.Second)
 			return
 		}
@@ -437,8 +495,8 @@ func checkForUpdate(state *updateState, assetsDir string) {
 	}
 
 	// Replace binary
-	state.status = "Installing update..."
-	state.progress = 1
+	state.setStatus("Installing update...")
+	state.setProgress(1)
 
 	if runtime.GOOS == "windows" {
 		// Windows can't overwrite running exe — rename old, move new in
@@ -447,7 +505,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 		if err := os.Rename(exePath, oldPath); err != nil {
 			os.Remove(tmpPath)
 			log.Printf("Update: can't rename old binary: %v", err)
-			state.err = "Update failed (file locked?)"
+			state.setErr("Update failed (file locked?)")
 			time.Sleep(2 * time.Second)
 			return
 		}
@@ -456,7 +514,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 			os.Rename(oldPath, exePath)
 			os.Remove(tmpPath)
 			log.Printf("Update: can't place new binary: %v", err)
-			state.err = "Update failed"
+			state.setErr("Update failed")
 			time.Sleep(2 * time.Second)
 			return
 		}
@@ -466,23 +524,21 @@ func checkForUpdate(state *updateState, assetsDir string) {
 		if err := os.Chmod(tmpPath, 0755); err != nil {
 			os.Remove(tmpPath)
 			log.Printf("Update: chmod failed: %v", err)
-			state.err = "Update failed"
+			state.setErr("Update failed")
 			time.Sleep(2 * time.Second)
 			return
 		}
 		if err := os.Rename(tmpPath, exePath); err != nil {
 			os.Remove(tmpPath)
 			log.Printf("Update: rename failed: %v", err)
-			state.err = "Update failed"
+			state.setErr("Update failed")
 			time.Sleep(2 * time.Second)
 			return
 		}
 	}
 
 	log.Printf("Update: installed %s successfully", manifest.Version)
-	state.status = "Update installed!"
-	state.changelog = manifest.Changelog
-	state.needRestart = true
+	state.markInstalled(manifest.Changelog)
 }
 
 // hashLocalFile computes the SHA-256 of a local file by streaming (no full read into RAM).
@@ -526,8 +582,8 @@ func syncExtraFiles(state *updateState, files []manifestFile, assetsDir string) 
 		}
 
 		// Download the file.
-		state.status = fmt.Sprintf("Downloading %s...", f.Path)
-		state.progress = 0
+		state.setStatus(fmt.Sprintf("Downloading %s...", f.Path))
+		state.setProgress(0)
 		log.Printf("Update: downloading %s", f.Path)
 
 		dlClient := &http.Client{Timeout: downloadTimeout}
@@ -575,11 +631,11 @@ func syncExtraFiles(state *updateState, files []manifestFile, assetsDir string) 
 				}
 				downloaded += int64(n)
 				if totalBytes > 0 {
-					state.progress = float32(downloaded) / float32(totalBytes)
+					state.setProgress(float32(downloaded) / float32(totalBytes))
 					// Update status with size info for large files.
 					dlMB := float64(downloaded) / (1024 * 1024)
 					totalMB := float64(totalBytes) / (1024 * 1024)
-					state.status = fmt.Sprintf("Downloading %s... (%.0f/%.0f MB)", f.Path, dlMB, totalMB)
+					state.setStatus(fmt.Sprintf("Downloading %s... (%.0f/%.0f MB)", f.Path, dlMB, totalMB))
 				}
 			}
 			if readErr == io.EOF {
@@ -615,7 +671,7 @@ func syncExtraFiles(state *updateState, files []manifestFile, assetsDir string) 
 			os.Remove(tmpPath)
 			continue
 		}
-		state.progress = 1
+		state.setProgress(1)
 		log.Printf("Update: synced %s (%d bytes)", f.Path, downloaded)
 	}
 
