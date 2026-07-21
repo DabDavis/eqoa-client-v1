@@ -136,14 +136,33 @@ func (c *SpriteAnimController) SetAction(animID int) {
 }
 
 // ClearAction resets pair 1 to empty (no action playing).
-// PS2 dual-call: if pair 0 was set to the same animation (from SetAction driving
-// both pairs), clear it too so locomotion can reclaim pair 0.
+// PS2 dual-call: if pair 0 was set to the same animation from SetAction driving
+// both pairs, clear it too so locomotion can reclaim pair 0.
+//
+// The guard is critical: SetLocomotion ALSO drives both pairs to the same
+// (locomotion) animation. Without the isLocomotionAnim check, clearing the
+// action would wipe the locomotion pair — freezing the legs at idle while the
+// character moves ("walk shows idle / sliding"). Only reclaim pair 0 when it was
+// driven by an actual action animation.
 func (c *SpriteAnimController) ClearAction() {
 	actionAnim := c.pairs[PairAction].AnimID
 	c.pairs[PairAction] = PairState{AnimID: -1}
-	if actionAnim >= 0 && c.pairs[PairLocomotion].AnimID == actionAnim {
+	if actionAnim >= 0 && c.pairs[PairLocomotion].AnimID == actionAnim && !isLocomotionAnim(actionAnim) {
 		c.pairs[PairLocomotion] = PairState{AnimID: -1}
 	}
+}
+
+// isLocomotionAnim reports whether a CPlayList slot is a locomotion-layer
+// animation — the only slots SetLocomotion is ever called with (idle, walk,
+// walkBack, run, swim, fall, landing, strafe, special idle, battle/combat idle,
+// mounted). Used by ClearAction to avoid wiping locomotion when the action pair
+// happens to mirror it.
+func isLocomotionAnim(animID int) bool {
+	switch animID {
+	case 0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 15, 16, 17, 18:
+		return true
+	}
+	return false
 }
 
 // setAnimation implements PS2 SetAnimation (0x00422D78) — the unified entry
