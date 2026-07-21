@@ -316,6 +316,10 @@ Dual-pair model matching PS2 `VICSprite::SetAnimation` (0x00422D78):
 
 **PlayOnce**: Attack anims hold last frame; locomotion loops. `applySkeletal` clamps play-once anims and notifies controller via `MarkActionFinished()`.
 
+**Both `SetLocomotion` AND `SetAction` drive BOTH pairs** (PS2 dual-call). `SetLocomotion(walk)` sets pair0=pair1=walk so the upper body also animates the walk when no action is active; `SetAction(attack)` sets both to the attack (full-body swing). Because of this, `ClearAction` must only reclaim pair0 when it was set by an **action** anim (`!isLocomotionAnim`) — otherwise clearing the action wipes the locomotion pair too, and `Resolve()` returns idle: the character plays idle while moving ("walk shows idle / sliding"). This is per-frame (resolveCombat calls ClearAction every frame), so the bug is universal across humanoids, not race/class-specific. `SetLocomotion` runs before `resolveCombat` each frame, so a finished action is reclaimed by the priority system regardless. Regression-guarded by `internal/models/walk_repro_test.go`.
+
+**Debugging animation "wrong-anim" bugs — rule out the model first**: dump the model's CPlayList slot→raw mapping straight from the ISO (`esf.OpenISOFile(iso,"CHAR.ESF").FindObject(modelID).(*esf.CSprite)`, then match `PlayList[].AnimDictID[]` against `Animations[].DictID`, mirroring `mesh.go`). If slot 1 (walk) maps to distinct valid raw indices, the model is fine and the bug is in the controller/resolve pipeline, not the model. The client also logs this at load: `Humanoid 0x%08X: N anims, M PL slots: [...]`.
+
 ### Animation Profiles (`animprofile.go`)
 5 profiles for different model types:
 - Humanoid (full weapon attack pools, dual wield/shield/2-hand)
@@ -404,6 +408,17 @@ ISO Prompt → Title Screen → Login → Character Select → [Create/Delete] �
 ## Gamepad Support
 
 `cmd/client/gamepad.go`: PS2 DualShock 2 mapping → Raylib gamepad. Left stick = movement, right stick = camera orbit/zoom/swim, D-pad = targeting, cross/circle/square/triangle = actions. Auto-shows spell bar on first gamepad frame.
+
+## Runtime Robustness Invariants (do NOT regress — 2026-07-21)
+
+Verified zero data races under `-race` vs Sandstorm. Future edits must preserve:
+
+- **Packet handling is panic-guarded**: `engine.go dispatchIncoming` wraps every message in `recover()`. Handlers index into variable-length wire data — a short/malformed packet must not crash the client. Also bounds-check before indexing (e.g. HP reads in `state.go` guard `len(data) >= 28`).
+- **Startup I/O runs off-thread, results applied on the main goroutine**: `runStartupIO` (blocking auth/patch/connect) touches ONLY its args, never GameState; `applyStartupResult` (called from `Tick`) writes `Phase`/`Conn`/`StatusMsg`/`AccountID`. Never write those fields from the startup goroutine — that races the game loop. Same pattern for login: goroutine → `loginResultCh` → `pollLoginResult` on the main goroutine.
+- **World switch closes the old terrain loader**: `switchWorldTerrain` calls `terrain.Loader.Close()`, which stops the load-worker goroutine THEN closes the world ESF file handle + overlays. Skipping it leaks a goroutine + OS file handle per continent switch.
+- **Zone eviction unloads GPU textures**: `renderer.go resetZoneSlot` must `rl.UnloadTexture` the slot's `texCache` (not just meshes) or VRAM grows monotonically while streaming.
+- **Headless tool serializes GameState with `gameMu`** (`cmd/headless/main.go`): tick loop + all command handlers hold it; hold it around any GameState access but NEVER across a `time.Sleep` (blocking commands release it). The visual client doesn't need this — its Tick + reads are all on the render goroutine.
+- **Update creds are build-injected, never hardcoded**: `-ldflags -X main.updateUser/updatePass` from git-ignored `scripts/.deploy-secrets` (see Deploy Workflow).
 
 ## DRDP Protocol Client (`internal/network/`)
 
