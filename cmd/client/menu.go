@@ -10,6 +10,7 @@ import (
 
 	"github.com/eqoa/client/internal/game"
 	"github.com/eqoa/client/internal/gfx"
+	"github.com/eqoa/client/internal/models"
 	"github.com/eqoa/client/internal/ui"
 )
 
@@ -197,8 +198,8 @@ func (c *Client) handleMenuInput() {
 		case 1: // Inventory: Equipped / Carrying / Bank
 			c.invSubTab = (c.invSubTab + dir + 3) % 3
 			c.menuScroll = 0
-		case 2: // Character: Stats / Spells / CM
-			c.charSubTab = (c.charSubTab + dir + 3) % 3
+		case 2: // Character: Stats / Spells / CM / Faction / Appearance
+			c.charSubTab = (c.charSubTab + dir + 5) % 5
 			c.menuScroll = 0
 		case 4: // Social: Who / Group / LFG / Auction
 			c.socialSubTab = (c.socialSubTab + dir + 4) % 4
@@ -1176,8 +1177,8 @@ func (c *Client) drawEquippedGrid(items []ParsedItem, leftX, startY, areaW, area
 
 func (c *Client) drawMenuCharacter(startY, contentH int32) {
 
-	// Sub-tab bar: Stats / Spells / Class Mastery / Faction
-	innerY := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Stats", "Spells", "Class Mastery", "Faction"}, &c.charSubTab)
+	// Sub-tab bar: Stats / Spells / Class Mastery / Faction / Appearance
+	innerY := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Stats", "Spells", "Class Mastery", "Faction", "Appearance"}, &c.charSubTab)
 	innerH := contentH - 26
 
 	switch c.charSubTab {
@@ -1189,6 +1190,70 @@ func (c *Client) drawMenuCharacter(startY, contentH int32) {
 		c.drawMenuCM(innerY, innerH)
 	case 3:
 		c.drawMenuFaction(innerY, innerH)
+	case 4:
+		c.drawMenuAppearance(innerY, innerH)
+	}
+}
+
+// drawMenuAppearance is the client-side transmog panel. Everything here is
+// cosmetic and local — the server keeps sending the real armor bytes, and other
+// players see the character unchanged.
+func (c *Client) drawMenuAppearance(startY, contentH int32) {
+	x := menuXPos() + menuPad
+	y := startY + 4
+	lineH := int32(20)
+	t := &c.transmog
+
+	c.uiLabel(x, y, "Armor Appearance (local only)", 13, colorGold)
+	y += lineH + 2
+
+	c.uiCheckbox(x, y, "Override equipped armor", &t.Enabled)
+	y += lineH
+
+	if !t.Enabled {
+		c.uiLabel(x, y+4, "Your real equipment is shown.", 11, colorDim)
+		return
+	}
+
+	// Armor set picker — one row per set, including the client-side ornate plate.
+	c.uiLabel(x, y+4, "Set", 11, colorDim)
+	y += lineH
+	colW := int32(120)
+	for i := 0; i < models.ArmorSetCount; i++ {
+		col := int32(i % 3)
+		row := int32(i / 3)
+		bx, by := x+col*colW, y+row*lineH
+		label := models.ArmorSetNames[i]
+		if t.Set == byte(i) {
+			label = "> " + label
+		}
+		if c.uiButtonStyled(bx, by, colW-6, lineH-2, label, 11) {
+			t.Set = byte(i)
+		}
+	}
+	y += lineH * int32((models.ArmorSetCount+2)/3)
+	y += 6
+
+	if t.Set == models.ArmorSetOrnatePlate {
+		c.uiLabel(x, y, "Ornate plate art from CHAR.ESF (unused by retail).", 11, colorDim)
+		y += lineH
+	}
+
+	c.uiCheckbox(x, y, "Hide robe (robes cover chest and legs)", &t.HideRobe)
+	y += lineH
+
+	c.uiCheckbox(x, y, "Override tint", &t.TintSet)
+	y += lineH
+
+	if t.TintSet {
+		tintIdx := int(t.Tint)
+		c.uiLabel(x, y, "Tint", 11, colorDim)
+		if c.uiSliderInt(x+40, y, 160, &tintIdx, 0, len(models.Tints)-1) {
+			t.Tint = byte(tintIdx)
+		}
+		tc := models.GetTintColor(t.Tint)
+		rl.DrawRectangle(x+210, y, 16, 16, rl.NewColor(tc.R, tc.G, tc.B, 255))
+		c.uiLabel(x+232, y+2, models.TintNames[t.Tint], 11, colorWhite)
 	}
 }
 

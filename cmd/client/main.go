@@ -59,6 +59,7 @@ type Client struct {
 	terrainZoneIdx   int // primary zone (for collision, flora, effects)
 	loadedZoneIdxs   map[int]bool // all currently loaded zone indices
 	modelMgr       *models.ModelManager
+	transmog       transmogState // client-side cosmetic armor override
 	skyDome        *sky.Sky
 	camAngle       float32 // horizontal orbit angle (radians)
 	camPitch       float32 // vertical elevation angle (radians)
@@ -477,6 +478,7 @@ func main() {
 		terrainZoneIdx:  -1,
 		loadedZoneIdxs:  make(map[int]bool),
 		animMgr:         &AnimationManager{DebugAnimOverride: -1},
+		transmog:        defaultTransmog(),
 		spellCtxSpellID: -1,
 		charSelectIdx:   -1,
 		runMode:         true,

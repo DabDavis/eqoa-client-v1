@@ -346,6 +346,7 @@ func (c *Client) drawWorld() {
 	// Player animation — resolved by AnimationManager (combat, debug, landing).
 	// Returns dual-pair: locoAnim (lower body) + actionAnim (upper body override).
 	playerEquip := entityEquipment(&p, c.modelMgr)
+	c.transmog.apply(playerEquip)
 	playerLocoAnim, playerActionAnim := c.animMgr.ResolvePlayerAnim(gs, &p, c.engine, now)
 
 	c.animMgr.ConsumePendingPlayerHitFX()

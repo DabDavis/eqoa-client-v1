@@ -5,7 +5,8 @@ package models
 // Source: PS2 VICSpriteCust::$Armor table at EE 0x004FB910 stores VIRaster pool
 // indices. DictIDs resolved from runtime VIRaster pool in EE memory dump
 // (pool at 0x0076B5A0, VISurface+0x00 = DictID).
-var ArmorTextures = [9][5]int32{
+// Sets 0-8 are the PS2 sets. Set 9 is client-side only — see ArmorSetOrnatePlate.
+var ArmorTextures = [ArmorSetCount][5]int32{
 	{0, 0, 0, 0, 0},                                                                     // 0 = none (base model texture)
 	{-1085571574, 1648643354, -2066550155, 750072456, 2060964273},                        // 1 = cloth
 	{1926263787, -1180968619, 945285206, -1489171117, -178279300},                         // 2 = leather
@@ -15,6 +16,31 @@ var ArmorTextures = [9][5]int32{
 	{-112471789, -1599977331, -1093450370, 1872225035, -1111850444},                       // 6 = banded mail
 	{637778783, 596508817, -343199798, -1925225009, -614333192},                           // 7 = scale
 	{1071320539, -2127282779, 90341958, 241961123, 1552852940},                            // 8 = monk
+	{1085332903, -348034519, 104354322, -184150041, 1126741776},                           // 9 = ornate plate (same IDs as 4, CHAR.ESF art)
+}
+
+// ArmorSetCount is the number of selectable armor sets, including client-side ones.
+const ArmorSetCount = 10
+
+// ArmorSetOrnatePlate is a cosmetic set with no PS2 $Armor entry. It reuses the
+// plate DictIDs but resolves them from CHAR.ESF instead of CHARCUST.CSF.
+//
+// Both files store surfaces under these five DictIDs, with different art:
+// CHARCUST.CSF holds the plain steel plate the retail client shows, while
+// CHAR.ESF holds an ornate gold-and-steel variant that is never displayed,
+// because the texture lookup searches CHARCUST first and stops on the first hit.
+// Verified by exact RGB pixel match — see go-eqoa-esf-tools-v2/cmd/matchtex and
+// extracted-assets/gold-silver-armor/README.md.
+const ArmorSetOrnatePlate byte = 9
+
+// armorSetFromCharESF marks sets whose textures must be read from CHAR.ESF
+// rather than through the default CHARCUST-first search order.
+var armorSetFromCharESF = [ArmorSetCount]bool{ArmorSetOrnatePlate: true}
+
+// ArmorSetNames labels each armor set for UI.
+var ArmorSetNames = [ArmorSetCount]string{
+	"None", "Cloth", "Leather", "Chainmail", "Plate",
+	"Padded", "Banded Mail", "Scale", "Monk", "Ornate Plate",
 }
 
 // TextSlot indices for ArmorTextures second dimension.
@@ -47,6 +73,12 @@ var Tints = [14]TintColor{
 	{0xDC, 0xBE, 0x96, 0xFF}, // 11 = Tan
 	{0x00, 0xC8, 0xB4, 0xFF}, // 12 = Teal
 	{0x96, 0x00, 0x3C, 0xFF}, // 13 = Purple
+}
+
+// TintNames labels each entry of Tints for UI.
+var TintNames = [len(Tints)]string{
+	"White", "Dark Gray", "Cyan", "Brown", "Navy", "Green", "Gold",
+	"Olive", "Red", "Ice Blue", "Silver", "Tan", "Teal", "Purple",
 }
 
 // RobeTextures maps [robeStyle] to ESF Surface DictIDs.
@@ -110,11 +142,22 @@ var FaceTextures = [10][8]int32{
 
 // GetArmorTextureDictID returns the ESF Surface DictID for an armor texture.
 // Returns 0 if the armor set is 0 (no armor) or out of range.
+//
+// Callers that load the texture should prefer GetArmorTexture, which also
+// reports which ESF file the DictID must be read from.
 func GetArmorTextureDictID(armorSet byte, textSlot int) int32 {
+	dictID, _ := GetArmorTexture(armorSet, textSlot)
+	return dictID
+}
+
+// GetArmorTexture returns the ESF Surface DictID for an armor texture and
+// whether it must be read from CHAR.ESF rather than through the default
+// CHARCUST-first search order. Returns (0, false) for set 0 or out of range.
+func GetArmorTexture(armorSet byte, textSlot int) (dictID int32, fromCharESF bool) {
 	if int(armorSet) >= len(ArmorTextures) || textSlot < 0 || textSlot >= 5 {
-		return 0
+		return 0, false
 	}
-	return ArmorTextures[armorSet][textSlot]
+	return ArmorTextures[armorSet][textSlot], armorSetFromCharESF[armorSet]
 }
 
 // GetRobeTextureDictID returns the ESF Surface DictID for a robe texture.

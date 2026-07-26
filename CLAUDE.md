@@ -278,10 +278,18 @@ Equipment textures live in **CHARCUST.CSF** (compressed ESF), NOT CHAR.ESF. Face
 
 ### Lookup Flow
 ```
-DrawEntity → GetArmorTextureDictID(armorSet, slot) → DictID
-  → getEquipmentTexture(dictID) → search CHARCUST → CHARFACE → CHAR.ESF
+DrawEntity → resolveSlotTexture(equip, slot) → (DictID, texSource)
+  → getEquipmentTexture(dictID, src)
+      texSrcAuto    → search CHARCUST → CHARFACE → CHAR.ESF
+      texSrcCharESF → CHAR.ESF only
   → FindObject(dictID) → *esf.Surface → GPU texture (cached)
 ```
+
+**A DictID is not unique across files.** CHARCUST.CSF and CHAR.ESF both store
+surfaces under the five plate DictIDs with *different* art. `texCache` is
+therefore keyed by `texKey{dictID, src}`, not by DictID alone — keying by DictID
+let `getTexture` and `getEquipmentTexture` shadow each other. See
+`claude-notes/charesf-shadowed-armor.md`.
 
 ### Data Tables (`equipment.go`)
 | Table | Size | Source |
@@ -303,7 +311,17 @@ Maps material indices to equipment slots. `count(int32) + count × { meshIndex, 
 Helms are **separate 3D models** (NOT texture swaps). 8 SimpleSprite meshes in CHARCUST.CSF, rendered as standalone objects positioned at character head height. Hair hidden when helm equipped.
 
 ### Transmog System
-Client-side cosmetic overrides (`cmd/client/transmog.go`). Tracks known weapon/shield DictIDs from visible entities. 9 armor set names, 14 tint color names. Applies overrides to equipment state before rendering.
+Client-side cosmetic armor override (`cmd/client/transmog.go`), applied to the
+local player's `EquipmentState` in `render.go` before drawing. Purely local —
+nothing is sent to the server, and other players see the real equipment.
+
+UI: **F12 → Character → Appearance**. Picks any of the 10 armor sets, optionally
+forces a single tint, and hides an equipped robe (robes cover chest and legs, so
+without this the override looks like a no-op).
+
+**Set 9 `ArmorSetOrnatePlate`** is client-side only: it reuses the plate DictIDs
+but forces `texSrcCharESF`, surfacing the ornate gold-and-steel plate art that
+CHARCUST.CSF otherwise shadows. Retail can't display it.
 
 ## Animation System
 

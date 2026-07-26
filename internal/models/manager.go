@@ -28,6 +28,28 @@ type EquipmentState struct {
 	HideRobe bool // client-side toggle: hide robe without unequipping
 }
 
+// texSource identifies which ESF file a cached texture was read from. A DictID
+// alone is not a unique key: CHAR.ESF and CHARCUST.CSF both store surfaces under
+// the plate armor DictIDs with different art, so caching by DictID alone lets
+// whichever loads first shadow the other.
+type texSource uint8
+
+const (
+	// texSrcDirect is a surface handed to getTexture already loaded, from
+	// whichever file its model came from.
+	texSrcDirect texSource = iota
+	// texSrcAuto is the default equipment search order: CHARCUST, CHARFACE, CHAR.
+	texSrcAuto
+	// texSrcCharESF forces the lookup to read from CHAR.ESF only.
+	texSrcCharESF
+)
+
+// texKey identifies a cached GPU texture.
+type texKey struct {
+	dictID int32
+	src    texSource
+}
+
 // meshGroup holds a GPU mesh and its material for one texture group.
 type meshGroup struct {
 	Mesh        rl.Mesh
@@ -542,7 +564,7 @@ type ModelManager struct {
 	helmCache    map[byte]*CharModel    // helm index → helm 3D model (loaded from CHARCUST.CSF)
 	whiteTex          rl.Texture2D
 	hairColorTexCache [8]rl.Texture2D    // solid-color textures for gnome mustache tinting
-	texCache          map[int32]rl.Texture2D // Surface DictID → GPU texture
+	texCache          map[texKey]rl.Texture2D // Surface DictID + source file → GPU texture
 	shader             rl.Shader        // alpha cutoff shader for character models
 	blendShader        rl.Shader        // alpha blend shader for armor overlay pass
 	clothingShader     rl.Shader        // clothing overlay: discard transparent, force opaque
@@ -689,7 +711,7 @@ func newManagerFromFiles(file, custFile, faceFile *esf.ObjFile) (*ModelManager, 
 		itemCache:   make(map[int32]*CharModel),
 		helmCache:   make(map[byte]*CharModel),
 		whiteTex:    whiteTex,
-		texCache:    make(map[int32]rl.Texture2D),
+		texCache:    make(map[texKey]rl.Texture2D),
 		shader:             shader,
 		blendShader:        blendShader,
 		clothingShader:     clothingShader,
@@ -998,9 +1020,9 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 		var swapped bool
 		var origTex rl.Texture2D
 		if mg.TextureSlot >= 0 && equip != nil && !skipSwap {
-			dictID := m.resolveSlotTexture(equip, mg.TextureSlot)
+			dictID, texSrc := m.resolveSlotTexture(equip, mg.TextureSlot)
 			if dictID != 0 {
-				replaceTex := m.getEquipmentTexture(dictID)
+				replaceTex := m.getEquipmentTexture(dictID, texSrc)
 				if replaceTex.ID != m.whiteTex.ID {
 					maps := (*[32]rl.MaterialMap)(unsafe.Pointer(mg.Material.Maps))
 					origTex = maps[rl.MapDiffuse].Texture
@@ -1061,7 +1083,7 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 			} else if mg.TextureSlot >= TextSlotChest && mg.TextureSlot <= TextSlotBoots && mg.Layer1DictID != 0 {
 				// No armor/robe equipped, but model has a layer 1 clothing texture.
 				// Single-pass composite: layer1 (clothing) over layer0 (skin).
-				layer1Tex := m.getEquipmentTexture(mg.Layer1DictID)
+				layer1Tex := m.getEquipmentTexture(mg.Layer1DictID, texSrcAuto)
 				if layer1Tex.ID != m.whiteTex.ID {
 					maps := (*[32]rl.MaterialMap)(unsafe.Pointer(mg.Material.Maps))
 					baseTex := maps[rl.MapDiffuse].Texture
@@ -2412,8 +2434,8 @@ func (m *ModelManager) getTexture(surf *esf.Surface) rl.Texture2D {
 	if surf == nil || surf.Image == nil {
 		return m.whiteTex
 	}
-	texID := surf.ObjInfo().DictID
-	if tex, ok := m.texCache[texID]; ok {
+	key := texKey{surf.ObjInfo().DictID, texSrcDirect}
+	if tex, ok := m.texCache[key]; ok {
 		return tex
 	}
 	// Scale PS2 alpha range (0-128 where 128=opaque) to OpenGL (0-255).
@@ -2427,7 +2449,7 @@ func (m *ModelManager) getTexture(surf *esf.Surface) rl.Texture2D {
 	rl.GenTextureMipmaps(&tex)
 	rl.SetTextureFilter(tex, rl.FilterTrilinear)
 	rl.SetTextureWrap(tex, rl.WrapRepeat)
-	m.texCache[texID] = tex
+	m.texCache[key] = tex
 	return tex
 }
 
@@ -2451,18 +2473,27 @@ func scalePS2Alpha(img *image.NRGBA) *image.NRGBA {
 
 
 // getEquipmentTexture loads a GPU texture by ESF Surface DictID.
-// Searches CHARCUST.CSF first (equipment textures), then CHAR.ESF.
+//
+// src selects which file to read from: texSrcAuto searches CHARCUST.CSF first
+// (armor/hair/robe), then CHARFACE.CSF (faces), then CHAR.ESF; texSrcCharESF
+// reads CHAR.ESF only. The distinction matters because the plate DictIDs exist
+// in both CHARCUST.CSF and CHAR.ESF with different art.
+//
 // Returns the white fallback texture if the DictID is invalid or not found.
-func (m *ModelManager) getEquipmentTexture(dictID int32) rl.Texture2D {
+func (m *ModelManager) getEquipmentTexture(dictID int32, src texSource) rl.Texture2D {
 	if dictID == 0 {
 		return m.whiteTex
 	}
-	if tex, ok := m.texCache[dictID]; ok {
+	key := texKey{dictID, src}
+	if tex, ok := m.texCache[key]; ok {
 		return tex
 	}
-	// Search CHARCUST first (armor/hair/robe), then CHARFACE (face textures), then CHAR.ESF.
+	search := []*esf.ObjFile{m.custFile, m.faceFile, m.file}
+	if src == texSrcCharESF {
+		search = []*esf.ObjFile{m.file}
+	}
 	var surf *esf.Surface
-	for _, f := range []*esf.ObjFile{m.custFile, m.faceFile, m.file} {
+	for _, f := range search {
 		if f == nil {
 			continue
 		}
@@ -2486,37 +2517,40 @@ func (m *ModelManager) getEquipmentTexture(dictID int32) rl.Texture2D {
 	rl.GenTextureMipmaps(&tex)
 	rl.SetTextureFilter(tex, rl.FilterTrilinear)
 	rl.SetTextureWrap(tex, rl.WrapRepeat)
-	m.texCache[dictID] = tex
+	m.texCache[key] = tex
 	return tex
 }
 
-// resolveSlotTexture returns the replacement DictID for a given TextureSlot.
-// Handles armor (0-4), hair (5), face (6), and helm (7).
-func (m *ModelManager) resolveSlotTexture(equip *EquipmentState, slot int) int32 {
+// resolveSlotTexture returns the replacement DictID for a given TextureSlot and
+// the file it must be read from. Handles armor (0-4), hair (5), face (6), and
+// helm (7).
+func (m *ModelManager) resolveSlotTexture(equip *EquipmentState, slot int) (int32, texSource) {
 	switch {
 	case slot >= TextSlotChest && slot <= TextSlotBoots:
-		// Armor slots 0-4: robe overrides chest (0) and legs (3).
-		var dictID int32
-		if equip.Robe < 4 {
-			dictID = GetRobeTextureDictID(equip.Robe, slot)
+		// Armor slots 0-4: robe overrides chest (0) and legs (3) unless hidden.
+		if equip.Robe < 4 && !equip.HideRobe {
+			if dictID := GetRobeTextureDictID(equip.Robe, slot); dictID != 0 {
+				return dictID, texSrcAuto
+			}
 		}
-		if dictID == 0 {
-			armorSet, _ := armorSetForSlot(equip, slot)
-			dictID = GetArmorTextureDictID(armorSet, slot)
+		armorSet, _ := armorSetForSlot(equip, slot)
+		dictID, fromCharESF := GetArmorTexture(armorSet, slot)
+		if fromCharESF {
+			return dictID, texSrcCharESF
 		}
-		return dictID
+		return dictID, texSrcAuto
 	case slot == 5: // hair
 		// PS2 SetHair uses hairStyle (arg1) as the $Hair texture index (0-7).
 		// Go's HairColor field (byte 105) = PS2's hairStyle parameter.
 		// Visibility is handled by shouldDraw/hairSlotVisible, so all slots that
 		// reach here are visible and should get the hair texture.
-		return GetHairTextureDictID(equip.HairColor)
+		return GetHairTextureDictID(equip.HairColor), texSrcAuto
 	case slot == 7: // face — always show character face texture
 		// Helm is rendered as a separate 3D model (not a texture swap on slot 7).
 		// The head mesh always displays the face texture from CHARFACE.CSF.
-		return GetFaceTexture(equip.Race, equip.FaceOption, equip.Sex)
+		return GetFaceTexture(equip.Race, equip.FaceOption, equip.Sex), texSrcAuto
 	default:
-		return 0
+		return 0, texSrcAuto
 	}
 }
 
