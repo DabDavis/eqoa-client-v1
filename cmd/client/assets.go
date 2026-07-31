@@ -503,6 +503,11 @@ func entityEquipment(ent *game.Entity, mgr *models.ModelManager) *models.Equipme
 // PS2 reads Race from the ESF CSprite data (VICSprite::GetRace at 0x00506968).
 // When an illusion changes ModelID, this returns the illusion model's race
 // so face/skin textures match the rendered model.
+// The result is always in CSprite.Race space, because that is what
+// models.GetFaceTexture expects. The fallback therefore converts the network
+// race byte rather than returning it raw: the two enums agree for 0-8 but the
+// network puts Ogre at 9, where CSprite.Race uses 9 as its "unset" sentinel and
+// puts Ogre at 10.
 func deriveRace(ent *game.Entity, mgr *models.ModelManager) byte {
 	// Prefer ESF CSprite Race (PS2-accurate, stored during model load).
 	if mgr != nil {
@@ -510,7 +515,17 @@ func deriveRace(ent *game.Entity, mgr *models.ModelManager) byte {
 			return byte(r)
 		}
 	}
-	return ent.Race // non-player model or not loaded, keep original
+	return networkRaceToCSpriteRace(ent.Race)
+}
+
+// networkRaceToCSpriteRace converts a wire race byte (HUM=0 … OGR=9) into the
+// CSprite.Race space the model tables are keyed on. Used only until the model
+// loads and its real Race is known.
+func networkRaceToCSpriteRace(netRace byte) byte {
+	if netRace == 9 {
+		return 10 // Ogre
+	}
+	return netRace
 }
 
 // streaming winEnd fix

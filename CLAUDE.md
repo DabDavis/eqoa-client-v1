@@ -323,6 +323,28 @@ without this the override looks like a no-op).
 but forces `texSrcCharESF`, surfacing the ornate gold-and-steel plate art that
 CHARCUST.CSF otherwise shadows. Retail can't display it.
 
+#### Per-slot NPC art (`NPCArmorTextures`)
+
+Below the set grid, each armor slot can instead take any of **63 CHAR.ESF NPC
+clothing textures** that were authored on the player body meshes — cycled with
+`<`/`>` per slot. These are individual materials off different NPCs, not
+coordinated sets, hence per-slot rather than another set row.
+
+`internal/models/npcarmor.go` is **generated** by
+`go-eqoa-esf-tools-v2/cmd/npctex -gogen`; edit the generator, not the table. See
+`claude-notes/npc-armor-texture-survey.md` for the regeneration command and how
+the set was derived.
+
+Two invariants (regression-tested in `npcarmor_test.go` / `transmog_test.go`):
+
+- **A slot's UV layout is shared across races but splits by sex.** Each entry
+  carries a `Compat` bitmask over (race, sex); the picker filters on the local
+  body and `transmogState.apply` re-validates every frame, dropping art the
+  rendered body cannot wear. Never offer a texture without checking `FitsBody`.
+- **An override outranks a robe.** `resolveSlotTexture` returns it first, and the
+  two-pass armor branch excludes overridden slots from `isRobe` — otherwise a
+  robed character renders single-pass and loses the skin under transparent areas.
+
 ## Animation System
 
 ### SpriteAnimController (`animcontroller.go`)

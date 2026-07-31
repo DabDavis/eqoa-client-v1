@@ -64,7 +64,8 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 	// Collect triangles grouped by material.
 	groups := make(map[matKey][]triVert)
 	matSurfaces := make(map[matKey]*esf.Surface) // material → layer 0 texture
-	layer1DictIDs := make(map[matKey]int32)       // material → layer 1 DictID (clothing overlay)
+	layer1DictIDs := make(map[matKey]int32)      // material → layer 1 DictID (clothing overlay)
+	layer0Colors := make(map[matKey][4]byte)     // material → layer 0 colour (per-race skin tone)
 
 	var totalTris int
 	bbox := esf.NewBox()
@@ -110,6 +111,7 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 			if _, seen := matSurfaces[key]; !seen {
 				matSurfaces[key] = resolveSurface(mp, vl.Material)
 				layer1DictIDs[key] = resolveLayer1DictID(mp, vl.Material)
+				layer0Colors[key] = resolveLayer0Color(mp, vl.Material)
 			}
 
 			// Expand triangle strip to individual triangles.
@@ -386,6 +388,13 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 		}
 		tex := m.getTexture(surf)
 		rl.SetMaterialTexture(&mat, rl.MapDiffuse, tex)
+		// Layer-0 colour multiplies the texture (PS2 SetLayerColor) and carries
+		// the per-race skin tone. Setting it here means the base pass gets it and
+		// the armour/robe passes, which already save and restore Color, still work.
+		if c, ok := layer0Colors[key]; ok && c != [4]byte{255, 255, 255, 255} {
+			maps := (*[32]rl.MaterialMap)(unsafe.Pointer(mat.Maps))
+			maps[rl.MapDiffuse].Color = rl.NewColor(c[0], c[1], c[2], 255)
+		}
 		if surf != nil {
 			totalTextures++
 		}
@@ -697,6 +706,7 @@ func (m *ModelManager) loadItemModel(modelID int32) *CharModel {
 
 	groups := make(map[matKey][]triVert)
 	matSurfaces := make(map[matKey]*esf.Surface)
+	layer0Colors := make(map[matKey][4]byte) // material → layer 0 colour (per-race skin tone)
 
 	var totalTris int
 	bbox := esf.NewBox()
@@ -748,6 +758,7 @@ func (m *ModelManager) loadItemModel(modelID int32) *CharModel {
 					key := matKey{matPalPtr: matPalPtr, matIndex: vl.Material}
 					if _, seen := matSurfaces[key]; !seen {
 						matSurfaces[key] = resolveSurface(mp, vl.Material)
+						layer0Colors[key] = resolveLayer0Color(mp, vl.Material)
 					}
 					// Apply both the child and parent placement transforms.
 					tris := destripVertices(vl.Vertices, cp)
@@ -793,6 +804,7 @@ func (m *ModelManager) loadItemModel(modelID int32) *CharModel {
 
 			if _, seen := matSurfaces[key]; !seen {
 				matSurfaces[key] = resolveSurface(mp, vl.Material)
+				layer0Colors[key] = resolveLayer0Color(mp, vl.Material)
 			}
 
 			tris := destripVertices(vl.Vertices, sp)
@@ -880,6 +892,13 @@ func (m *ModelManager) loadItemModel(modelID int32) *CharModel {
 		surf := matSurfaces[key]
 		tex := m.getTexture(surf)
 		rl.SetMaterialTexture(&mat, rl.MapDiffuse, tex)
+		// Layer-0 colour multiplies the texture (PS2 SetLayerColor) and carries
+		// the per-race skin tone. Setting it here means the base pass gets it and
+		// the armour/robe passes, which already save and restore Color, still work.
+		if c, ok := layer0Colors[key]; ok && c != [4]byte{255, 255, 255, 255} {
+			maps := (*[32]rl.MaterialMap)(unsafe.Pointer(mat.Maps))
+			maps[rl.MapDiffuse].Color = rl.NewColor(c[0], c[1], c[2], 255)
+		}
 		if surf != nil {
 			totalTextures++
 		}
@@ -1064,6 +1083,25 @@ func resolveSurface(mp *esf.MaterialPalette, matIdx int) *esf.Surface {
 		return nil
 	}
 	return mat.Layers[0].Surface
+}
+
+// resolveLayer0Color returns layer 0's material colour, which the PS2
+// multiplies into the texture (VIMaterial::SetLayerColor). This is where the
+// per-race skin tone lives, not in the texture: the dark-skinned race's body
+// shares the same pale skin surface (-1338533307) as several others and is
+// tinted (109, 83, 77), while its head has its own dark texture and no tint.
+// Ignoring the colour therefore renders that race with a dark face and a pale
+// body. White is returned when a material carries no layers.
+func resolveLayer0Color(mp *esf.MaterialPalette, matIdx int) [4]byte {
+	white := [4]byte{255, 255, 255, 255}
+	if mp == nil || matIdx < 0 || matIdx >= len(mp.Materials) {
+		return white
+	}
+	mat := mp.Materials[matIdx]
+	if len(mat.Layers) == 0 {
+		return white
+	}
+	return mat.Layers[0].Color
 }
 
 // resolveLayer1DictID returns the DictID of layer 1's Surface for a material.

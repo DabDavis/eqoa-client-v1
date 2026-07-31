@@ -123,21 +123,62 @@ var HairTextures = [8]int32{
 // HairNullTexture is the bald/no-hair ESF Surface DictID.
 var HairNullTexture int32 = 1125869994 // pool[198]
 
-// FaceTextures maps [race][faceIndex*2+sex] to ESF Surface hash DictID.
-// Face textures use unique DictIDs (not duplicated), so DictID lookup is safe.
-// 10 races x 8 entries (4 faces x 2 sexes: male=0, female=1).
-// Ogre faces extracted from CHARFACE.CSF (not in PS2 $Race table — added later).
+// FaceTextures maps [row][faceIndex*2+sex] to ESF Surface hash DictID, mirroring
+// the PS2 $Race table's layout (Race[race*8 + face*2 + sex], sex 0=male).
+// The 10 rows x 8 entries account for CHARFACE.CSF exactly: all 80 surfaces, no
+// spares. Ogre is the row absent from the 72-entry PS2 $Race table.
+//
+// Rows are ordered by the NETWORK race enum (HUM=0 … OGR=9), which is *not*
+// CSprite.Race at the top end — index with FaceRowForCSpriteRace, never with a
+// CSprite Race value directly. See that function for the divergence.
+//
+// The row names below were wrong for rows 4-7 (they read Halfling/Dwarf/Troll/
+// Barbarian). Corrected by matching each row's face art to the body skin it has
+// to sit next to: normalised body-vs-face RGB agrees to within a percent on every
+// row, and row 5 is unmistakable — both its face and its body skin are green
+// (35,38,27 with G > R), i.e. Troll, which the network enum also puts at 5.
 var FaceTextures = [10][8]int32{
-	{1249555534, 1985805693, 1544055455, -2014661682, 1838555376, -1720161761, 2133055297, -1425661840},   // Human
-	{1953705756, -130205509, -2046761619, 164294412, -1752261698, 458794333, -1457761777, 753294254},      // Elf
-	{1123782610, -329760479, 1418282531, -35260558, 1712782452, 259239363, 2007282373, 553739284},         // DarkElf
-	{-1716470973, 1662343962, -1421971052, 1956843883, -1127471131, -2043623492, -832971210, -1749123571}, // Gnome
-	{1870557257, -1112454576, -2129910118, -817954655, -1835410197, -523454734, -1540910276, -228954813},  // Halfling
-	{313034802, 2121145473, 607534723, -1879321902, 902034644, -1584821981, 1196534565, -1290322060},      // Dwarf
-	{-638844159, 686922440, -344344238, 981422361, -49844317, 1275922282, 244655604, 1570422203},          // Troll
-	{1837018216, -1150319513, 2131518137, -855819592, -1868949238, -561319671, -1574449317, -266819750},   // Barbarian
-	{-735732927, 131118344, -441233006, 425618265, -146733085, 720118186, 147766836, 1014618107},          // Erudite
-	{-50023566, -620928575, 244476355, -326428654, 538976276, -31928733, 833476197, 262571188},            // Ogre
+	{1249555534, 1985805693, 1544055455, -2014661682, 1838555376, -1720161761, 2133055297, -1425661840},   // 0 Human
+	{1953705756, -130205509, -2046761619, 164294412, -1752261698, 458794333, -1457761777, 753294254},      // 1 Elf
+	{1123782610, -329760479, 1418282531, -35260558, 1712782452, 259239363, 2007282373, 553739284},         // 2 DarkElf  (blue-grey)
+	{-1716470973, 1662343962, -1421971052, 1956843883, -1127471131, -2043623492, -832971210, -1749123571}, // 3 Gnome
+	{1870557257, -1112454576, -2129910118, -817954655, -1835410197, -523454734, -1540910276, -228954813},  // 4 Dwarf
+	{313034802, 2121145473, 607534723, -1879321902, 902034644, -1584821981, 1196534565, -1290322060},      // 5 Troll     (green)
+	{-638844159, 686922440, -344344238, 981422361, -49844317, 1275922282, 244655604, 1570422203},          // 6 Barbarian
+	{1837018216, -1150319513, 2131518137, -855819592, -1868949238, -561319671, -1574449317, -266819750},   // 7 Halfling
+	{-735732927, 131118344, -441233006, 425618265, -146733085, 720118186, 147766836, 1014618107},          // 8 Erudite  (dark)
+	{-50023566, -620928575, 244476355, -326428654, 538976276, -31928733, 833476197, 262571188},            // 9 Ogre
+}
+
+// FaceRowNames labels each FaceTextures row for UI and tooling.
+var FaceRowNames = [len(FaceTextures)]string{
+	"Human", "Elf", "DarkElf", "Gnome", "Dwarf",
+	"Troll", "Barbarian", "Halfling", "Erudite", "Ogre",
+}
+
+// FaceRowForCSpriteRace maps a model's CSprite.Race to a FaceTextures row, or
+// -1 when the model has no face row.
+//
+// The two enums agree for 0-8 but diverge above that:
+//
+//   - CSprite.Race 9 is not Ogre, it is the parser's "unset" default. pkg/esf
+//     sets Race = 9 when the CSpriteHeader predates the field, so every creature
+//     and prop in CHAR.ESF reports 9. No race-9 model is a player body: none has
+//     the two LOD sub-sprites and >3000 verts every real body has.
+//   - The Ogre player body reports CSprite.Race 10, which the network enum has no
+//     value for and which therefore has no row of its own.
+//
+// Indexing FaceTextures with CSprite.Race directly gives Ogres no face at all
+// (row 10 is out of range) and would hand creature models the Ogre faces.
+func FaceRowForCSpriteRace(cspriteRace byte) int {
+	switch {
+	case cspriteRace <= 8:
+		return int(cspriteRace)
+	case cspriteRace == 10:
+		return 9 // Ogre
+	default:
+		return -1 // 9 = unset sentinel, or out of range
+	}
 }
 
 // GetArmorTextureDictID returns the ESF Surface DictID for an armor texture.
@@ -258,16 +299,23 @@ func GetTintColor(tintIndex byte) TintColor {
 }
 
 // GetFaceTexture returns the ESF hash DictID for a face texture.
-// Returns 0 if race or index is out of range.
-func GetFaceTexture(race, faceOption, sex byte) int32 {
-	if int(race) >= len(FaceTextures) || int(faceOption) >= 4 {
+//
+// cspriteRace is a model's CSprite.Race — the value the renderer has, from
+// VICSprite::GetRace — not a network race byte. The row is resolved through
+// FaceRowForCSpriteRace, which is what gets Ogres (CSprite.Race 10) their faces
+// and keeps creature models (the unset sentinel 9) from borrowing them.
+//
+// Returns 0 when the model has no face row or the index is out of range.
+func GetFaceTexture(cspriteRace, faceOption, sex byte) int32 {
+	row := FaceRowForCSpriteRace(cspriteRace)
+	if row < 0 || int(faceOption) >= 4 {
 		return 0
 	}
 	idx := int(faceOption)*2 + int(sex)
 	if idx >= 8 {
 		return 0
 	}
-	return FaceTextures[race][idx]
+	return FaceTextures[row][idx]
 }
 
 // isHairDictID returns true if the given DictID matches any known hair texture.

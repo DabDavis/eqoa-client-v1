@@ -26,6 +26,22 @@ type EquipmentState struct {
 	HairColor, HairLength, HairStyle, FaceOption, Race, Sex byte
 	HideHelm bool // client-side toggle: hide helm without unequipping
 	HideRobe bool // client-side toggle: hide robe without unequipping
+
+	// TexOverride is a client-side per-armor-slot Surface DictID, indexed by
+	// TextSlotChest..TextSlotBoots. Zero means no override. A non-zero entry
+	// wins over the robe and armor-set lookups and is read from CHAR.ESF, which
+	// is where the NPC art in NPCArmorTextures lives. Cosmetic and local only —
+	// nothing here is sent to the server.
+	TexOverride [5]int32
+}
+
+// slotOverride returns the per-slot texture override, or 0 when the slot is not
+// an armor slot or nothing is overridden.
+func (e *EquipmentState) slotOverride(slot int) int32 {
+	if e == nil || slot < TextSlotChest || slot > TextSlotBoots {
+		return 0
+	}
+	return e.TexOverride[slot]
 }
 
 // texSource identifies which ESF file a cached texture was read from. A DictID
@@ -1032,7 +1048,11 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 					// (e.g., exposed arms, neckline). Robes cover the full body opaquely.
 					if mg.TextureSlot >= TextSlotChest && mg.TextureSlot <= TextSlotBoots {
 						// Check if this slot's texture came from a robe (fully opaque coverage).
-						isRobe := equip.Robe < 4 && GetRobeTextureDictID(equip.Robe, mg.TextureSlot) != 0
+						// An override wins over the robe in resolveSlotTexture, so it must
+						// also take the armor path here or it would render single-pass and
+						// lose the skin underneath wherever the art is transparent.
+						isRobe := equip.slotOverride(mg.TextureSlot) == 0 &&
+							equip.Robe < 4 && GetRobeTextureDictID(equip.Robe, mg.TextureSlot) != 0
 						if isRobe {
 							// Robes: single-pass direct swap with robe tint.
 							tint := GetTintColor(equip.RobeTint)
@@ -2527,6 +2547,11 @@ func (m *ModelManager) getEquipmentTexture(dictID int32, src texSource) rl.Textu
 func (m *ModelManager) resolveSlotTexture(equip *EquipmentState, slot int) (int32, texSource) {
 	switch {
 	case slot >= TextSlotChest && slot <= TextSlotBoots:
+		// A per-slot cosmetic override outranks both the robe and the armor set,
+		// so picking NPC art for a slot is not silently undone by an equipped robe.
+		if dictID := equip.slotOverride(slot); dictID != 0 {
+			return dictID, texSrcCharESF
+		}
 		// Armor slots 0-4: robe overrides chest (0) and legs (3) unless hidden.
 		if equip.Robe < 4 && !equip.HideRobe {
 			if dictID := GetRobeTextureDictID(equip.Robe, slot); dictID != 0 {

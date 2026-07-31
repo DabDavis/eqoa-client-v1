@@ -1215,29 +1215,30 @@ func (c *Client) drawMenuAppearance(startY, contentH int32) {
 		return
 	}
 
-	// Armor set picker — one row per set, including the client-side ornate plate.
+	// Armor set picker — the base look for any slot without a per-slot override.
 	c.uiLabel(x, y+4, "Set", 11, colorDim)
+	if t.Set == models.ArmorSetOrnatePlate {
+		c.uiLabel(x+30, y+4, "(ornate plate art from CHAR.ESF, unused by retail)", 10, colorDim)
+	}
 	y += lineH
-	colW := int32(120)
+	const setCols = 5
+	colW := int32(88)
 	for i := 0; i < models.ArmorSetCount; i++ {
-		col := int32(i % 3)
-		row := int32(i / 3)
+		col := int32(i % setCols)
+		row := int32(i / setCols)
 		bx, by := x+col*colW, y+row*lineH
 		label := models.ArmorSetNames[i]
 		if t.Set == byte(i) {
 			label = "> " + label
 		}
-		if c.uiButtonStyled(bx, by, colW-6, lineH-2, label, 11) {
+		if c.uiButtonStyled(bx, by, colW-6, lineH-2, label, 10) {
 			t.Set = byte(i)
 		}
 	}
-	y += lineH * int32((models.ArmorSetCount+2)/3)
-	y += 6
+	y += lineH * int32((models.ArmorSetCount+setCols-1)/setCols)
+	y += 4
 
-	if t.Set == models.ArmorSetOrnatePlate {
-		c.uiLabel(x, y, "Ornate plate art from CHAR.ESF (unused by retail).", 11, colorDim)
-		y += lineH
-	}
+	y = c.drawNPCArmorPicker(x, y, t)
 
 	c.uiCheckbox(x, y, "Hide robe (robes cover chest and legs)", &t.HideRobe)
 	y += lineH
@@ -1255,6 +1256,72 @@ func (c *Client) drawMenuAppearance(startY, contentH int32) {
 		rl.DrawRectangle(x+210, y, 16, 16, rl.NewColor(tc.R, tc.G, tc.B, 255))
 		c.uiLabel(x+232, y+2, models.TintNames[t.Tint], 11, colorWhite)
 	}
+}
+
+// npcArmorSlots are the slots offered in the per-slot picker, in the order they
+// read top-to-bottom on a character.
+var npcArmorSlots = []struct {
+	slot  int
+	label string
+}{
+	{models.TextSlotChest, "Chest"},
+	{models.TextSlotBracer, "Bracer"},
+	{models.TextSlotGloves, "Gloves"},
+	{models.TextSlotLegs, "Legs"},
+	{models.TextSlotBoots, "Boots"},
+}
+
+// drawNPCArmorPicker draws the per-slot NPC texture rows and returns the next y.
+//
+// The offered list is filtered to the local character's body: a slot's UV layout
+// is shared across races but splits by sex, so showing every texture to everyone
+// would let players pick art that renders as garbage on their model.
+func (c *Client) drawNPCArmorPicker(x, y int32, t *transmogState) int32 {
+	lineH := int32(18)
+	race, sex := c.localBody()
+
+	c.uiLabel(x, y+4, "Per-slot disc art (NPC clothing from CHAR.ESF)", 11, colorGold)
+	if c.uiButtonStyled(x+300, y+2, 70, lineH-3, "Clear all", 10) {
+		t.clearSlotTex()
+	}
+	y += lineH + 2
+
+	for _, s := range npcArmorSlots {
+		avail := models.NPCArmorForSlot(s.slot, race, sex)
+		c.uiLabel(x, y+3, s.label, 11, colorDim)
+
+		if len(avail) == 0 {
+			c.uiLabel(x+56, y+3, "none fit this body", 11, colorDim)
+			y += lineH
+			continue
+		}
+		if c.uiButtonStyled(x+56, y, 20, lineH-3, "<", 11) {
+			t.cycleSlotTex(s.slot, race, sex, -1)
+		}
+		if c.uiButtonStyled(x+78, y, 20, lineH-3, ">", 11) {
+			t.cycleSlotTex(s.slot, race, sex, 1)
+		}
+		clr := colorDim
+		if t.SlotTex[s.slot] != 0 {
+			clr = colorWhite
+		}
+		c.uiLabel(x+104, y+3, t.slotTexName(s.slot), 11, clr)
+		c.uiLabel(x+330, y+3, fmt.Sprintf("%d avail", len(avail)), 10, colorDim)
+		y += lineH
+	}
+	return y + 4
+}
+
+// localBody returns the race and sex of the body being rendered for the local
+// player, derived the same way the render path does so the picker cannot offer
+// art that apply() will then reject.
+func (c *Client) localBody() (race, sex byte) {
+	gs := c.engine.State
+	if gs == nil {
+		return 0, 0
+	}
+	equip := entityEquipment(&gs.Player, c.modelMgr)
+	return equip.Race, equip.Sex
 }
 
 func (c *Client) drawMenuStats(startY, contentH int32) {
