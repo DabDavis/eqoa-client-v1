@@ -233,6 +233,24 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 					}
 				}
 			}
+			// Pin the idle ground baseline now, from slot 0's first frame,
+			// rather than letting it latch onto whatever the first entity
+			// using this model happened to be playing. Slot 0 is idle across
+			// every humanoid (claude-notes/anim-slot-semantics.md); a model
+			// without it keeps the old first-frame fallback.
+			if model.Skeleton != nil {
+				if pair, ok := model.PLSlotToRawPair[0]; ok {
+					var idleUpper, idleLower *esf.HSpriteAnim
+					if pair[0] >= 0 && pair[0] < len(cs.Animations) {
+						idleUpper = cs.Animations[pair[0]]
+					}
+					if pair[1] >= 0 && pair[1] < len(cs.Animations) {
+						idleLower = cs.Animations[pair[1]]
+					}
+					model.Skeleton.CaptureIdleBounce(idleUpper, idleLower)
+				}
+			}
+
 			// Build per-animation keyframe trigger map (sound + spell FX triggers).
 			// Store raw frame positions — PS2 ProcessPlayTiming compares frame positions directly.
 			for rawIdx, anim := range cs.Animations {

@@ -119,6 +119,13 @@ func (s *Skeleton) ComputeAnimPose(anim *esf.HSpriteAnim, frameIdx int) []mat4 {
 			if boneIdx < 0 || boneIdx >= int32(n) {
 				continue
 			}
+			// Same LOD gate as applyAnimNodes, and for the same reason: a bone
+			// with LODChannel < 0 is never animated, and feeding it keyframes
+			// mis-positions helms and weapons on every race. This path used to
+			// omit it, which made the two entry points disagree.
+			if !s.animatesBone(boneIdx) {
+				continue
+			}
 			animLocal[boneIdx] = unpackFrame(node.Frames[frameIdx])
 		}
 	}
@@ -152,23 +159,9 @@ func (s *Skeleton) ComputeAnimPoseLerp(anim *esf.HSpriteAnim, t float32) []mat4 
 
 	copy(animLocal, s.BindLocal)
 
-	if anim != nil && anim.NumFrames > 0 {
-		// Compute frame index and interpolation factor.
-		totalFrames := float32(anim.NumFrames)
-		pos := t * totalFrames
-		f0 := int(pos) % int(anim.NumFrames)
-		f1 := (f0 + 1) % int(anim.NumFrames)
-		frac := pos - float32(int(pos))
-
-		boneIndices := s.resolveBoneIndices(anim)
-		for i, node := range anim.Nodes {
-			boneIdx := boneIndices[i]
-			if boneIdx < 0 || boneIdx >= int32(n) {
-				continue
-			}
-			animLocal[boneIdx] = lerpFrame(node.Frames[f0], node.Frames[f1], frac)
-		}
-	}
+	// Shared with the Lerp2 paths rather than reimplemented: the two used to
+	// differ, and only one of them applied the LOD gate.
+	applyAnimNodes(s, anim, t, animLocal)
 
 	s.lockRootPosition(animLocal)
 	s.applyAllFixScale(animLocal)
@@ -377,72 +370,125 @@ func absf(x float32) float32 {
 	return x
 }
 
-// lerpMat4 interpolates two local transform matrices for cross-fade blending.
-// PS2 uses SLERP on quaternions at the frame level. We lerp the matrix elements
-// then re-orthonormalize the 3x3 rotation columns via Gram-Schmidt. This
-// preserves per-axis scale while fixing the rotation orthogonality that raw
-// matrix lerp destroys (which causes model flattening during large twists).
+// lerpMat4 interpolates two local bone transforms for cross-fade blending.
+//
+// It blends the ROTATION as a rotation. Each source is split into (quaternion,
+// per-axis scale, translation) — an exact split, because a bone local is
+// R·diag(s) with R orthonormal, so normalising each column recovers R and the
+// column magnitudes are the scale. The quaternions are then NLERPed exactly the
+// way lerpFrame does one level down, and the scale and translation are lerped
+// componentwise.
+//
+// The previous implementation lerped the sixteen matrix ELEMENTS and repaired
+// the result with Gram-Schmidt. That is structurally sound — the output is
+// orthogonal, carries the lerped source scales, and never flips handedness —
+// but a rotation is not a linear space, so the rotation it landed on was not the
+// rotation between the two poses. Measured over 227,040 blended bone transforms
+// from 1,892 real CHAR.ESF slot transitions (esfviewer/posetest.html), the error
+// grew with how far apart the poses were, which is exactly when a cross-fade is
+// doing visible work:
+//
+//	  0- 15 deg apart: mean 0.02 deg, worst  0.27
+//	 45- 90 deg apart: mean 2.05 deg, worst 10.17
+//	135-180 deg apart: mean 26.6 deg, worst 48.42
+//	worst overall 77.13 deg (slot 26 2H_slash -> 30 shield_bash, bone 11, blend 0.5)
+//
+// Mirrored frames (negative determinant) are carried in the scale rather than
+// silently unmirrored: the sign is pulled out onto the third axis before the
+// quaternion is taken and put back on recomposition. No bone on the disc is
+// mirrored today, but the old cross-product step would have unmirrored one.
 func lerpMat4(a, b mat4, t float32) mat4 {
-	var r mat4
+	qa, sa, ta, oka := decomposeMat4(a)
+	qb, sb, tb, okb := decomposeMat4(b)
+	if !oka || !okb {
+		// A degenerate source has no rotation to blend. Fall back to the raw
+		// element lerp, which is what the old code did here too.
+		var r mat4
+		t1 := 1.0 - t
+		for i := range r {
+			r[i] = a[i]*t1 + b[i]*t
+		}
+		return r
+	}
+
 	t1 := 1.0 - t
-	for i := range r {
-		r[i] = a[i]*t1 + b[i]*t
+
+	// Shortest path: q and -q are the same rotation, and interpolating between
+	// them without this takes the long way round.
+	if qa[0]*qb[0]+qa[1]*qb[1]+qa[2]*qb[2]+qa[3]*qb[3] < 0 {
+		qb[0], qb[1], qb[2], qb[3] = -qb[0], -qb[1], -qb[2], -qb[3]
+	}
+	qx := t1*qa[0] + t*qb[0]
+	qy := t1*qa[1] + t*qb[1]
+	qz := t1*qa[2] + t*qb[2]
+	qw := t1*qa[3] + t*qb[3]
+	n := float32(math.Sqrt(float64(qx*qx + qy*qy + qz*qz + qw*qw)))
+	if n < 1e-9 {
+		// Exactly antipodal after the flip: no shortest path is defined. Keep
+		// the source rotation rather than emitting a zero quaternion.
+		qx, qy, qz, qw = qa[0], qa[1], qa[2], qa[3]
+	} else {
+		inv := 1.0 / n
+		qx, qy, qz, qw = qx*inv, qy*inv, qz*inv, qw*inv
 	}
 
-	// Re-orthonormalize the 3x3 rotation+scale columns.
-	// The interpolated column magnitudes are WRONG (rotation matrix lerp shrinks
-	// them). Instead, lerp the source column magnitudes which are correct (~1.0).
+	s := [3]float32{
+		t1*sa[0] + t*sb[0],
+		t1*sa[1] + t*sb[1],
+		t1*sa[2] + t*sb[2],
+	}
+	// Uniform scale of 1 here, with the real per-axis scale applied below, so
+	// that composeTransform stays the single place a quaternion becomes a matrix.
+	m := composeTransform(qx, qy, qz, qw,
+		t1*ta[0]+t*tb[0], t1*ta[1]+t*tb[1], t1*ta[2]+t*tb[2], 1.0)
+	applyFixScale(&m, s)
+	return m
+}
 
-	// Source column magnitudes (per-axis scale from each matrix)
-	sa0 := float32(math.Sqrt(float64(a[0]*a[0] + a[4]*a[4] + a[8]*a[8])))
-	sa1 := float32(math.Sqrt(float64(a[1]*a[1] + a[5]*a[5] + a[9]*a[9])))
-	sa2 := float32(math.Sqrt(float64(a[2]*a[2] + a[6]*a[6] + a[10]*a[10])))
-	sb0 := float32(math.Sqrt(float64(b[0]*b[0] + b[4]*b[4] + b[8]*b[8])))
-	sb1 := float32(math.Sqrt(float64(b[1]*b[1] + b[5]*b[5] + b[9]*b[9])))
-	sb2 := float32(math.Sqrt(float64(b[2]*b[2] + b[6]*b[6] + b[10]*b[10])))
-
-	// Lerp the correct magnitudes
-	s0 := t1*sa0 + t*sb0
-	s1 := t1*sa1 + t*sb1
-	s2 := t1*sa2 + t*sb2
-
-	// Normalize interpolated columns by their OWN magnitudes to get unit directions,
-	// then Gram-Schmidt orthogonalize, then apply lerped source magnitudes.
-	rs0 := float32(math.Sqrt(float64(r[0]*r[0] + r[4]*r[4] + r[8]*r[8])))
-	rs1 := float32(math.Sqrt(float64(r[1]*r[1] + r[5]*r[5] + r[9]*r[9])))
-	if rs0 < 1e-6 || rs1 < 1e-6 || s0 < 1e-6 || s1 < 1e-6 || s2 < 1e-6 {
-		return r
+// decomposeMat4 splits a bone local into rotation, per-axis scale and
+// translation. Exact for the matrices this is used on: every bone local is
+// composeTransform's R times a uniform scale, optionally times FixScale's
+// per-axis diagonal, so the 3x3 is R·diag(s) with orthogonal columns.
+//
+// ok is false when an axis has collapsed, which leaves no rotation to recover.
+func decomposeMat4(m mat4) (q [4]float32, s [3]float32, t [3]float32, ok bool) {
+	s[0] = float32(math.Sqrt(float64(m[0]*m[0] + m[4]*m[4] + m[8]*m[8])))
+	s[1] = float32(math.Sqrt(float64(m[1]*m[1] + m[5]*m[5] + m[9]*m[9])))
+	s[2] = float32(math.Sqrt(float64(m[2]*m[2] + m[6]*m[6] + m[10]*m[10])))
+	t = [3]float32{m[3], m[7], m[11]}
+	if s[0] < 1e-9 || s[1] < 1e-9 || s[2] < 1e-9 {
+		return q, s, t, false
 	}
 
-	// Normalize column 0 by its own magnitude
-	ix0 := 1.0 / rs0
-	c0x, c0y, c0z := r[0]*ix0, r[4]*ix0, r[8]*ix0
+	i0, i1, i2 := 1.0/s[0], 1.0/s[1], 1.0/s[2]
+	// r[row][col], so column c is (m[c], m[4+c], m[8+c]).
+	r00, r10, r20 := m[0]*i0, m[4]*i0, m[8]*i0
+	r01, r11, r21 := m[1]*i1, m[5]*i1, m[9]*i1
+	r02, r12, r22 := m[2]*i2, m[6]*i2, m[10]*i2
 
-	// Column 1: normalize, subtract projection onto c0, re-normalize
-	ix1 := 1.0 / rs1
-	c1x, c1y, c1z := r[1]*ix1, r[5]*ix1, r[9]*ix1
-	dot10 := c1x*c0x + c1y*c0y + c1z*c0z
-	c1x -= dot10 * c0x
-	c1y -= dot10 * c0y
-	c1z -= dot10 * c0z
-	len1 := float32(math.Sqrt(float64(c1x*c1x + c1y*c1y + c1z*c1z)))
-	if len1 < 1e-6 {
-		return r
+	// A mirrored frame is not a rotation; carry the flip in the scale so the
+	// quaternion below describes a genuine rotation and recomposition restores
+	// the mirror exactly.
+	det := r00*(r11*r22-r12*r21) - r01*(r10*r22-r12*r20) + r02*(r10*r21-r11*r20)
+	if det < 0 {
+		s[2] = -s[2]
+		r02, r12, r22 = -r02, -r12, -r22
 	}
-	inv1 := 1.0 / len1
-	c1x *= inv1; c1y *= inv1; c1z *= inv1
 
-	// Column 2: cross product (guaranteed orthogonal + unit length)
-	c2x := c0y*c1z - c0z*c1y
-	c2y := c0z*c1x - c0x*c1z
-	c2z := c0x*c1y - c0y*c1x
-
-	// Apply LERPED source magnitudes (not the shrunken interpolated ones)
-	r[0] = c0x * s0; r[4] = c0y * s0; r[8] = c0z * s0
-	r[1] = c1x * s1; r[5] = c1y * s1; r[9] = c1z * s1
-	r[2] = c2x * s2; r[6] = c2y * s2; r[10] = c2z * s2
-
-	return r
+	if tr := r00 + r11 + r22; tr > 0 {
+		f := float32(math.Sqrt(float64(tr+1))) * 2
+		q = [4]float32{(r21 - r12) / f, (r02 - r20) / f, (r10 - r01) / f, 0.25 * f}
+	} else if r00 > r11 && r00 > r22 {
+		f := float32(math.Sqrt(float64(1+r00-r11-r22))) * 2
+		q = [4]float32{0.25 * f, (r01 + r10) / f, (r02 + r20) / f, (r21 - r12) / f}
+	} else if r11 > r22 {
+		f := float32(math.Sqrt(float64(1+r11-r00-r22))) * 2
+		q = [4]float32{(r01 + r10) / f, 0.25 * f, (r12 + r21) / f, (r02 - r20) / f}
+	} else {
+		f := float32(math.Sqrt(float64(1+r22-r00-r11))) * 2
+		q = [4]float32{(r02 + r20) / f, (r12 + r21) / f, 0.25 * f, (r10 - r01) / f}
+	}
+	return q, s, t, true
 }
 
 // resolveBoneIndices returns cached per-node bone indices for an animation.
@@ -466,6 +512,36 @@ func (s *Skeleton) resolveBoneIndices(anim *esf.HSpriteAnim) []int32 {
 // DrawEntity/drawHelm (subtracting the root drop to keep feet on ground).
 // Locking root Y was wrong — it shifts head Z through the tilted spine chain,
 // causing a 0.041 forehead exposure gap.
+// CaptureIdleBounce sets the idle baseline deterministically, from the idle
+// animation's first frame, and should be called once when the model is loaded.
+//
+// It exists because the fallback in lockRootPosition below latches on the first
+// pose ever computed, and a Skeleton lives on the CharModel in the manager's
+// `cache map[int32]*CharModel` — one per ModelID, shared by every entity using
+// it. So the ground offset for every human male was taken from whatever
+// animation the first human male happened to be playing on his first frame.
+// Right when that was idle, and wrong for good when it was not: a corpse or a
+// runner spawning first would set the baseline for the whole race.
+//
+// Either animation may be nil; a model with no idle slot keeps the fallback.
+func (s *Skeleton) CaptureIdleBounce(upper, lower *esf.HSpriteAnim) {
+	if upper == nil && lower == nil {
+		return
+	}
+	n := len(s.Nodes)
+	animLocal := make([]mat4, n)
+	copy(animLocal, s.BindLocal)
+	applyAnimNodes(s, upper, 0, animLocal)
+	applyAnimNodes(s, lower, 0, animLocal)
+	for i, bone := range s.Nodes {
+		if bone.ParentID < 0 || int(bone.ParentID) >= n {
+			s.IdleBounce = animLocal[i][7] - s.BindLocal[i][7]
+			s.idleCaptured = true
+			return
+		}
+	}
+}
+
 func (s *Skeleton) lockRootPosition(animLocal []mat4) {
 	n := len(s.Nodes)
 	for i, bone := range s.Nodes {
@@ -475,8 +551,9 @@ func (s *Skeleton) lockRootPosition(animLocal []mat4) {
 		if bone.ParentID < 0 || int(bone.ParentID) >= n {
 			// Capture root Y delta from bind pose.
 			s.StepBounce = animLocal[i][7] - s.BindLocal[i][7]
-			// Capture idle baseline on first frame. groundAdj uses IdleBounce
-			// (constant) so idle drop is compensated but walk bob shows through.
+			// Fallback idle baseline, for models CaptureIdleBounce could not
+			// resolve an idle slot for. groundAdj uses IdleBounce (constant) so
+			// the idle drop is compensated but walk bob still shows through.
 			if !s.idleCaptured {
 				s.IdleBounce = s.StepBounce
 				s.idleCaptured = true
@@ -498,7 +575,6 @@ func applyAnimNodes(s *Skeleton, anim *esf.HSpriteAnim, t float32, animLocal []m
 	f0 := int(pos) % int(anim.NumFrames)
 	f1 := (f0 + 1) % int(anim.NumFrames)
 	frac := pos - float32(int(pos))
-	filter := s.ChannelFilter
 
 	boneIndices := s.resolveBoneIndices(anim)
 	for i, node := range anim.Nodes {
@@ -506,20 +582,35 @@ func applyAnimNodes(s *Skeleton, anim *esf.HSpriteAnim, t float32, animLocal []m
 		if boneIdx < 0 || boneIdx >= n {
 			continue
 		}
-		// CRITICAL: Do not remove this LOD check. LODChannel=-1 means "never
-		// animate" (e.g. head bone). Without this, the head bone gets wrong
-		// keyframe data causing helm/weapon misposition on all races.
-		// PS2 ProcessPlayList skips LODChannel<0 bones. See commit 1c36061.
-		if len(s.BoneLOD) > int(boneIdx) {
-			lod := s.BoneLOD[boneIdx]
-			if lod < 0 || (filter > 0 && lod <= filter) {
-				continue
-			}
+		if !s.animatesBone(boneIdx) {
+			continue
 		}
 		frame0 := node.Frames[f0]
 		frame1 := node.Frames[f1]
 		animLocal[boneIdx] = lerpFrame(frame0, frame1, frac)
 	}
+}
+
+// animatesBone reports whether an animation may drive this bone at the current
+// LOD level.
+//
+// CRITICAL: do not drop this check. LODChannel < 0 means "never animate" (the
+// head bone, among others), and feeding such a bone keyframe data mis-positions
+// helms and weapons on every race. PS2 ProcessPlayList skips LODChannel < 0
+// bones; ChannelFilter above 0 additionally drops detail bones for distant
+// entities. See commit 1c36061.
+//
+// It lives here, as one function, because the two callers used to carry their
+// own copies of the rule and only one of them had it.
+func (s *Skeleton) animatesBone(boneIdx int32) bool {
+	if int(boneIdx) >= len(s.BoneLOD) {
+		return true
+	}
+	lod := s.BoneLOD[boneIdx]
+	if lod < 0 {
+		return false
+	}
+	return !(s.ChannelFilter > 0 && lod <= s.ChannelFilter)
 }
 
 func (s *Skeleton) resolveBoneIndex(refID int32) int32 {
