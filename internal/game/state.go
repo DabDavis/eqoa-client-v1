@@ -1288,6 +1288,16 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 	gs.Phase = PhaseInWorld
 	gs.StatusMsg = "In world"
 
+	// Everything above is parsing and local state, and is worth keeping whether
+	// or not there is a connection to answer on. The batch below is not: a nil
+	// Conn here would panic inside QueueReliable, and a packet handler that
+	// crashes the client is exactly what the dispatch guard exists to prevent.
+	// Every other sender in this file already checks.
+	if gs.Conn == nil {
+		log.Printf("MemoryDump: no connection — world entry batch not sent")
+		return
+	}
+
 	// Send the same world-entry opcode batch the PS2 client sends (all in ONE packet):
 	// CharacterInWorld + ChangeChatMode + FactionMessages + LootMessages + first 0x40.
 	// PS2 pcap shows all five in the same packet at world entry (~10.48s).
