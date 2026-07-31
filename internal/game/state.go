@@ -982,13 +982,19 @@ func (gs *GameState) handleCamera1(msg *protocol.Message) {
 		// Do NOT change Phase here — Sandstorm sends Camera1(-1) after CharacterSelect,
 		// which would overwrite PhaseCharSelect and prevent auto-select from triggering.
 	}
-	// Always send ACK response
-	gs.Conn.Flush()
+	// Always send ACK response. Flush locks the connection's mutex on its first
+	// line, so a nil Conn panics rather than no-opping — same crash the
+	// world-entry batch in handleMemoryDump had.
+	if gs.Conn != nil {
+		gs.Conn.Flush()
+	}
 }
 
 func (gs *GameState) handleCamera2(msg *protocol.Message) {
 	log.Printf("Camera2 received")
-	gs.Conn.Flush()
+	if gs.Conn != nil {
+		gs.Conn.Flush()
+	}
 }
 
 func (gs *GameState) handleCharacterSelect(msg *protocol.Message) {
