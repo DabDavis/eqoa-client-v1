@@ -234,14 +234,25 @@ func TestCaptureIdleBounceBeatsTheFirstFramePlayed(t *testing.T) {
 
 // ComputeAnimPose and ComputeAnimPoseLerp used to skip the LOD gate that
 // applyAnimNodes calls critical, so the entry points disagreed about whether a
-// LODChannel < 0 bone may be animated. They now share one rule.
+// LODChannel < 0 bone may be animated. They now share one rule, and that rule is
+// ProcessPlayList's own: animate iff `lodLevel < bone.LODChannel` (0x00449000,
+// bone struct +0xC).
+//
+// The -1 row is the one that used to be missing. The old code had no way to
+// express the nearest band — it called that 0 — and guarded with
+// `ChannelFilter > 0`, so at level 0 it animated every channel-0 bone. That is
+// 3,541 bones, 16% of every bone in CHAR.ESF, animating one band longer than
+// retail.
 func TestAnimatesBoneGate(t *testing.T) {
 	s := &Skeleton{BoneLOD: []int32{-1, 0, 1, 2, 3}}
 	for _, c := range []struct {
 		filter int32
 		want   []bool
 	}{
-		{0, []bool{false, true, true, true, true}},
+		// level -1: nearest. Everything animates except the never-animate
+		// bones, which fail -1 < -1 without needing a special case.
+		{-1, []bool{false, true, true, true, true}},
+		{0, []bool{false, false, true, true, true}},
 		{1, []bool{false, false, false, true, true}},
 		{2, []bool{false, false, false, false, true}},
 	} {
@@ -256,5 +267,44 @@ func TestAnimatesBoneGate(t *testing.T) {
 	// A bone past the end of the table is animated rather than dropped.
 	if !s.animatesBone(99) {
 		t.Error("bone outside BoneLOD should default to animated")
+	}
+}
+
+// CalcLODLevelIndex is VIHSprite::CalcLODLevelIndex (0x0044A440) and the bands
+// have to line up with it exactly — an off-by-one here freezes a band of bones
+// at the wrong distance, which is invisible in a screenshot and obvious in
+// motion.
+func TestCalcLODLevelIndexMatchesPS2Bands(t *testing.T) {
+	// The retail majority: 491 of CHAR.ESF's 568 models.
+	s := &Skeleton{LODDistances: []float32{5, 15, 40}}
+	sq := func(d float32) float32 { return d * d }
+	for _, c := range []struct {
+		dist float32
+		want int32
+	}{
+		{0, -1}, {4.9, -1},
+		{5, 0}, {14.9, 0}, // at the threshold exactly: past it, not under it
+		{15, 1}, {39.9, 1},
+		{40, 2}, {1000, 2}, // never above the last band
+	} {
+		if got := s.CalcLODLevelIndex(sq(c.dist)); got != c.want {
+			t.Errorf("distance %v: level %d, want %d", c.dist, got, c.want)
+		}
+	}
+	// A model shipped without a table animates fully at every distance rather
+	// than freezing — CalcLODLevelIndex guards on count > 0 the same way.
+	none := &Skeleton{}
+	if got := none.CalcLODLevelIndex(sq(9999)); got != -1 {
+		t.Errorf("no LOD table: level %d, want -1", got)
+	}
+	// The large-model table, which is 5x looser. A distance that is band 2 for
+	// an ordinary model is still full detail for one of these — the whole
+	// reason a single global threshold cannot work.
+	big := &Skeleton{LODDistances: []float32{25, 75, 200}}
+	if got := big.CalcLODLevelIndex(sq(40)); got != 0 {
+		t.Errorf("large model at 40 units: level %d, want 0", got)
+	}
+	if got := s.CalcLODLevelIndex(sq(40)); got != 2 {
+		t.Errorf("ordinary model at 40 units: level %d, want 2", got)
 	}
 }

@@ -1587,24 +1587,21 @@ if model.PLSlotToRawPair != nil {
 		lowerT = as.LowerFramePos / as.LowerNumFrames
 	}
 
-	// PS2 per-bone animation LOD (ProcessPlayList channelFilter).
-	// Skip detail bones for distant entities to reduce CPU skinning cost.
-	// Channel 3=spine (always), 2=limbs (medium), 1=hands (close), 0=fingertips (never).
-	if isPlayer {
-		skel.ChannelFilter = 0 // full detail for player
-	} else {
+	// PS2 per-bone animation LOD. The level comes from the MODEL'S OWN distance
+	// table (VIHSprite::CalcLODLevelIndex, 0x0044A440) rather than from
+	// thresholds chosen here: retail ships three distances per model and they
+	// differ by a factor of five between models — (5,15,40) on 491 of CHAR.ESF's
+	// 568, but (25,75,200) on 40, which are the large ones that must hold detail
+	// further out. One global pair of thresholds cannot express that.
+	//
+	// The player is NOT special-cased. CalcNodeTransform computes the level the
+	// same way for everything, and the third-person camera sits far enough back
+	// that the player genuinely does drop a band.
+	{
 		dx := x - m.camX
 		dy := y - m.camY
 		dz := z - m.camZ
-		distSq := dx*dx + dy*dy + dz*dz
-		switch {
-		case distSq > 150*150: // >150 units: spine only
-			skel.ChannelFilter = 2
-		case distSq > 60*60: // >60 units: skip hands/fingers
-			skel.ChannelFilter = 1
-		default:
-			skel.ChannelFilter = 0 // full detail
-		}
+		skel.ChannelFilter = skel.CalcLODLevelIndex(dx*dx + dy*dy + dz*dz)
 	}
 
 	// Compute per-bone skinning matrices, with cross-fade blend if active.

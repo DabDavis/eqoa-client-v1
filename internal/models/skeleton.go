@@ -30,11 +30,16 @@ type Skeleton struct {
 	// applyAnimNodes (called ~40 times per entity per frame).
 	boneIndexCache map[*esf.HSpriteAnim][]int32
 
-	// Animation LOD channel filter. Set per-frame by applySkeletal based on
-	// entity distance. Bones with LODChannel <= channelFilter are skipped
-	// (use bind pose instead). PS2: ProcessPlayList arg1.
-	// 0 = full detail (all bones), 1 = skip fingertips, 2 = skip hands, 3 = bind pose only.
+	// Animation LOD level. Set per-frame by applySkeletal from the model's own
+	// LOD distances. This is ProcessPlayList's arg1 on the PS2, and it is
+	// VIHSprite::CalcLODLevelIndex's return value: -1 nearest, then 0, 1, 2 for
+	// the three distance bands. -1 is full detail, NOT 0.
 	ChannelFilter int32
+
+	// LODDistances is the model's own distance table, straight out of the
+	// hierarchy. Empty means the model shipped without one, in which case
+	// everything animates.
+	LODDistances []float32
 }
 
 // NewSkeleton computes bind-pose matrices from a hierarchy.
@@ -52,6 +57,11 @@ func NewSkeleton(hier *esf.HSpriteHierarchy, refMap *esf.BoneRefMap) *Skeleton {
 	}
 	s := &Skeleton{
 		Nodes:          hier.Nodes,
+		LODDistances:   hier.LODDistances,
+		// -1, not 0: on the PS2 the nearest band is -1, and 0 already drops
+		// every channel-0 bone (16% of all bones in CHAR.ESF). A zero value
+		// here would silently stop animating them.
+		ChannelFilter: -1,
 		BindLocal:      make([]mat4, n),
 		BindWorld:      make([]mat4, n),
 		InvBindWorld:   make([]mat4, n),
@@ -594,11 +604,17 @@ func applyAnimNodes(s *Skeleton, anim *esf.HSpriteAnim, t float32, animLocal []m
 // animatesBone reports whether an animation may drive this bone at the current
 // LOD level.
 //
-// CRITICAL: do not drop this check. LODChannel < 0 means "never animate" (the
-// head bone, among others), and feeding such a bone keyframe data mis-positions
-// helms and weapons on every race. PS2 ProcessPlayList skips LODChannel < 0
-// bones; ChannelFilter above 0 additionally drops detail bones for distant
-// entities. See commit 1c36061.
+// This is ProcessPlayList's own comparison, verbatim. The PS2 does, per bone:
+//
+//	if (lodLevel < bone->LODChannel)   // 0x00449000, bone struct +0xC
+//	    ...apply the animation...
+//
+// ONE comparison covers both jobs. "Never animate" is not a special case: a
+// bone with LODChannel -1 fails `-1 < -1` even at the nearest level, which is
+// what keeps helms and weapons positioned (62 such bones across CHAR.ESF). And
+// a bone with LODChannel 0 fails `0 < 0` at level 0, which is where the old
+// rule diverged — it had a `ChannelFilter > 0` guard that animated all 3,541
+// channel-0 bones (16% of every bone in the game) one band longer than retail.
 //
 // It lives here, as one function, because the two callers used to carry their
 // own copies of the rule and only one of them had it.
@@ -606,11 +622,33 @@ func (s *Skeleton) animatesBone(boneIdx int32) bool {
 	if int(boneIdx) >= len(s.BoneLOD) {
 		return true
 	}
-	lod := s.BoneLOD[boneIdx]
-	if lod < 0 {
-		return false
+	return s.ChannelFilter < s.BoneLOD[boneIdx]
+}
+
+// CalcLODLevelIndex is VIHSprite::CalcLODLevelIndex (0x0044A440), which is the
+// only thing that may set ChannelFilter.
+//
+// The distances are stored PLAIN and squared here at comparison time, exactly
+// as the PS2 does — it holds distSq and compares against `d*d` per entry rather
+// than pre-squaring the table. Returns -1 when nearer than the first distance,
+// otherwise the index of the last distance passed: with three entries the range
+// is -1, 0, 1, 2, which is four bands and not three.
+func (s *Skeleton) CalcLODLevelIndex(distSq float32) int32 {
+	n := len(s.LODDistances)
+	if n == 0 {
+		return -1
 	}
-	return !(s.ChannelFilter > 0 && lod <= s.ChannelFilter)
+	if distSq < s.LODDistances[0]*s.LODDistances[0] {
+		return -1
+	}
+	level := int32(-1)
+	for i := 1; ; i++ {
+		level++
+		if i >= n || distSq < s.LODDistances[i]*s.LODDistances[i] {
+			break
+		}
+	}
+	return level
 }
 
 func (s *Skeleton) resolveBoneIndex(refID int32) int32 {
