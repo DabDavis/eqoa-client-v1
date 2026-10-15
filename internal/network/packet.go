@@ -105,10 +105,9 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 	// Our arrivalDirty flag mirrors this behavior (#18).
 	if conn.arrivalDirty {
 		bodyFlags |= protocol.BodyFlagFlushAck
-		// PS2: if arrival_history != 0, also set FlushAck mask (0x04)
-		if conn.arrivalHistory != 0 {
-			bodyFlags |= protocol.BodyFlagUnknownPacked // 0x04 = FlushAck mask
-		}
+		// No 0x04 mask: the PS2 writes m_uiRxMask there, which nothing but a
+		// reset ever sets — always 0, so the bit is never set, and no PS2
+		// segment in four captures carries it.
 		// PS2: always sets GuaranteedAck (0x02) when arrivalDirty, even if
 		// recvReliable==0 (sends seq=0). This is a no-op on the server since
 		// its guaranteed_rx starts at 0, but matches PS2 behavior exactly.
@@ -117,16 +116,9 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 
 	// Build guaranteed ack mask from reliableOOO map (only when GuaranteedAck is set).
 	// NOTE: conn.mu is already held by Flush — do NOT re-lock (Go mutexes aren't reentrant).
-	var guaranteedAckMask int64
+	var guaranteedAckMask uint64
 	if bodyFlags&protocol.BodyFlagGuaranteedAck != 0 {
-		if len(conn.reliableOOO) > 0 {
-			for seq := range conn.reliableOOO {
-				offset := int(seq - conn.recvReliable - 1)
-				if offset >= 0 && offset < 64 {
-					guaranteedAckMask |= int64(1) << uint(offset)
-				}
-			}
-		}
+		guaranteedAckMask = GuaranteedAckMask(conn.reliableOOO, conn.recvReliable)
 		if guaranteedAckMask != 0 {
 			bodyFlags |= protocol.BodyFlagGuaranteedAckMask // 0x08
 		}
@@ -226,10 +218,6 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 	// Write flush ack (last received arrival number)
 	if bodyFlags&protocol.BodyFlagFlushAck != 0 {
 		writer.WriteUint16(conn.recvArrival)
-		// PS2: if flag 0x04, write arrival history bitmap
-		if bodyFlags&protocol.BodyFlagUnknownPacked != 0 {
-			writer.Write7BitEncodedInt64(int64(conn.arrivalHistory))
-		}
 	}
 
 	// Write guaranteed ack (last received reliable message sequence)
@@ -237,7 +225,7 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 		writer.WriteUint16(conn.recvReliable)
 		// PS2: if flag 0x08, write guaranteed ack mask
 		if bodyFlags&protocol.BodyFlagGuaranteedAckMask != 0 {
-			writer.Write7BitEncodedInt64(guaranteedAckMask)
+			writer.Write7BitEncodedUInt64(guaranteedAckMask) // packed_uns64, not zigzag
 		}
 	}
 
@@ -374,4 +362,21 @@ func ParsePacket(data []byte, conn *Connection) (*ReceivedPacket, error) {
 
 	pkt.Body = body
 	return pkt, nil
+}
+
+// GuaranteedAckMask is connection_get_ack_mask: a bit for each guaranteed
+// message held out of order, bit 0 being rx+2 (rx+1 is never held — it
+// would be in order), written as an unsigned LEB128. It used to be bit 0 =
+// rx+1 written zigzag, so the server, decoding the PS2's way, took each held
+// S as S+2. Verified on PS2 captures: after a burst lost 11..18, the PS2
+// acked rx=10 with bits 7..13 — 19..25, the second burst, exactly.
+func GuaranteedAckMask(held map[uint16]bool, rx uint16) uint64 {
+	var mask uint64
+	for seq := range held {
+		bit := int(int16(seq-rx)) - 2
+		if bit >= 0 && bit < 64 {
+			mask |= 1 << uint(bit)
+		}
+	}
+	return mask
 }

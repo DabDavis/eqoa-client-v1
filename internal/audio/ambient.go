@@ -68,46 +68,33 @@ func LoadAmbientTracks(file *esf.ObjFile) map[int32]*AmbientTrack {
 	return tracks
 }
 
-// PS2 VISceneSoundTrack::SetTracks (0x00471250) hardcodes two arrays:
-// 12 "day" ambient tracks and 8 "night" ambient tracks (20 total = all XM modules).
-// Track selection uses terrain profile blending (CalcProfileBlend) to pick the
-// biome-appropriate track. For now we use zone index as a proxy for terrain type.
-var (
-	DayTrackIDs = [12]int32{
-		-1705133364, // 0x9A5DBACC
-		-1513750472, // 0xA5C60038
-		-336400701,  // 0xEBF2EEC3
-		-1868662553, // 0x909E78E7
-		-1832277810, // 0x92C9A8CE
-		-1596201910, // 0xA0DBE44A
-		-1186844858, // 0xB9422F46
-		803938549,   // 0x2FEB20F5
-		-2041969022, // 0x864A0682
-		1701799145,  // 0x656F64E9
-		-614815237,  // 0xDB5AA9FB
-		558085599,   // 0x2143B5DF
-	}
-	NightTrackIDs = [8]int32{
-		1122422586,  // 0x42E6CF3A
-		1928364566,  // 0x72F08216
-		450674790,   // 0x1ADCC066
-		1756659874,  // 0x68B480A2
-		-1638519974, // 0x9E562B5A
-		-822665418,  // 0xCEF71F36
-		216312629,   // 0x0CE4AB35
-		-42995991,   // 0xFD6FEEE9
-	}
-)
+// AmbientTrackPairs is VISceneSoundTrack::SetTracks: the (day, night) XM
+// pair for each terrain-profile music index (TerrainProfile.Music). Index 0
+// is silence. These are the twenty AMBTRACK.ESF modules, paired.
+var AmbientTrackPairs = [11][2]int32{
+	{0, 0},
+	{-1705133364, -1513750472}, // 0x9A5DBACC, 0xA5C60038
+	{-336400701, -1868662553},  // 0xEBF2EEC3, 0x909E78E7
+	{-1832277810, -1596201910}, // 0x92C9A8CE, 0xA0DBE44A
+	{-1186844858, 803938549},   // 0xB9422F46, 0x2FEB20F5
+	{-2041969022, 1701799145},  // 0x864A0682, 0x656F64E9
+	{-614815237, 558085599},    // 0xDB5AA9FB, 0x2143B5DF
+	{1122422586, 1928364566},   // 0x42E6CF3A, 0x72F08216
+	{450674790, 1756659874},    // 0x1ADCC066, 0x68B480A2
+	{-1638519974, -822665418},  // 0x9E562B5A, 0xCEF71F36
+	{216312629, -42995991},     // 0x0CE4AB35, 0xFD6FEEE9
+}
 
-// SelectAmbientTrack picks a day or night ambient DictID based on region ID and time.
-// regionID comes from WorldRegions (one per zone proxy, values 0-11 for day, 0-7 for night).
-func SelectAmbientTrack(regionID int, isDusk bool) int32 {
-	if isDusk {
-		idx := regionID % len(NightTrackIDs)
-		return NightTrackIDs[idx]
+// AmbientTrackFor is VIScene::SetSoundTrack's choice: the music index's day or
+// night module (night is before 5:00 or after 20:00). 0 means silence.
+func AmbientTrackFor(music int, night bool) int32 {
+	if music < 0 || music >= len(AmbientTrackPairs) {
+		return 0
 	}
-	idx := regionID % len(DayTrackIDs)
-	return DayTrackIDs[idx]
+	if night {
+		return AmbientTrackPairs[music][1]
+	}
+	return AmbientTrackPairs[music][0]
 }
 
 // CheckAmbientZone returns the DictID and volume of the ambient track for the given position.

@@ -72,44 +72,54 @@ func (pn *PortalNav) FindRoomAt(x, y, z float32) int {
 	return pn.FindRoom(x, y, z)
 }
 
-// GetVisibleRooms returns the set of room indices visible from position (x,y,z)
-// via BFS through portal connections. If the position is outside all rooms
-// (outdoor), returns nil (meaning all rooms should be drawn).
-func (pn *PortalNav) GetVisibleRooms(x, y, z float32) map[int]bool {
-	if pn == nil {
+// RoomAt is the room VIWorld::RenderByPortals starts from: the room of the
+// zone-tree leaf holding the point (VIZoneTree leaf m_a), or -1.
+func (zt *ZoneTerrain) RoomAt(x, y, z float32) int {
+	if zt.Tree == nil {
+		return -1
+	}
+	leaf := zt.Tree.FindLeaf(x, y, z)
+	if leaf < 0 || leaf >= len(zt.Tree.Leaves) {
+		return -1
+	}
+	if room := int(zt.Tree.Leaves[leaf].RoomIndex); room >= 0 && room < len(zt.Rooms) {
+		return room
+	}
+	return -1
+}
+
+// VisibleFrom is the room set RenderRoom reaches from an indoor room: the
+// room itself and every room behind a portal, recursively, leaving out
+// portals wholly behind the camera. The PS2 also narrows the frustum through
+// each portal, so it reaches no room this does not — what it draws, this
+// draws too.
+func (pn *PortalNav) VisibleFrom(room int, camX, camY, camZ, fwdX, fwdY, fwdZ float32) map[int]bool {
+	if pn == nil || room < 0 || room >= len(pn.rooms) {
 		return nil
 	}
-
-	startRoom := pn.FindRoom(x, y, z)
-	if startRoom < 0 {
-		return nil // outdoor — draw everything
+	behind := func(p *esf.ZoneRoomPortal) bool {
+		for _, v := range p.Vertices {
+			if (v.X-camX)*fwdX+(v.Y-camY)*fwdY+(v.Z-camZ)*fwdZ > 0 {
+				return false
+			}
+		}
+		return len(p.Vertices) > 0
 	}
-
-	visible := make(map[int]bool)
-	queue := []int{startRoom}
-	visible[startRoom] = true
-
+	visible := map[int]bool{room: true}
+	queue := []int{room}
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
-
-		if cur < 0 || cur >= len(pn.rooms) {
-			continue
-		}
-		for _, portal := range pn.rooms[cur].Portals {
+		for i := range pn.rooms[cur].Portals {
+			portal := &pn.rooms[cur].Portals[i]
 			dest := int(portal.DestRoomID)
-			if dest < 0 {
-				// Portal to exterior — mark exterior as visible but don't BFS from it
-				visible[-1] = true
+			if dest < 0 || dest >= len(pn.rooms) || visible[dest] || behind(portal) {
 				continue
 			}
-			if dest < len(pn.rooms) && !visible[dest] {
-				visible[dest] = true
-				queue = append(queue, dest)
-			}
+			visible[dest] = true
+			queue = append(queue, dest)
 		}
 	}
-
 	return visible
 }
 

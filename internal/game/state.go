@@ -1014,7 +1014,9 @@ func (gs *GameState) handleCharacterSelect(msg *protocol.Message) {
 	// Skip opcode (2 bytes)
 	reader := buffer.NewReader(data[2:])
 
-	// Character count (zigzag encoded)
+	// Character count is zigzag encoded, like the per-character fields below.
+	// Confirmed against pcaps/ps2_sandstorm.pcap: count byte 0x0E for 7
+	// characters. CLAUDE.md's "count is UNSIGNED" note is incorrect.
 	count, _ := reader.Read7BitEncodedInt64()
 	log.Printf("CharacterSelect: %d characters", count)
 
@@ -1145,27 +1147,42 @@ func (gs *GameState) handleTime(msg *protocol.Message) {
 	}
 }
 
+// GameDayMs is the length of a game day in real milliseconds: CLIENT
+// func_00BC7B70 takes the clock modulo 3,600,000, so a day lasts 60 minutes.
+const GameDayMs = 3_600_000
+
 // GameHour returns the current game hour (0.0-24.0) based on server time.
 // Returns 12.0 (noon) if no time has been received yet.
 //
-// Uses absolute Unix time modulo cycle duration. The cycle duration is
-// epoch2 - epoch1 (typically 1,350,000ms = 22.5 real minutes per game day).
-// A half-cycle offset aligns the phase with PS2 client rendering.
+// CLIENT func_00BC7B70 computes it every frame as
+// (VISyncTime::Get(+0x2EC50) mod 3,600,000) / 3,600,000 * 24 and hands it to
+// VIScene::SetTimeOfDay. The Time handler (func_00BD0508) syncs the SECOND
+// timestamp into +0x2EC50, and VISyncTime::Get advances it at 1:1 from the
+// moment it was synced, so the phase comes from epoch2 alone. The first
+// timestamp (+0x2EC30) plays no part in the hour.
 func (gs *GameState) GameHour() float32 {
 	if !gs.TimeValid {
 		return 12.0
 	}
-	cycleDurationMs := float64(gs.TimeEpoch2 - gs.TimeEpoch1)
-	if cycleDurationMs <= 0 {
-		cycleDurationMs = 1_350_000.0
+	elapsedMs := time.Since(gs.TimeReceived).Milliseconds()
+	if elapsedMs < 0 {
+		elapsedMs = 0
 	}
-	elapsedMs := float64(time.Since(gs.TimeReceived).Milliseconds())
-	totalMs := float64(gs.TimeEpoch1) + elapsedMs
-	frac := math.Mod(totalMs, cycleDurationMs) / cycleDurationMs
-	if frac < 0 {
-		frac += 1.0
+	ms := (gs.TimeEpoch2 + uint64(elapsedMs)) % GameDayMs
+	return float32(ms) / GameDayMs * 24
+}
+
+// SetGameHour pins the clock so GameHour reads h now and advances from there,
+// as if a Time opcode had just carried that hour. Offline mode uses it.
+func (gs *GameState) SetGameHour(h float32) {
+	h = float32(math.Mod(float64(h), 24))
+	if h < 0 {
+		h += 24
 	}
-	return float32(frac * 24.0)
+	gs.TimeEpoch2 = uint64(float64(h) / 24 * GameDayMs)
+	gs.TimeEpoch1 = gs.TimeEpoch2
+	gs.TimeReceived = time.Now()
+	gs.TimeValid = true
 }
 
 func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
@@ -1654,6 +1671,9 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 	// Clear all entities from previous zone — PS2 VIEntity visibility is purely
 	// state-channel-driven, so old entities are invalid after zone transition.
 	oldCount := len(gs.Entities)
+	for id := range gs.Entities {
+		gs.SpellFXSys.NotifyActorWasDestroyed(id)
+	}
 	gs.Entities = make(map[uint32]*Entity)
 	gs.ChannelEntity = [29]uint32{}
 
@@ -2088,6 +2108,9 @@ func (gs *GameState) decodePlayerState(data []byte) {
 
 	// HP: offset 26 flag (1=alive, 3=dead), offset 27 bar (0-255).
 	if len(data) >= 28 {
+		if data[26] == 3 && gs.Player.HPFlag != 3 {
+			gs.SpellFXSys.StopIfThisWasCaster(gs.PlayerObjectID) // CLIENT: after SetDeath
+		}
 		gs.Player.HPFlag = data[26]
 		gs.Player.HP = data[27]
 		gs.Player.MaxHP = 255
@@ -2170,7 +2193,9 @@ func (gs *GameState) decodePlayerState(data []byte) {
 			gs.Player.HairStyle = data[107]
 			gs.Player.FaceOption = data[108]
 			gs.Player.Robe = data[109]
-			gs.Player.Sex = data[110]
+			// Byte 110 is the robe tint (below); the channel carries no sex,
+			// which the face takes from the model, as VICSprite::SetFace does.
+			gs.Player.Sex = SexFromModelID(gs.Player.ModelID)
 		}
 	}
 	if len(data) >= 111 {
@@ -2206,7 +2231,7 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 		if oldID != 0 {
 			if ent, ok := gs.Entities[oldID]; ok && ent.Channel == int(channel) {
 				log.Printf("Entity removed: ch=%d %q objID=0x%08X", channel, ent.Name, oldID)
-				delete(gs.Entities, oldID)
+				gs.removeEntity(oldID)
 			}
 			gs.ChannelEntity[channel] = 0
 		}
@@ -2225,7 +2250,7 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 	if oldID != 0 && oldID != objectID {
 		if old, ok := gs.Entities[oldID]; ok && old.Channel == int(channel) {
 			log.Printf("Entity replaced: ch=%d %q objID=0x%08X → 0x%08X", channel, old.Name, oldID, objectID)
-			delete(gs.Entities, oldID)
+			gs.removeEntity(oldID)
 		}
 	}
 	gs.ChannelEntity[channel] = objectID
@@ -2392,6 +2417,9 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 			log.Printf("ENTITY HP CHANGED ch=%d %q objID=0x%08X: hp=%d→%d flag=%d→%d",
 				channel, ent.Name, ent.ObjectID, oldHP, ent.HP, ent.HPFlag, hpFlag)
 		}
+		if hpFlag == 3 && ent.HPFlag != 3 {
+			gs.SpellFXSys.StopIfThisWasCaster(ent.ObjectID) // CLIENT: after SetDeath
+		}
 		ent.HPFlag = hpFlag
 	}
 
@@ -2531,6 +2559,13 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 	}
 }
 
+// removeEntity forgets an entity, and tells the spell system its actor is
+// gone, as CLIENT's actor release does (NotifyActorWasDestroyed).
+func (gs *GameState) removeEntity(id uint32) {
+	delete(gs.Entities, id)
+	gs.SpellFXSys.NotifyActorWasDestroyed(id)
+}
+
 // PurgeStaleEntities removes entities whose state channel hasn't been updated
 // within the given timeout. This handles the case where a server silently stops
 // sending updates for an entity without zeroing the channel's objectID.
@@ -2542,7 +2577,7 @@ func (gs *GameState) PurgeStaleEntities(timeout time.Duration) int {
 		if !ent.LastUpdate.IsZero() && now.Sub(ent.LastUpdate) > timeout {
 			log.Printf("Entity stale: ch=%d %q objID=0x%08X (no update for %v)",
 				ent.Channel, ent.Name, id, now.Sub(ent.LastUpdate).Round(time.Second))
-			delete(gs.Entities, id)
+			gs.removeEntity(id)
 			purged++
 		}
 	}
@@ -3290,6 +3325,9 @@ func (gs *GameState) resolveObjectName(objectID uint32) string {
 
 func (gs *GameState) handleCharacterDied(msg *protocol.Message) {
 	data := msg.Data()
+	if !gs.Player.Dead {
+		gs.SpellFXSys.StopIfThisWasCaster(gs.PlayerObjectID) // CLIENT: after SetDeath
+	}
 	gs.Player.Dead = true
 	gs.Player.DeadSince = time.Now()
 	gs.Player.HP = 0
@@ -3501,13 +3539,16 @@ func (gs *GameState) handleCastingCombat(msg *protocol.Message) {
 				fxStart = time.Now().Add(-time.Duration(timerMs) * time.Millisecond)
 			}
 		}
-		gs.SpellFXSys.Play(animHash, timerMs, casterID, targetID, fxStart)
+		// ONE playback carries the secondaries (CLIENT func_00BD3738 skips
+		// the ones it cannot resolve); playing the effect once per secondary
+		// repeated the caster's whole event list for each of them.
+		var secondary []uint32
 		for _, secTarget := range secondaryTargets {
-			secKnown := secTarget == gs.PlayerObjectID || gs.Entities[secTarget] != nil
-			if secKnown {
-				gs.SpellFXSys.Play(animHash, timerMs, casterID, secTarget, fxStart)
+			if secTarget == gs.PlayerObjectID || gs.Entities[secTarget] != nil {
+				secondary = append(secondary, secTarget)
 			}
 		}
+		gs.SpellFXSys.Play(animHash, timerMs, casterID, targetID, fxStart, secondary...)
 	}
 
 	// Parse remaining tail data (Sandstorm sends stat/buff/position as separate opcodes)
@@ -3600,22 +3641,27 @@ func (gs *GameState) handleMerchantBox(msg *protocol.Message) {
 	}
 }
 
+// handleWeatherControl handles opcode 0x00C5: CLIENT 0x00BD2CC0 reads one byte
+// and calls func_00BD9F00(type, 0), i.e. VIAtmosphere::SetWeather(type, false)
+// — a 30-second fade.
 func (gs *GameState) handleWeatherControl(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) >= 3 {
 		wt := WeatherType(data[2])
-		log.Printf("WeatherControl: type=%d (instant)", wt)
+		log.Printf("WeatherControl: type=%d (fade)", wt)
 		if gs.Weather != nil {
 			gs.Weather.SetWeather(wt, false)
 		}
 	}
 }
 
+// handleSkyboxWeather handles opcode 0x00C7: CLIENT 0x00BD2CEC is the same
+// read with func_00BD9F00(type, 1), SetWeather(type, true) — instant.
 func (gs *GameState) handleSkyboxWeather(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) >= 3 {
 		wt := WeatherType(data[2])
-		log.Printf("SkyboxWeather: type=%d (fade)", wt)
+		log.Printf("SkyboxWeather: type=%d (instant)", wt)
 		if gs.Weather != nil {
 			gs.Weather.SetWeather(wt, true)
 		}

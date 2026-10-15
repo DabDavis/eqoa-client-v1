@@ -1046,8 +1046,8 @@ func (c *Client) drawSpellEffects(gs *game.GameState, camera rl.Camera3D) {
 			bolt := c.lightningSystem.GetOrCreate(key, sx, sy, sz, dx, dy, dz, color)
 			bolt.SetEndpoints(sx, sy, sz, dx, dy, dz)
 			bolt.Color = color
-			if fx.LightningFlashed {
-				bolt.Flash()
+			if fx.LightningHeld {
+				bolt.Flash() // SetCharge(1), every frame of the duration
 			}
 
 			// Mode 3: secondary bolt from caster LEFT hand (PS2 allocates second VILightning at +0x2C)
@@ -1058,7 +1058,7 @@ func (c *Client) drawSpellEffects(gs *game.GameState, camera rl.Camera3D) {
 				bolt2 := c.lightningSystem.GetOrCreate(key2, lx, ly, lz, dx, dy, dz, color)
 				bolt2.SetEndpoints(lx, ly, lz, dx, dy, dz)
 				bolt2.Color = color
-				if fx.LightningFlashed {
+				if fx.LightningHeld {
 					bolt2.Flash()
 				}
 			}

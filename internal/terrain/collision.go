@@ -528,168 +528,141 @@ func collTriHeight(tri *CollTriangle, px, pz float32) (float32, bool) {
 	return y, true
 }
 
-// CalcFitResult mirrors PS2 VIWalkControl::CalcFit output parameters:
-//
-//	position      → X, Z          (final resolved position after all iterations)
-//	hitPoint      → HitX, HitZ    (point of first wall collision)
-//	surfaceNormal → NX, NY, NZ    (outward normal at first hit surface)
-//	slideVector   → SlideX, SlideZ (Skitter output — remaining movement projected onto wall)
-//
-// PS2 signature: CalcFit(int mode, VIScene& scene, VIVect3& position,
-//
-//	VIVect3& hitPoint, VIVect3& surfaceNormal, VIVect3& slideVector)
+// CalcFitResult is what the sphere half of VIWalkControl::Move leaves behind.
 type CalcFitResult struct {
-	X, Z           float32 // final resolved position
-	HitX, HitZ     float32 // point of first wall collision (from→hit at t)
-	NX, NY, NZ     float32 // surface normal at first hit
-	SlideX, SlideZ float32 // slide vector — Skitter output after last iteration
-	Hit            bool    // true if any wall collision occurred
+	X, Z       float32 // final position
+	HitX, HitZ float32 // where the first sweep stopped
+	NX, NY, NZ float32 // the first hit's normal
+	Hit        bool    // the first sweep hit something
+	// PushedOut: wedged in the air, the walker was moved a radius out along the
+	// stuck normals; Move zeroes its horizontal force and velocity then.
+	PushedOut bool
 }
 
-// CalcFit resolves horizontal wall collision using iterative collide-and-slide.
-// Mirrors PS2 VIWalkControl::CalcFit + VICollSphere + VICollRay::Skitter.
+// CalcFit is the sphere sweep of VIWalkControl::Move (viwalkcontrol.cpp), for
+// a horizontal step at the sphere's height (feet + 1.2, radius 0.6):
 //
-// sweepSphereVsWalls only returns wall/steep hits (normalY ≤ 0.7). Walkable surfaces
-// (ramps, gentle slopes) are invisible to CalcFit — they're handled by
-// SampleHeight (CalcFloor), which adjusts Y after horizontal movement resolves.
+//   - sweep from the old position to the new one; no hit, the walker arrives;
+//   - on a hit, skitter twice (the player's Move(0)): re-aim along the surface,
+//     kept horizontal when grounded, and sweep again. A sweep that comes free,
+//     or that moves at all (t > 0.001), ends the wedge;
+//   - only when every sweep stuck at once AND the walker is airborne and out
+//     of liquid is it pushed a radius out along the stuck normals and swept
+//     again — never on an ordinary wall contact;
+//   - the walker ends where the last sweep stopped.
 //
-// Pipeline: CalcFit (horizontal walls) → CalcFloor/SampleHeight (vertical ground)
+// It used to push out by the radius after every hit, which made walls shove
+// the player away, and a first sweep starting in contact returned the
+// unblocked target, which let corners be walked through.
 //
-// Returns CalcFitResult with PS2 output parameters: position, hitPoint,
-// surfaceNormal, slideVector.
-func (zt *ZoneTerrain) CalcFit(oldX, oldY, oldZ, newX, newZ float32) CalcFitResult {
+// The floor is SampleHeight's (CalcFloor). Faces under 60° are left to it
+// rather than swept: the PS2 steps the walker in 32 ms ticks, where those
+// slopes only ever slow a climb, and this client steps once per frame.
+func (zt *ZoneTerrain) CalcFit(oldX, oldY, oldZ, newX, newZ float32, grounded, inLiquid bool) CalcFitResult {
 	r := CalcFitResult{X: newX, Z: newZ}
 	if len(zt.CollTiles) == 0 {
 		return r
 	}
+	y := oldY + charCollY
+	from, to := vec3{oldX, y, oldZ}, vec3{newX, y, newZ}
 
-	const (
-		maxIter    = 2     // PS2 Move: $fp = 2 — max Skitter iterations
-		perturbMul = 0.01  // PS2 Skitter: PerturbMult blend weight (0x3C23D70A)
-		minMove    = 0.001 // PS2 Move: skip if movement negligible (0x38D1B717 ≈ 1e-4 squared)
-	)
+	var s collSphere
+	s.init(from, to, charRadius)
+	if !zt.collideSphere(&s) {
+		return r
+	}
+	hp := s.hitPoint()
+	r.Hit = true
+	r.HitX, r.HitZ = hp[0], hp[2]
+	r.NX, r.NY, r.NZ = s.hitNormal[0], s.hitNormal[1], s.hitNormal[2]
 
-	// PS2 VIWalkControl::Move sweeps at constant Y = oldY + charCollY.
-	// The PS2 VIEnvRay pre-sample only searches ±0.1 (walkControl[0x54]),
-	// which is essentially no adjustment. Constant Y is correct here.
-	sphereY := oldY + charCollY
-
-	fromX, fromZ := oldX, oldZ
-	remX, remZ := newX-oldX, newZ-oldZ
-
-	// Accumulated hit normals for post-loop pushout (PS2 Move accumulates
-	// normals across all Skitter iterations).
-	var accNX, accNY, accNZ float32
-
-	for iter := 0; iter < maxIter; iter++ {
-		mag := float32(math.Sqrt(float64(remX*remX + remZ*remZ)))
-		if mag < minMove {
+	var skit vec3
+	if grounded {
+		skit = vec3{0, 1, 0}
+	}
+	wedged := true
+	var normal vec3
+	for i := 0; i < 2; i++ {
+		s.skitter(skit)
+		if !zt.collideSphere(&s) {
+			wedged = false
 			break
 		}
-
-		toX := fromX + remX
-		toZ := fromZ + remZ
-
-		hnx, hny, hnz, t, hit := zt.SweepSphereVsWalls(
-			fromX, sphereY, fromZ,
-			toX, sphereY, toZ,
-			charRadius,
-		)
-		if !hit {
-			r.X = toX
-			r.Z = toZ
-			break
-		}
-
-		// PS2 Move: check hit time > 0.001 (0x3A83126F) before processing.
-		if t < 0.001 {
-			break
-		}
-
-		// Record first-hit outputs (PS2 hitPoint + surfaceNormal).
-		if !r.Hit {
-			r.HitX = fromX + remX*t
-			r.HitZ = fromZ + remZ*t
-			r.NX = hnx
-			r.NY = hny
-			r.NZ = hnz
-			r.Hit = true
-		}
-
-		// PS2 Move: accumulate hit normals across iterations.
-		accNX += hnx
-		accNY += hny
-		accNZ += hnz
-
-		if CollDebug {
-			slopeAngle := math.Acos(float64(hny)) * 180 / math.Pi
-			fmt.Printf("CalcFit[%d] HIT t=%.3f normal=(%.2f,%.2f,%.2f) slope=%.0f° rem=(%.3f,%.3f)\n",
-				iter, t, hnx, hny, hnz, slopeAngle, remX, remZ)
-		}
-
-		// PS2 Move: position at hit point (no skin offset — PS2 uses t directly).
-		r.X = fromX + remX*t
-		r.Z = fromZ + remZ*t
-
-		// PS2 VICollRay::Skitter: 3D normal projection.
-		// slideVector = remainder - dot(remainder, N) * N
-		// PS2 does double reflection with 0.01 blend, but the dominant term
-		// is the simple projection. Using full 3D normal (not 2D XZ-only).
-		slideX := remX * (1 - t)
-		slideY := float32(0) // horizontal movement, Y component is 0
-		slideZ := remZ * (1 - t)
-
-		dot3d := slideX*hnx + slideY*hny + slideZ*hnz
-		slideX -= dot3d * hnx
-		slideZ -= dot3d * hnz
-
-		// PS2 Skitter: blend with PerturbMult (0.01) to nudge off wall.
-		// slide = normalize(slide + perturbMul * hitNormal)
-		slideX += perturbMul * hnx
-		slideZ += perturbMul * hnz
-		sLen := float32(math.Sqrt(float64(slideX*slideX + slideZ*slideZ)))
-		if sLen > 1e-6 {
-			slideX /= sLen
-			slideZ /= sLen
-			// Scale to remaining distance projected onto slide direction.
-			remMag := float32(math.Sqrt(float64(remX*remX+remZ*remZ))) * (1 - t)
-			remX = slideX * remMag
-			remZ = slideZ * remMag
+		if 0.001 < s.hitTime {
+			wedged = false
 		} else {
-			remX = 0
-			remZ = 0
-		}
-
-		if CollDebug {
-			fmt.Printf("  Skitter: dot=%.3f slide=(%.3f,%.3f)\n", dot3d, remX, remZ)
-		}
-
-		// Store slide vector output (PS2 slideVector parameter).
-		r.SlideX = remX
-		r.SlideZ = remZ
-
-		fromX = r.X
-		fromZ = r.Z
-	}
-
-	// PS2 Move: post-loop pushout — push position outward along accumulated
-	// normal by charRadius. This ensures the player stays fully outside walls.
-	if r.Hit {
-		aLen := float32(math.Sqrt(float64(accNX*accNX + accNY*accNY + accNZ*accNZ)))
-		if aLen > 1e-6 {
-			pushX := (accNX / aLen) * charRadius
-			pushZ := (accNZ / aLen) * charRadius
-			r.X += pushX
-			r.Z += pushZ
+			normal = normal.add(s.hitNormal)
 		}
 	}
-
-	if CollDebug && r.Hit {
-		fmt.Printf("CalcFit RESULT: pos=(%.2f,%.2f) hit=(%.2f,%.2f) normal=(%.2f,%.2f,%.2f) slide=(%.3f,%.3f)\n",
-			r.X, r.Z, r.HitX, r.HitZ, r.NX, r.NY, r.NZ, r.SlideX, r.SlideZ)
+	if wedged && !grounded && !inLiquid {
+		normal.normalize()
+		to = to.add(normal.scale(charRadius))
+		r.PushedOut = true
+		s.init(from, to, charRadius)
+		zt.collideSphere(&s)
 	}
+	end := s.hitPoint()
+	r.X, r.Z = end[0], end[2]
 
+	if CollDebug {
+		fmt.Printf("CalcFit: (%.2f,%.2f)->(%.2f,%.2f) hit (%.2f,%.2f) n=(%.2f,%.2f,%.2f) end (%.2f,%.2f) wedged=%v pushed=%v\n",
+			oldX, oldZ, newX, newZ, r.HitX, r.HitZ, r.NX, r.NY, r.NZ, r.X, r.Z, wedged, r.PushedOut)
+	}
 	return r
+}
+
+// collideSphere sweeps s against the steep collision triangles around its
+// path, keeping the earliest hit — the walker's VIScene::Collide.
+func (zt *ZoneTerrain) collideSphere(s *collSphere) bool {
+	// A zero-length sweep collides with nothing (VICollBuffer's walk).
+	if s.length == 0 {
+		return false
+	}
+	minX := min(s.start[0], s.end[0]) - s.radius
+	maxX := max(s.start[0], s.end[0]) + s.radius
+	minZ := min(s.start[2], s.end[2]) - s.radius
+	maxZ := max(s.start[2], s.end[2]) + s.radius
+
+	keys := make([]TileKey, 0, 18)
+	add := func(x, z float32) {
+		tx := int(math.Floor(float64(x / TileSize)))
+		tz := int(math.Floor(float64(z / TileSize)))
+		for dz := -1; dz <= 1; dz++ {
+			for dx := -1; dx <= 1; dx++ {
+				k := TileKey{TX: tx + dx, TZ: tz + dz}
+				dup := false
+				for _, have := range keys {
+					dup = dup || have == k
+				}
+				if !dup {
+					keys = append(keys, k)
+				}
+			}
+		}
+	}
+	add(s.start[0], s.start[2])
+	add(s.end[0], s.end[2])
+
+	hit := false
+	for _, key := range keys {
+		tile := zt.CollTiles[key]
+		if tile == nil {
+			continue
+		}
+		for i := range tile.Triangles {
+			tri := &tile.Triangles[i]
+			if tri.Walkable || tri.MaxX < minX || tri.MinX > maxX || tri.MaxZ < minZ || tri.MinZ > maxZ {
+				continue
+			}
+			// The PS2's strip order: CollTriangle holds each strip triangle
+			// with its first two vertices swapped, so swap them back — the
+			// face normal, and so which side blocks, depends on it.
+			if s.collideTri(vec3{tri.X1, tri.Y1, tri.Z1}, vec3{tri.X0, tri.Y0, tri.Z0}, vec3{tri.X2, tri.Y2, tri.Z2}) {
+				hit = true
+			}
+		}
+	}
+	return hit
 }
 
 // segTriIntersect runs Möller-Trumbore segment-triangle intersection.
@@ -831,4 +804,91 @@ func addCollTriToZone(zt *ZoneTerrain, tri CollTriangle) {
 		zt.CollTiles[key] = tile
 	}
 	tile.Triangles = append(tile.Triangles, tri)
+}
+
+// TopSurfaceY returns the height of the highest collision triangle over (x, z),
+// whatever its slope — what a ray cast straight down from far above hits
+// first. The weather's per-particle ray (VIAtmosphere::ProcessWeather) uses
+// it, which is what stops rain at a roof.
+func (zt *ZoneTerrain) TopSurfaceY(x, z float32) (float32, bool) {
+	if len(zt.CollTiles) == 0 {
+		return 0, false
+	}
+	cx := int(math.Floor(float64(x / TileSize)))
+	cz := int(math.Floor(float64(z / TileSize)))
+	found := false
+	bestY := float32(0)
+	for dz := -1; dz <= 1; dz++ {
+		for dx := -1; dx <= 1; dx++ {
+			tile := zt.CollTiles[TileKey{TX: cx + dx, TZ: cz + dz}]
+			if tile == nil {
+				continue
+			}
+			for i := range tile.Triangles {
+				tri := &tile.Triangles[i]
+				if x < tri.MinX || x > tri.MaxX || z < tri.MinZ || z > tri.MaxZ {
+					continue
+				}
+				y, ok := collTriHeight(tri, x, z)
+				if ok && (!found || y > bestY) {
+					bestY = y
+					found = true
+				}
+			}
+		}
+	}
+	return bestY, found
+}
+
+// SunGateBelow returns the baked sun gate — the vertex alpha the lighting
+// multiplies the sun by — of the highest base-layer triangle under (x, z)
+// between y-depth and y. VIScene::CalcOutdoorsIntensity reads exactly that off
+// the world 15 units below the camera to decide how far outdoors it is.
+func (zt *ZoneTerrain) SunGateBelow(x, y, z, depth float32) (float32, bool) {
+	cx := int(math.Floor(float64(x / TileSize)))
+	cz := int(math.Floor(float64(z / TileSize)))
+	found := false
+	bestY, gate := float32(0), float32(0)
+	for dz := -1; dz <= 1; dz++ {
+		for dx := -1; dx <= 1; dx++ {
+			tile := zt.Tiles[TileKey{TX: cx + dx, TZ: cz + dz}]
+			if tile == nil {
+				continue
+			}
+			for i := range tile.Triangles {
+				t := &tile.Triangles[i]
+				if t.Layer != 0 {
+					continue
+				}
+				if x < min(t.X0, t.X1, t.X2) || x > max(t.X0, t.X1, t.X2) ||
+					z < min(t.Z0, t.Z1, t.Z2) || z > max(t.Z0, t.Z1, t.Z2) {
+					continue
+				}
+				w0, w1, w2, ok := baryXZ(t.X0, t.Z0, t.X1, t.Z1, t.X2, t.Z2, x, z)
+				if !ok {
+					continue
+				}
+				ty := w0*t.Y0 + w1*t.Y1 + w2*t.Y2
+				if ty > y || ty < y-depth || (found && ty <= bestY) {
+					continue
+				}
+				bestY, found = ty, true
+				gate = w0*t.A0 + w1*t.A1 + w2*t.A2
+			}
+		}
+	}
+	return gate, found
+}
+
+// baryXZ returns the barycentric weights of (px, pz) in a triangle's XZ
+// projection, and whether the point lies inside it.
+func baryXZ(x0, z0, x1, z1, x2, z2, px, pz float32) (w0, w1, w2 float32, ok bool) {
+	d := (z1-z2)*(x0-x2) + (x2-x1)*(z0-z2)
+	if d == 0 {
+		return 0, 0, 0, false
+	}
+	w0 = ((z1-z2)*(px-x2) + (x2-x1)*(pz-z2)) / d
+	w1 = ((z2-z0)*(px-x2) + (x0-x2)*(pz-z2)) / d
+	w2 = 1 - w0 - w1
+	return w0, w1, w2, w0 >= 0 && w1 >= 0 && w2 >= 0
 }

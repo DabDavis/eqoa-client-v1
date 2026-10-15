@@ -139,7 +139,7 @@ func loadTitleScreen(f *esf.ObjFile) *titleScreen {
 			continue
 		}
 
-		img := scalePS2AlphaImage(surf.Image)
+		img := surf.Image
 
 		// Fire atlas: extract flame frames + keep full atlas for sparkles
 		if idx == 6 {

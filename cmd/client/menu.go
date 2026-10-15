@@ -1217,8 +1217,11 @@ func (c *Client) drawMenuAppearance(startY, contentH int32) {
 
 	// Armor set picker — the base look for any slot without a per-slot override.
 	c.uiLabel(x, y+4, "Set", 11, colorDim)
-	if t.Set == models.ArmorSetOrnatePlate {
+	switch t.Set {
+	case models.ArmorSetOrnatePlate:
 		c.uiLabel(x+30, y+4, "(ornate plate art from CHAR.ESF, unused by retail)", 10, colorDim)
+	case models.ArmorSetTemplarPlate:
+		c.uiLabel(x+30, y+4, "(NPC armor from CHAR.ESF, unused by retail)", 10, colorDim)
 	}
 	y += lineH
 	const setCols = 5

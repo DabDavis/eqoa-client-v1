@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"image"
 	"log"
 	"os"
 	"path/filepath"
@@ -198,8 +197,7 @@ func (c *Client) loadReticleFromFile(uiFile *esf.ObjFile) {
 	// Load main ring texture.
 	if obj, err := uiFile.FindObject(ringDictID); err == nil && obj != nil {
 		if surf, ok := obj.(*esf.Surface); ok && surf != nil && surf.Image != nil {
-			img := scalePS2AlphaImage(surf.Image)
-			rlImg := rl.NewImageFromImage(img)
+			rlImg := rl.NewImageFromImage(surf.Image)
 			c.reticleTex = rl.LoadTextureFromImage(rlImg)
 			rl.UnloadImage(rlImg)
 			rl.SetTextureFilter(c.reticleTex, rl.FilterBilinear)
@@ -211,8 +209,7 @@ func (c *Client) loadReticleFromFile(uiFile *esf.ObjFile) {
 	// Load twinkle/sparkle texture.
 	if obj, err := uiFile.FindObject(twinkleDictID); err == nil && obj != nil {
 		if surf, ok := obj.(*esf.Surface); ok && surf != nil && surf.Image != nil {
-			img := scalePS2AlphaImage(surf.Image)
-			rlImg := rl.NewImageFromImage(img)
+			rlImg := rl.NewImageFromImage(surf.Image)
 			c.twinkleTex = rl.LoadTextureFromImage(rlImg)
 			rl.UnloadImage(rlImg)
 			rl.SetTextureFilter(c.twinkleTex, rl.FilterBilinear)
@@ -250,8 +247,7 @@ func loadIconsFromFile(f *esf.ObjFile, filter func(int, *esf.Surface) bool) (map
 			continue
 		}
 
-		img := scalePS2AlphaImage(surf.Image)
-		rlImg := rl.NewImageFromImage(img)
+		rlImg := rl.NewImageFromImage(surf.Image)
 		tex := rl.LoadTextureFromImage(rlImg)
 		rl.UnloadImage(rlImg)
 		rl.SetTextureFilter(tex, rl.FilterBilinear)
@@ -327,8 +323,7 @@ func (c *Client) loadWeatherTextures() {
 			log.Printf("loadWeatherTextures: %s is not a Surface", name)
 			return rl.Texture2D{}
 		}
-		img := scalePS2AlphaImage(surf.Image)
-		rlImg := rl.NewImageFromImage(img)
+		rlImg := rl.NewImageFromImage(surf.Image)
 		tex := rl.LoadTextureFromImage(rlImg)
 		rl.UnloadImage(rlImg)
 		rl.SetTextureFilter(tex, rl.FilterBilinear)
@@ -340,22 +335,6 @@ func (c *Client) loadWeatherTextures() {
 	snow := load(snowDictID, "snow.tga")
 	splash := load(splashDictID, "splash.tga")
 	c.weather.SetTextures(rain, snow, splash)
-}
-
-// scalePS2AlphaImage scales PS2 alpha values (0-128 -> 0-255) for OpenGL.
-func scalePS2AlphaImage(img *image.NRGBA) *image.NRGBA {
-	bounds := img.Bounds()
-	out := image.NewNRGBA(bounds)
-	copy(out.Pix, img.Pix)
-	for i := 3; i < len(out.Pix); i += 4 {
-		a := int(out.Pix[i])
-		a *= 2
-		if a > 255 {
-			a = 255
-		}
-		out.Pix[i] = uint8(a)
-	}
-	return out
 }
 
 // worldESFName maps PS2 world IDs to ESF filenames.
@@ -495,8 +474,24 @@ func entityEquipment(ent *game.Entity, mgr *models.ModelManager) *models.Equipme
 		HairStyle:  ent.HairStyle,
 		FaceOption: ent.FaceOption,
 		Race:       deriveRace(ent, mgr),
-		Sex:        ent.Sex,
+		Sex:        deriveSex(ent, mgr),
 	}
+}
+
+// deriveSex is the sex the entity's face is chosen by. VICSprite::SetFace
+// reads it from the model's header; the state channel carries none, and
+// ent.Sex is only set by opcode 0x00B3, which no server sends — so every
+// woman on the channel got a man's face.
+func deriveSex(ent *game.Entity, mgr *models.ModelManager) byte {
+	if mgr != nil {
+		if s := mgr.ModelSex(int32(ent.ModelID)); s >= 0 {
+			return byte(s)
+		}
+	}
+	if s := game.SexFromModelID(ent.ModelID); s != 0 {
+		return s
+	}
+	return ent.Sex
 }
 
 // deriveRace returns the race matching the entity's current model.

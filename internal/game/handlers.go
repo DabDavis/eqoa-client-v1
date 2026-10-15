@@ -211,6 +211,9 @@ func (gs *GameState) parseEntityReliable(reader *buffer.Reader, source string, i
 	if reader.Remaining() >= 1 {
 		dead, _ := reader.ReadByte()
 		if dead == 1 {
+			if !ent.Dead {
+				gs.SpellFXSys.StopIfThisWasCaster(ent.ObjectID) // CLIENT: after SetDeath
+			}
 			ent.Dead = true
 			ent.DeadSince = time.Now()
 		}

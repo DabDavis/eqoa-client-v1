@@ -291,6 +291,15 @@ type CharModel struct {
 	HeadIdx      int        // head bone index in skeleton hierarchy (-1 if not found)
 	RightHandIdx int        // right hand bone index (-1 if not found)
 	LeftHandIdx  int        // left hand bone index (-1 if not found)
+	// NodeBones is the CSprite's NodeIDList (VICSprite::m_node): the bone each
+	// named node 0..8 sits on, or -1. Spell effects attach to nodes through it
+	// (CalcSlotWorldTransform); node 4 is where a projectile flies to.
+	NodeBones    [9]int
+	HasNodeBones bool
+	// IsCSprite is set for a model built from a VICSprite (sprite type 5) —
+	// every character in CHAR.ESF, creatures included, and the type the
+	// spell code checks before it touches actions or triggers.
+	IsCSprite bool
 	AnimHead     [3]float32 // animated head bone position (centered model space, updated per frame)
 	AnimHeadMat  mat4       // animated head bone full world matrix (centered model space)
 	AnimRHandMat mat4       // animated right hand bone full world matrix (centered model space)
@@ -450,24 +459,11 @@ void main() {
 }
 `
 
-// Alpha blend shader — same as cutoff but without discard.
-// Used for the armor overlay pass where transparent pixels should blend
-// with the skin layer underneath (rendered in the previous pass).
-const alphaBlendFS = `#version 330
-in vec2 fragTexCoord;
-in vec4 fragColor;
-uniform sampler2D texture0;
-uniform vec4 colDiffuse;
-out vec4 finalColor;
-void main() {
-    vec4 texel = texture(texture0, fragTexCoord);
-    finalColor = texel * colDiffuse * fragColor;
-}
-`
-
 // Clothing composite shader — single-pass texture compositing for default clothing.
-// Reads clothing atlas (texture0) and skin (texture1). Alpha-blends clothing over
-// skin with bilinear-fringe recovery. Avoids 2-pass depth/blend issues.
+// Reads clothing atlas (texture0) and skin (texture1). Avoids 2-pass depth/blend
+// issues. The clothing is the body material's layer 1, which is blend mode 0 on
+// every CHAR.ESF body: the PS2 alpha-tests it at 128 (TEST 0x3080B) and draws it
+// opaque, so it replaces the skin outright wherever its alpha reaches 0.5.
 //
 // GPU bilinear filtering in straight-alpha space contaminates RGB at atlas edges
 // (averages opaque tattoo/clothing color with black alpha=0 padding). Dividing
@@ -488,19 +484,17 @@ void main() {
     if (alpha < 0.5) discard;
     // Recover clothing color from bilinear-filtered boundary pixels.
     vec3 cleanCloth = cloth.a > 0.01 ? cloth.rgb / cloth.a : vec3(0.0);
-    // Alpha-blend recovered clothing over skin — smooth transition at edges.
-    vec3 blended = mix(skin.rgb, cleanCloth, cloth.a);
+    vec3 blended = cloth.a >= 0.5 ? cleanCloth : skin.rgb;
     finalColor = vec4(blended * tint, 1.0);
 }
 `
 
 // dilateTexture fills transparent padding pixels with the nearest opaque pixel's
 // color, preventing black fringe when bilinear filtering or mipmapping samples
-// UV atlas padding. Uses alpha threshold of 26 (~10% opacity) to also catch
-// near-transparent dark edge pixels left by PS2 alpha scaling (PS2 alpha 1-12
-// scales to OpenGL 2-24, which are nearly invisible but have dark/black RGB).
+// UV atlas padding. Pixels under alpha 13 (~5% opacity) count as padding too:
+// they are nearly invisible but carry dark/black RGB.
 func dilateTexture(img *image.NRGBA) {
-	const alphaThreshold = 26 // treat pixels below this as transparent
+	const alphaThreshold = 13 // treat pixels below this as transparent
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	// Mark which pixels are sufficiently opaque (valid content).
@@ -582,10 +576,8 @@ type ModelManager struct {
 	hairColorTexCache [8]rl.Texture2D    // solid-color textures for gnome mustache tinting
 	texCache          map[texKey]rl.Texture2D // Surface DictID + source file → GPU texture
 	shader             rl.Shader        // alpha cutoff shader for character models
-	blendShader        rl.Shader        // alpha blend shader for armor overlay pass
 	clothingShader     rl.Shader        // clothing overlay: discard transparent, force opaque
 	skinShader         rl.Shader        // GPU-skinned alpha cutoff shader
-	skinBlendShader    rl.Shader        // GPU-skinned alpha blend shader
 	skinClothingShader rl.Shader        // GPU-skinned clothing composite shader
 	bodySlots       map[int32]bool                    // DictIDs of body-slot textures (slots 0-4) needing dilation
 	animStates      animStateMap                      // per-entity animation state
@@ -697,7 +689,6 @@ func newManagerFromFiles(file, custFile, faceFile *esf.ObjFile) (*ModelManager, 
 	log.Printf("models: CHAR.ESF loaded (%d dictionary entries)", file.DictLen())
 
 	shader := rl.LoadShaderFromMemory(alphaCutoffVS, alphaCutoffFS)
-	blendShader := rl.LoadShaderFromMemory(alphaCutoffVS, alphaBlendFS)
 	clothingShader := rl.LoadShaderFromMemory(alphaCutoffVS, clothingCompositeFS)
 	// Tell the composite shader that texture1 sampler is bound to texture unit 1.
 	tex1Loc := rl.GetShaderLocation(clothingShader, "texture1")
@@ -707,17 +698,16 @@ func newManagerFromFiles(file, custFile, faceFile *esf.ObjFile) (*ModelManager, 
 
 	// GPU-skinned shader variants (same fragment shaders, skinning vertex shader).
 	skinShader := rl.LoadShaderFromMemory(skinAlphaCutoffVS, alphaCutoffFS)
-	skinBlendShader := rl.LoadShaderFromMemory(skinAlphaCutoffVS, alphaBlendFS)
 	skinClothingShader := rl.LoadShaderFromMemory(skinAlphaCutoffVS, clothingCompositeFS)
 	// Register bone attribute/uniform locations for all skinned shaders.
-	for _, s := range []rl.Shader{skinShader, skinBlendShader, skinClothingShader} {
+	for _, s := range []rl.Shader{skinShader, skinClothingShader} {
 		s.UpdateLocation(shaderLocVertexBoneIds, rl.GetShaderLocationAttrib(s, "vertexBoneIds"))
 		s.UpdateLocation(shaderLocVertexBoneWeights, rl.GetShaderLocationAttrib(s, "vertexBoneWeights"))
 		s.UpdateLocation(shaderLocBoneMatrices, rl.GetShaderLocation(s, "boneMatrices"))
 	}
 	skinTex1Loc := rl.GetShaderLocation(skinClothingShader, "texture1")
 	rl.SetShaderValue(skinClothingShader, skinTex1Loc, []float32{tex1AsFloat}, rl.ShaderUniformInt)
-	log.Printf("models: shaders loaded (cutoff=%d, blend=%d, clothing=%d, skin=%d)", shader.ID, blendShader.ID, clothingShader.ID, skinShader.ID)
+	log.Printf("models: shaders loaded (cutoff=%d, clothing=%d, skin=%d)", shader.ID, clothingShader.ID, skinShader.ID)
 
 	return &ModelManager{
 		file:        file,
@@ -729,10 +719,8 @@ func newManagerFromFiles(file, custFile, faceFile *esf.ObjFile) (*ModelManager, 
 		whiteTex:    whiteTex,
 		texCache:    make(map[texKey]rl.Texture2D),
 		shader:             shader,
-		blendShader:        blendShader,
 		clothingShader:     clothingShader,
 		skinShader:         skinShader,
-		skinBlendShader:    skinBlendShader,
 		skinClothingShader: skinClothingShader,
 		bodySlots:           make(map[int32]bool),
 		animStates:      make(animStateMap),
@@ -760,19 +748,19 @@ func (m *ModelManager) BoneWorldPos(modelID int32, entityID uint32, nodeID uint1
 	if !ok || model == nil || model.Skeleton == nil {
 		return 0, 0, 0, false
 	}
-	// Map spell attachment slot to skeleton bone index.
-	// PS2 ASlotList: slot 0 = right hand, slot 1 = left hand.
-	// NodeIDList: slot 8 = head bone.
+	// A named node maps to its bone through the NodeIDList — VICSprite::
+	// CalcSlotWorldTransform reads m_node[id] — and a node the model lacks is
+	// the actor's own transform, which the caller's root position stands for.
 	idx := -1
-	switch nodeID {
-	case 0:
+	switch {
+	case model.HasNodeBones && int(nodeID) < len(model.NodeBones):
+		idx = model.NodeBones[nodeID]
+	case nodeID == 0:
 		idx = model.RightHandIdx
-	case 1:
+	case nodeID == 1:
 		idx = model.LeftHandIdx
-	case 8:
+	case nodeID == 8:
 		idx = model.HeadIdx
-	default:
-		idx = int(nodeID) // raw fallback
 	}
 	// Use per-entity cached skin matrices (survives past draw call).
 	// Falls back to shared model matrices if entity not in cache.
@@ -1051,8 +1039,11 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 						// An override wins over the robe in resolveSlotTexture, so it must
 						// also take the armor path here or it would render single-pass and
 						// lose the skin underneath wherever the art is transparent.
+						// HideRobe too, as resolveSlotTexture checks it: a hidden
+						// robe's slot holds armor, which needs the armor path.
 						isRobe := equip.slotOverride(mg.TextureSlot) == 0 &&
-							equip.Robe < 4 && GetRobeTextureDictID(equip.Robe, mg.TextureSlot) != 0
+							equip.Robe < 4 && !equip.HideRobe &&
+							GetRobeTextureDictID(equip.Robe, mg.TextureSlot) != 0
 						if isRobe {
 							// Robes: single-pass direct swap with robe tint.
 							tint := GetTintColor(equip.RobeTint)
@@ -1065,30 +1056,26 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 							maps[rl.MapDiffuse].Color = origColor
 							continue
 						}
-						// Armor: two-pass rendering (skin base + tinted armor overlay with alpha blend).
+						// Armor: two-pass rendering (skin base + tinted armor overlay).
 						// Pass 1: skin texture (base body, alpha cutoff shader).
 						rl.DrawMesh(mg.Mesh, mg.Material, transform)
-						// Pass 2: overlay on top (alpha blend, no depth write, tinted).
+						// Pass 2: the armor in layer 1, tinted, no depth write. Layer 1
+						// is blend mode 0 on every CHAR.ESF body, which the PS2
+						// alpha-tests at 128 and draws opaque, so pass 2 keeps the
+						// same cutoff shader as pass 1 rather than alpha-blending.
 						// PolygonOffset pushes overlay slightly closer so it reliably
 						// passes the GL_LESS depth test at same-depth as pass 1.
 						_, tintIdx := armorSetForSlot(equip, mg.TextureSlot)
 						tint := GetTintColor(tintIdx)
 						tintColor := rl.NewColor(tint.R, tint.G, tint.B, tint.A)
 						origColor := maps[rl.MapDiffuse].Color
-						origShader := mg.Material.Shader
 						maps[rl.MapDiffuse].Texture = replaceTex
 						maps[rl.MapDiffuse].Color = tintColor
-						if mg.GPUSkinned {
-							mg.Material.Shader = m.skinBlendShader
-						} else {
-							mg.Material.Shader = m.blendShader
-						}
 						rl.DisableDepthMask()
 						gfx.EnablePolygonOffset()
 						rl.DrawMesh(mg.Mesh, mg.Material, transform)
 						gfx.DisablePolygonOffset()
 						rl.EnableDepthMask()
-						mg.Material.Shader = origShader
 						maps[rl.MapDiffuse].Texture = origTex
 						maps[rl.MapDiffuse].Color = origColor
 						continue
@@ -1573,8 +1560,8 @@ if model.PLSlotToRawPair != nil {
 	// Sync blend state to controller for priority gating during cross-fade.
 	if as.Controller != nil {
 		blendActive := as.BlendFactor < 1.0
-		as.Controller.SetBlendActive(PairLocomotion, blendActive)
-		as.Controller.SetBlendActive(PairAction, blendActive)
+		as.Controller.SetBlendActive(LayerUpper, blendActive)
+		as.Controller.SetBlendActive(LayerLower, blendActive)
 		// Advance controller timers.
 		as.Controller.Update(dt)
 	}
@@ -2252,6 +2239,13 @@ func (m *ModelManager) GetModelDefaultScale(modelID int32) float32 {
 	return model.DefaultScale
 }
 
+// ModelIsCSprite reports whether a loaded model is a VICSprite, the PS2's
+// `m_type == 5` test. Returns false if the model is not loaded.
+func (m *ModelManager) ModelIsCSprite(modelID int32) bool {
+	model, ok := m.cache[modelID]
+	return ok && model != nil && model.IsCSprite
+}
+
 // ModelIsHumanoid returns true if the model's ESF SkelType == 1 (dual-pair humanoid
 // animation with upper/lower body split). Used for animation dispatch, weapon rendering,
 // and equipment attachment decisions.
@@ -2265,6 +2259,15 @@ func (m *ModelManager) ModelIsHumanoid(modelID int32) bool {
 func (m *ModelManager) ModelRace(modelID int32) int32 {
 	if model, ok := m.cache[modelID]; ok && model != nil {
 		return model.Race
+	}
+	return -1
+}
+
+// ModelSex returns the CSprite header's sex for a loaded model — what
+// VICSprite::SetFace keys the face on — or -1 if the model is not loaded.
+func (m *ModelManager) ModelSex(modelID int32) int32 {
+	if model, ok := m.cache[modelID]; ok && model != nil {
+		return int32(model.Sex)
 	}
 	return -1
 }
@@ -2390,7 +2393,7 @@ func (m *ModelManager) getHairColorTex(hairColor byte) rl.Texture2D {
 }
 
 // Cleanup unloads all GPU resources.
-// NOTE: Do NOT call rl.UnloadMaterial — all materials share m.shader and m.blendShader,
+// NOTE: Do NOT call rl.UnloadMaterial — all materials share m.shader and m.skinShader,
 // which are unloaded once below. UnloadMaterial would double-free the shared shader.
 func (m *ModelManager) Cleanup() {
 	for _, model := range m.cache {
@@ -2437,16 +2440,13 @@ func (m *ModelManager) Cleanup() {
 		}
 	}
 	rl.UnloadShader(m.shader)
-	rl.UnloadShader(m.blendShader)
 	rl.UnloadShader(m.clothingShader)
 	rl.UnloadShader(m.skinShader)
-	rl.UnloadShader(m.skinBlendShader)
 	rl.UnloadShader(m.skinClothingShader)
 	log.Printf("models: cleanup complete")
 }
 
 // getTexture returns a GPU texture for the given surface, loading and caching it.
-// Character textures are forced to full opacity since PS2 uses 0-128 alpha range.
 func (m *ModelManager) getTexture(surf *esf.Surface) rl.Texture2D {
 	if surf == nil || surf.Image == nil {
 		return m.whiteTex
@@ -2455,8 +2455,9 @@ func (m *ModelManager) getTexture(surf *esf.Surface) rl.Texture2D {
 	if tex, ok := m.texCache[key]; ok {
 		return tex
 	}
-	// Scale PS2 alpha range (0-128 where 128=opaque) to OpenGL (0-255).
-	img := scalePS2Alpha(surf.Image)
+	// Copy, because dilateTexture writes in place and surf.Image is shared.
+	// Alpha is not rescaled: the palette already holds 0..255.
+	img := cloneNRGBA(surf.Image)
 	// Dilate all textures: fill alpha=0 padding with nearest valid pixel color,
 	// preventing black fringe from bilinear filtering at UV seam edges.
 	dilateTexture(img)
@@ -2470,21 +2471,11 @@ func (m *ModelManager) getTexture(surf *esf.Surface) rl.Texture2D {
 	return tex
 }
 
-// scalePS2Alpha scales PS2 alpha values (0-128 = transparent-opaque) to
-// OpenGL range (0-255). Preserves transparent regions (alpha=0) while
-// making opaque regions (alpha>=128) fully opaque.
-func scalePS2Alpha(img *image.NRGBA) *image.NRGBA {
-	bounds := img.Bounds()
-	out := image.NewNRGBA(bounds)
+// cloneNRGBA returns a copy of img that can be modified without touching the
+// ESF object cache's image.
+func cloneNRGBA(img *image.NRGBA) *image.NRGBA {
+	out := image.NewNRGBA(img.Bounds())
 	copy(out.Pix, img.Pix)
-	for i := 3; i < len(out.Pix); i += 4 {
-		a := int(out.Pix[i])
-		a *= 2
-		if a > 255 {
-			a = 255
-		}
-		out.Pix[i] = uint8(a)
-	}
 	return out
 }
 
@@ -2526,7 +2517,7 @@ func (m *ModelManager) getEquipmentTexture(dictID int32, src texSource) rl.Textu
 	if surf == nil {
 		return m.whiteTex
 	}
-	img := scalePS2Alpha(surf.Image)
+	img := cloneNRGBA(surf.Image)
 	dilateTexture(img)
 	rlImg := rl.NewImageFromImage(img)
 	tex := rl.LoadTextureFromImage(rlImg)

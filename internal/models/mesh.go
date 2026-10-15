@@ -155,6 +155,7 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 		model.Race = cs.Race
 		model.Sex = cs.Sex
 		model.SkelType = cs.SkelType
+		model.IsCSprite = true
 	}
 	// PS2 CenterOff = (0, 1.2 * DefaultScale, 0) from VIWalkControl::InitParms.
 	// Height 1.2 is hardcoded; fixScale = DefaultScale.
@@ -603,6 +604,17 @@ func walkParents(nodes []esf.BoneNode, idx, levels int) int {
 // Falls back to heuristic for HSprite or when canonical data is absent.
 // Positions are adjusted to match mesh centering (XZ at origin, Y bottom=0).
 func findBones(model *CharModel, obj esf.Object, hier *esf.HSpriteHierarchy, cx, yBottom, cz, meshHeight float32, isHumanoid bool) {
+	// The NodeIDList, as VICSprite::m_node: named node -> bone.
+	if cs, ok := obj.(*esf.CSprite); ok && len(cs.NodeIDList) > 0 {
+		for n := range model.NodeBones {
+			model.NodeBones[n] = -1
+			if b := int(cs.NodeBone(int32(n))); b >= 0 && b < len(hier.Nodes) {
+				model.NodeBones[n] = b
+			}
+		}
+		model.HasNodeBones = true
+	}
+
 	// Find head bone — PS2 uses NodeIDList[8] (helm attachment bone).
 	// Try canonical lookup first, fall back to heuristic (highest-Y near centerline).
 	var headIdx int = -1

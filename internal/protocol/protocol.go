@@ -887,50 +887,37 @@ func AppendCRC(data []byte) []byte {
 // RLE Encoding (for outgoing state channels)
 // ========================================================================
 
-// RunLengthEncode encodes data using RLE matching PS2 DRDP format.
-// PS2 uses two RLE byte formats:
-//   - 1-byte nibble: (copyCount<<4)|zeroCount — when both counts ≤ 15
-//   - 2-byte extended: (copyCount|0x80), zeroCount — when either count > 15
-// The decoder checks bit 7: if set → 2-byte, else → 1-byte nibble.
+// RunLengthEncode is run_length_encode (rle.cpp): pairs of (zero run, literal
+// run). A zero run stops at 255 and a literal run at the first zero or at 127.
+// The pair is one byte (literals<<4 | zeros) when there are fewer than 8
+// literals and 16 zeros, else two: (literals | 0x80), zeros. The stream ends
+// with a 0 byte, which is the one-byte form of an empty pair.
+//
+// The short form used to take up to 15 literals. 8 or more set bit 7, which
+// the decoder reads as the long form — so a run of 8..15 non-zero bytes
+// corrupted the rest of the state (each 0x40 whose facing byte is 0 has one).
 func RunLengthEncode(data []byte) []byte {
-	if len(data) == 0 {
-		return []byte{0x00}
-	}
-
 	result := make([]byte, 0, len(data)+10)
-	length := len(data)
-	i := 0
-
-	for i < length {
-		j := i
-		for j < length && data[j] == 0 && j-i < 0x7F {
-			j++
+	for {
+		zeros := 0
+		for zeros < len(data) && data[zeros] == 0 && zeros != 255 {
+			zeros++
 		}
-		zeroes := j - i
-
-		for j < length && (data[j] != 0 || j == length-1 || data[j+1] != 0) && j-i-zeroes < 0x7F {
-			j++
+		data = data[zeros:]
+		literals := 0
+		for literals < len(data) && data[literals] != 0 && literals != 127 {
+			literals++
 		}
-		copyCount := j - zeroes - i
-
-		if copyCount == 0 && zeroes == 0 {
-			break
-		}
-
-		// PS2: use 1-byte nibble format when both counts fit in 4 bits
-		if copyCount <= 15 && zeroes <= 15 {
-			result = append(result, byte((copyCount<<4)|zeroes))
+		if literals >= 8 || zeros >= 16 {
+			result = append(result, byte(literals|0x80), byte(zeros))
 		} else {
-			result = append(result, byte(copyCount|0x80))
-			result = append(result, byte(zeroes))
+			c := byte(literals<<4 | zeros)
+			result = append(result, c)
+			if c == 0 {
+				return result
+			}
 		}
-		if copyCount > 0 {
-			result = append(result, data[i+zeroes:i+zeroes+copyCount]...)
-		}
-
-		i += copyCount + zeroes
+		result = append(result, data[:literals]...)
+		data = data[literals:]
 	}
-
-	result = append(result, 0x00)
-	return result
 }

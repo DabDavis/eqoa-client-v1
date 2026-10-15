@@ -515,17 +515,15 @@ func gmDebugEntries() []gmMenuEntry {
 		}},
 		{"Cycle Weather", func(c *Client) {
 			if c.weather != nil {
-				names := []string{"Clear", "Rain", "Snow", "Sleet", "Sandstorm", "Lavastorm", "Thunder"}
-				next := (int(c.weather.Type) + 1) % 7
+				next := (int(c.weather.Type) + 1) % len(game.WeatherNames)
 				c.weather.SetWeather(game.WeatherType(next), true)
-				log.Printf("GM: Weather → %s", names[next])
+				log.Printf("GM: Weather → %s", game.WeatherNames[next])
 			}
 		}, func(c *Client) string {
 			if c.weather == nil {
 				return "N/A"
 			}
-			names := []string{"Clear", "Rain", "Snow", "Sleet", "Sand", "Lava", "Thunder"}
-			return names[int(c.weather.Type)%7]
+			return game.WeatherNames[int(c.weather.Type)%len(game.WeatherNames)]
 		}},
 		{"Clear Entities", func(c *Client) {
 			gs := c.engine.State

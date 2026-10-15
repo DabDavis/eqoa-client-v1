@@ -81,7 +81,7 @@ func loadCharSave(name string) (charSave, bool) {
 }
 
 func (c *Client) saveChar() {
-	if c.engine == nil {
+	if c.engine == nil || c.offline != nil {
 		return
 	}
 	p := &c.engine.State.Player

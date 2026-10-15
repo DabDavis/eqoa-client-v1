@@ -260,7 +260,7 @@ func renderOne(loader *terrain.Loader, p params) {
 			rend.SetPlayerLight(true, tx, groundY+2.5, tz, float32(p.lantern),
 				1.0, 0.69, 0.36)
 		}
-		rend.SetLightingUniforms(eye.X, eye.Y, eye.Z, float32(p.hour), zt.PointLights)
+		rend.SetLightingUniforms(eye.X, eye.Y, eye.Z, float32(p.hour))
 		fr := frustum.FromCamera(camera, float32(p.w)/float32(p.h))
 		rend.DrawZone(primary, &fr, true, nil) // primary first, as render.go does
 		for i := range loaded {

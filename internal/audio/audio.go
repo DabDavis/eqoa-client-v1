@@ -25,6 +25,7 @@ type System struct {
 	sounds   map[int32]*soundData // DictID → decoded PCM data
 	active   []*ActiveSound       // currently playing sounds
 	listener [3]float32           // camera/player position
+	camDir   [3]float32           // camera view direction, for the pan
 	inited   bool
 	sfxMuted  bool                // true = spell/SFX sounds muted
 	sfxVolume float32             // SFX volume multiplier 0-1 (default 1.0)
@@ -365,10 +366,12 @@ func (s *System) Stop(id int32) {
 	}
 }
 
-// SetListener updates the listener (camera/player) position for 3D audio.
-func (s *System) SetListener(x, y, z float32) {
+// SetListener updates the listener — the camera — for 3D audio: its position
+// and the direction it looks, which the pan is taken against.
+func (s *System) SetListener(x, y, z, dirX, dirY, dirZ float32) {
 	s.mu.Lock()
 	s.listener = [3]float32{x, y, z}
+	s.camDir = [3]float32{dirX, dirY, dirZ}
 	s.mu.Unlock()
 }
 
@@ -419,25 +422,25 @@ func (s *System) calcVolume(pos [3]float32, baseVol, maxDist float32) float32 {
 	return baseVol * atten
 }
 
-// calcPan computes stereo pan from source position relative to listener.
-// Returns 0.0 (full left) to 1.0 (full right), 0.5 = center.
+// calcPan is VICSprite::CalcVolumeAndPan's pan: the cosine, in the ground
+// plane, between the source-to-camera direction and (dir.z, 0, -dir.x) — the
+// camera's left, which the reversed direction turns into -1 for a source on
+// the left and +1 on the right. raylib's pan is the same -1..1 with 0 centred.
+// It was 0..1 with 0.5 as "centre" (75% right to this raylib) and followed
+// world X instead of the camera.
 func (s *System) calcPan(pos [3]float32) float32 {
-	dx := pos[0] - s.listener[0]
-	dz := pos[2] - s.listener[2]
-	dist := float32(math.Sqrt(float64(dx*dx + dz*dz)))
+	return panFor(s.listener, s.camDir, pos)
+}
 
-	if dist < 0.01 {
-		return 0.5 // center
+func panFor(cam, dir, src [3]float32) float32 {
+	dx, dz := cam[0]-src[0], cam[2]-src[2]
+	rx, rz := dir[2], -dir[0]
+	dl := float32(math.Sqrt(float64(dx*dx + dz*dz)))
+	rn := float32(math.Sqrt(float64(rx*rx + rz*rz)))
+	if dl == 0 || rn == 0 {
+		return 0
 	}
-
-	// Simple left/right based on X offset, clamped
-	pan := 0.5 + (dx/dist)*0.4
-	if pan < 0 {
-		pan = 0
-	} else if pan > 1 {
-		pan = 1
-	}
-	return pan
+	return (dx*rx + dz*rz) / (dl * rn)
 }
 
 // HasSound returns true if a sound with the given DictID is loaded.

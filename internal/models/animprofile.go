@@ -61,10 +61,14 @@ var humanoidArmedProfile = AnimProfile{
 // the large variant's superset; small models gracefully skip missing slots.
 // Verified CPlayList slots from ESF scan: 0,1,2,3,4,5,6,7,10,11,12,13,14,15,17,22,23,30,34,37-39,43,44
 // Slots 8,9,16 do NOT exist — attacks at 22/23, battle stance at 17.
+// Death and the special idle are the same slots for every skeleton:
+// SetAnimation forces 14 when m_dead and substitutes 15 for idle when the
+// fidget timer runs out (vicsprite.cpp). Many creatures have slot 14 as their
+// only play-once animation and no slot 15 at all.
 var nonHumanoidProfile = AnimProfile{
-	SpecialIdle:  17, // CL slot 17: Special
-	BattleStance: 17, // CL slot 17: Special (slot 16 doesn't exist for SkelType 0/3)
-	Death:        15, // CL slot 15: Death
+	SpecialIdle:  15, // CL slot 15: special idle (fidget)
+	BattleStance: 17, // CL slot 17: combat idle (slot 16 doesn't exist for SkelType 0/3)
+	Death:        14, // CL slot 14: death
 	HitStun:      34, // CL slot 34: HitReaction (slot 10 only exists on SkelType 2)
 	CastDamage:   37, // CL slot 37: SpellCast (slot 11 only exists on SkelType 2)
 	CastBuff:     37, // CL slot 37: SpellCast
@@ -76,8 +80,8 @@ var nonHumanoidProfile = AnimProfile{
 		3,  // F8 2: run        → slot 3
 		5,  // F8 3: strafe     → slot 5
 		7,  // F8 4: jump/land  → slot 7
-		14, // F8 5: emote      → slot 14
-		15, // F8 6: death      → slot 15
+		14, // F8 5: death      → slot 14
+		15, // F8 6: fidget     → slot 15
 		17, // F8 7: battle stance → slot 17
 		6,  // F8 8: turn       → slot 6
 		10, // F8 9: hit        → slot 10

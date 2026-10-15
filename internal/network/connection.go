@@ -1167,24 +1167,12 @@ func (c *Connection) buildLobbyACKPacket() []byte {
 
 	// Body flags
 	var bodyFlags protocol.SegmentBodyFlags
-	bodyFlags |= protocol.BodyFlagFlushAck
-	if lobby.arrivalHistory != 0 {
-		bodyFlags |= protocol.BodyFlagUnknownPacked // 0x04 = FlushAck mask
-	}
+	bodyFlags |= protocol.BodyFlagFlushAck // no 0x04 mask: see BuildPacket
 	bodyFlags |= protocol.BodyFlagGuaranteedAck
 
-	// Build guaranteed ack mask from reliableOOO
-	var guaranteedAckMask int64
-	if len(lobby.reliableOOO) > 0 {
-		for seq := range lobby.reliableOOO {
-			offset := int(seq - lobby.recvReliable - 1)
-			if offset >= 0 && offset < 64 {
-				guaranteedAckMask |= int64(1) << uint(offset)
-			}
-		}
-		if guaranteedAckMask != 0 {
-			bodyFlags |= protocol.BodyFlagGuaranteedAckMask
-		}
+	guaranteedAckMask := GuaranteedAckMask(lobby.reliableOOO, lobby.recvReliable)
+	if guaranteedAckMask != 0 {
+		bodyFlags |= protocol.BodyFlagGuaranteedAckMask
 	}
 
 	if lobby.goodArrivalCount < 17 {
@@ -1199,14 +1187,11 @@ func (c *Connection) buildLobbyACKPacket() []byte {
 
 	// Write FlushAck (last received lobby arrival)
 	writer.WriteUint16(lobby.recvArrival)
-	if bodyFlags&protocol.BodyFlagUnknownPacked != 0 {
-		writer.Write7BitEncodedInt64(int64(lobby.arrivalHistory))
-	}
 
 	// Write GuaranteedAck (last contiguous reliable seq from lobby)
 	writer.WriteUint16(lobby.recvReliable)
 	if bodyFlags&protocol.BodyFlagGuaranteedAckMask != 0 {
-		writer.Write7BitEncodedInt64(guaranteedAckMask)
+		writer.Write7BitEncodedUInt64(guaranteedAckMask)
 	}
 
 	// Patch segment header with actual body size

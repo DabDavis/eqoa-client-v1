@@ -21,11 +21,10 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 |---|---|---|
 | `VIWalkControl::Process` | `handleInWorldInput()` — camera-relative movement + facing | `cmd/client/input.go` |
 | `VIWalkControl::SetTargetHeading` | `facing = atan2(moveX, moveZ)` — model +Z forward | `cmd/client/input.go` |
-| `VIWalkControl::CalcFit` | `ZoneTerrain.CalcFit() → CalcFitResult` — iterative collide + Skitter | `internal/terrain/collision.go` |
+| `VIWalkControl::Move` (sphere half) | `ZoneTerrain.CalcFit(…, grounded, inLiquid)` — sweep, two skitters, push-out only when wedged in the air | `internal/terrain/collision.go` |
+| `VICollSphere` + `VICollide::Collide(sphere, tri/edge/vertex)` + `VICollRay::Skitter` | `collSphere` — one-sided faces, t=0 for an embedded start, rule for rule with `go-eqoa-vi/vicoll` in float32 | `internal/terrain/sweep.go` |
 | `VIWalkControl::CalcFloor` | `ZoneTerrain.SampleHeight()` — ground snap | `internal/terrain/collision.go` |
-| `VICollRay::Init + Collide` | `castWallRay()` — Möller-Trumbore segment-triangle test | `internal/terrain/collision.go` |
-| `VICollRay::Skitter` | Inline in `CalcFit` loop — `slide = rem - dot(rem,N)*N` | `internal/terrain/collision.go` |
-| `VICollRay::PerturbMult` | `skin = 0.25` constant in `CalcFit` | `internal/terrain/collision.go` |
+| `VIWalkControl::Move` (env half) | `ZoneTerrain.ProbeLiquid()` — the liquid bits at feet+1.2 ±0.1 and mud at the feet | `internal/terrain/water.go` |
 | `VIWalkCamera::Process` | Camera orbit in `handleInWorldInput()` | `cmd/client/input.go` |
 | `VIParticleEmitter::Update` | Analytical particle physics (birth/death/position/size/color) | `internal/game/particles.go` |
 | `VIParticleSprite::Raster` | Billboard quad rendering (camera-facing textured quads) | `internal/game/particles.go` |
@@ -36,20 +35,21 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 | `VIHSprite::AddInterpolatedPlay` | 250ms cross-fade blend with per-pair rejection | `internal/models/manager.go` |
 | `VICSprite::SetAttackAction` | Primary swing anims (11 weapon types) | `cmd/client/animation.go` |
 | `VICSprite::SetAttackAltAction` | Alt swing anims (Primary/Alt alternation) | `cmd/client/animation.go` |
-| `VIAtmosphere` | Weather particles (7 types), 30s crossfade, wind, splash | `internal/game/weather.go` |
+| `VIAtmosphere` | WXTYPE 0 clear, 1-3 rain, 4-6 snow; 30 s fade (0xC5) or instant (0xC7); 8 s lightning; splashes | `internal/game/weather.go` |
+| `VIWorld::SetProfiles` + `CalcProfileBlend` | Terrain profiles → fog colour/near/far, overcast weight, ambient track | `internal/terrain/profiles.go` |
+| `VISpellEventDriver::ProcessProjectileEvent` | Projectiles and bolts ride the TARGET driver; 4 flight modes; `VIParticleSystem::DeltaTime` | `internal/game/spelldriver.go` |
 | `VILightning` | Jagged bolt renderer (16 segments, 3 branches) | `internal/game/lightning.go` |
-| `VIEffectVolume` | Environmental volumes (fog/dust/leaves/shafts/flock) | `internal/game/effectvolumes.go` |
+| `VIEffectVolume` | Environmental volumes (fog/dust/leaves/shafts/flock); `Render`'s distance fade and hour window | `internal/game/effectvolumes.go` |
 | `VIZoneTree` | BSP tree for water/lava/slime/mud detection | `internal/terrain/water.go` |
-| `VIUI` | 36-sheet UI textures, 9-slice frames, 252-entry TexID table | `internal/ui/viui.go` |
+| `VIUI` | 36-sheet UI textures, 252-entry TexID table; `BlitFrame` with per-piece flip flags, placed by corner sizes | `internal/ui/viui.go` |
+| `VIWorld::RenderByPortals` | Portal culling only from an INDOOR room (zone-tree leaf room without bit 0) | `cmd/client/render.go`, `internal/terrain/portalnav.go` |
 
 ### VI Functions NOT Yet Ported
 
 | PS2 VI Function | Purpose | Symbol Address (SUPPORT) |
 |---|---|---|
-| `VICollSphere::Init/Collide` | Swept sphere collision (player radius) | `0x005057A0` |
 | `VIWalkControl::UpdatePhysics` | Gravity, vertical velocity, jumping | `0x005132F4` |
 | `VIWalkControl::UpdateLocomotion` | Speed ramping (walk/run acceleration) | `0x00513372` |
-| `VIWalkControl::IsUnderWater/IsInLava` | Liquid detection for swim mode | `0x005134C8+` |
 | `VIWalkCamera::UpdateCameraPhysics` | Camera-wall collision | `0x00512F5A` |
 | `VIWalkControl::CalcPitchRollToLandscape` | Terrain-following rotation | `0x00513612` |
 | `VIMaterial::SetLayerTexture/BlendMode` | Multi-layer single-pass rendering | CLIENT symbols |
@@ -231,7 +231,9 @@ Procedural flora uses a hybrid approach: scatter on **render overlay triangles**
 
 ## Water & Environment Detection
 
-`internal/terrain/water.go` implements the PS2 VIZoneTree BSP tree parsed from ESF zone data. Provides `ProbeWater()` (3-probe detection), `FindWaterSurfaceY()`, and `GetEnvFlags()` for water/lava/slime/mud detection. Used for swim/drown mechanics.
+`internal/terrain/water.go` implements the PS2 VIZoneTree BSP tree parsed from ESF zone data. `ProbeLiquid()` returns VIWalkControl::Move's liquid bits for water/lava/slime/mud. "In" is probed at the sphere centre (feet + 1.2), "at surface" at the centre ±0.1, and mud at the feet. `WaterStateOf()` reduces them to the swim states, so water is only swum in once it is about 1.1 deep. Only mud slows a run (`VIWalkControl::Run`). A submerged body is damped by 0.02^dt. The swim clamp keeps the centre at the surface.
+
+**Rooms** (`esf.ZoneRoom` = sprite, palette, flags): flags bit 0 is OUTDOOR (81,172 of 81,773 Tunaria rooms). Portal culling runs only when the camera's zone-tree leaf room is indoor.
 
 ## Pathfinding / Navigation (5 strategies)
 
@@ -246,17 +248,21 @@ Procedural flora uses a hybrid approach: scatter on **render overlay triangles**
 
 ## Sky & Weather
 
-**Sky** (`internal/sky/sky.go`): SKY.ESF dome with dual-layer materials (base + cloud overlay at 3x UV tiling). Procedural star field (~200 golden spiral points). Sun/moon billboards with celestial elevation visibility. PS2-derived 24-hour tint table with weather-driven overcast darkening.
+**Sky** (`internal/sky/sky.go`): SKY.ESF dome with dual-layer materials (base + cloud overlay at 3x UV tiling). Procedural star field (~200 golden spiral points). Sun/moon billboards with celestial elevation visibility. PS2-derived 24-hour tint table with weather-driven overcast darkening. (The [A]-tier sky items in the audit note are not done.)
 
-**Weather** (`internal/game/weather.go`): 7 types (Clear, Rain, Snow, Sleet, Sandstorm, Lavastorm, Thunderstorm). 30-second crossfade transitions, wind effects, ground splash animations. Lightning flashes tied to thunderstorm.
+**Game clock**: one game day is 60 real minutes, `h = mod(ts2 + elapsed, 3.6e6)/3.6e6 × 24` (CLIENT `0x00BC7B70`).
 
-**Lightning** (`internal/game/lightning.go`): 16-segment jagged bolts with random perpendicular jitter, up to 3 branching sub-bolts. Charge decays at 5.0 units/sec, jitter regenerates on 70-350ms intervals.
+**Weather** (`internal/game/weather.go`): a VIAtmosphere port. WXTYPE 0 clear, 1–3 rain and 4–6 snow at intensities {0, .15, .5, 1, .15, .5, 1}. Opcode **0xC5 fades over 30 s, 0xC7 is instant** (the server's `ps2opcodes.go` comments were swapped too). Particles ray-test the ground, so rain stops at a roof; there is no indoor switch. The outdoors factor is the baked sun gate 15 below the camera.
+
+**Lightning** (`internal/game/lightning.go`): 16-segment jagged bolts, up to 3 branches. A spell bolt is held at charge 1 for its event's duration, then decays at 5/s.
+
+**Terrain lighting** (`internal/terrain/renderer.go`): VU1 VIRStrip2/3. lit = min(1, vtx.rgb + ambient(+emissive) + sun·max(0, −N·D)·vtx.a + lantern). Vertex alpha is a SUN GATE, never opacity. Overlay blend 4 is a multiply (`glBlendFunc(ZERO, SRC_ALPHA)`). Only the player's lantern lights terrain. Fog and the far plane come from the terrain profiles.
 
 ## Audio System
 
 | File | Purpose |
 |------|---------|
-| `audio.go` | Sound manager: 3D positional, distance attenuation, stereo panning, BGM streaming |
+| `audio.go` | Sound manager: 3D positional, distance attenuation, BGM streaming; pan is `CalcVolumeAndPan`'s, against the camera (−1 left … +1 right) |
 | `ambient.go` | AMBTRACK.ESF: XM→PCM at 22050Hz, 12 day + 8 night tracks, zone selection |
 | `bgm.go` | BGM zones from TUNARIA.ESF StreamAudioSprite placements |
 | `bgmstream.go` | VAG ADPCM streaming decoder (block-interleaved stereo, auto-detect interleave) |
@@ -266,7 +272,7 @@ Entity sounds triggered by animation keyframe crossings (`cmd/client/entitysound
 
 ## UI System
 
-**VIUI** (`internal/ui/viui.go`): PS2-faithful renderer loading 36 texture sheets from UI.ESF via hardcoded DictID→page mapping. 252-entry TexID lookup table (`internal/ui/table.go`, extracted from EE 0x004EDAF8). 9-slice frame rendering with 4 presets (Panel/Ornate/Thin/Line in `frames.go`). PS2 alpha (0-128) → GL (0-255) conversion at load time.
+**VIUI** (`internal/ui/viui.go`): PS2-faithful renderer loading 36 texture sheets from UI.ESF via hardcoded DictID→page mapping. 252-entry TexID lookup table (`internal/ui/table.go`, extracted from EE 0x004EDAF8). 9-slice frames in `frames.go`: Thin = `VIUIWindow::Draw`'s fp[0] (corner 36 at all four, mirrored on the right), Panel = fp[1] (left 47, right 52, fill 35), Line = fp[3]. Each piece carries flip flags. **Texture alpha is uploaded unchanged**: the palettes already hold 0..255, and the old ×2 made everything twice as opaque.
 
 **ESFont** (`cmd/client/esfont.go`): Bitmap font loaded from EQOA.ESF glyph metrics → texture atlas → Raylib GPU.
 
@@ -302,7 +308,7 @@ let `getTexture` and `getEquipmentTexture` shadow each other. See
 | `FaceTextures[9][8]` | 9 races × 4 faces × 2 sexes | CHARFACE.CSF + CHAR.ESF |
 
 ### Two-Pass Armor Rendering
-Pass 1: skin texture + alpha cutoff. Pass 2: armor texture + alpha blend + depth mask OFF. Needed because armor textures have transparent areas showing skin (arms, neckline).
+Pass 1: skin texture + alpha cutoff. Pass 2: armor texture, tinted, depth mask OFF, with the SAME alpha cutoff. On every CHAR.ESF body the armor layer is blend 0, which the PS2 alpha-tests at 128 and draws opaque. Needed because armor textures have transparent areas showing skin (arms, neckline).
 
 ### TSlotList (`0x2930`)
 Maps material indices to equipment slots. `count(int32) + count × { meshIndex, slotID, flag }`. Slots 0-4 = armor (chest/bracer/gloves/legs/boots), 5+ = hair/face/helm/robe.
@@ -315,13 +321,28 @@ Client-side cosmetic armor override (`cmd/client/transmog.go`), applied to the
 local player's `EquipmentState` in `render.go` before drawing. Purely local —
 nothing is sent to the server, and other players see the real equipment.
 
-UI: **F12 → Character → Appearance**. Picks any of the 10 armor sets, optionally
+UI: **F12 → Character → Appearance**. Picks any of the 11 armor sets, optionally
 forces a single tint, and hides an equipped robe (robes cover chest and legs, so
 without this the override looks like a no-op).
 
 **Set 9 `ArmorSetOrnatePlate`** is client-side only: it reuses the plate DictIDs
 but forces `texSrcCharESF`, surfacing the ornate gold-and-steel plate art that
 CHARCUST.CSF otherwise shadows. Retail can't display it.
+
+**Set 10 `ArmorSetTemplarPlate`** is also client-side only — silver plate with a
+blue tabard and gold shoulder medallions, adapted from CHAR.ESF model
+`0xD1300BD3`. Its DictIDs are unique to CHAR.ESF (nothing shadows them), and
+**four slots share one DictID**: the donor packs all its limb art into a single
+128×128 atlas laid out across the legs/boots/bracer/gloves UV tiles, the same
+tiles the player body samples. Chest has its own 128×128.
+
+The donor carries **no `CSpriteTSlotList`**, so it is invisible to
+`npctex -compat`/`-matrix` and never appeared in the 63-pair NPC survey. Slot
+assignment came from `npctex -fit`, which matches an untagged donor's materials
+to the player body's per-slot UV footprints — see
+`claude-notes/npc-armor-texture-survey.md`. An armor set is only the five
+`$Armor` text slots, so the donor's face and hair are deliberately not carried
+and the wearer keeps their own head.
 
 #### Per-slot NPC art (`NPCArmorTextures`)
 
@@ -348,15 +369,17 @@ Two invariants (regression-tested in `npcarmor_test.go` / `transmog_test.go`):
 ## Animation System
 
 ### SpriteAnimController (`animcontroller.go`)
-Dual-pair model matching PS2 `VICSprite::SetAnimation` (0x00422D78):
-- **Pair 0**: Locomotion (idle, walk, run, swim)
-- **Pair 1**: Action (attack, hit reaction, death, emotes)
+Two-layer model matching PS2 `VICSprite::SetAnimation` (0x00422D78):
+- **Layer 0 (`LayerUpper`)**: the upper body; also the whole body of a non-humanoid
+- **Layer 1 (`LayerLower`)**: the lower body (humanoids only)
 
 **Priority gating**: Playing animations always interruptible. Only stopped/finished play-once animations protected by priority. Idle can never replace a stopped anim. Same-animID rejected.
 
 **PlayOnce**: Attack anims hold last frame; locomotion loops. `applySkeletal` clamps play-once anims and notifies controller via `MarkActionFinished()`.
 
-**Both `SetLocomotion` AND `SetAction` drive BOTH pairs** (PS2 dual-call). `SetLocomotion(walk)` sets pair0=pair1=walk so the upper body also animates the walk when no action is active; `SetAction(attack)` sets both to the attack (full-body swing). Because of this, `ClearAction` must only reclaim pair0 when it was set by an **action** anim (`!isLocomotionAnim`) — otherwise clearing the action wipes the locomotion pair too, and `Resolve()` returns idle: the character plays idle while moving ("walk shows idle / sliding"). This is per-frame (resolveCombat calls ClearAction every frame), so the bug is universal across humanoids, not race/class-specific. `SetLocomotion` runs before `resolveCombat` each frame, so a finished action is reclaimed by the priority system regardless. Regression-guarded by `internal/models/walk_repro_test.go`.
+**The two layers are body HALVES**: `LayerUpper` (0) and `LayerLower` (1). `Resolve()` returns (upper, lower). A humanoid's `SetLocomotion` and `SetAction` set both layers, and the priority tables decide each layer. Walking plus an attack leaves the upper body swinging and the legs walking. A creature uses layer 0 alone. Death forces slot 14 and the special idle is slot 15 for every skeleton. `ClearAction` empties only non-locomotion layers. Regression-guarded by `internal/models/walk_repro_test.go`.
+
+**Action handles**: `SetAction` returns VICSprite's `m_actionSeq`, and `IsActionComplete(handle)` is true once anything later took layer 0 (a rejected action is complete at once) or the play stopped. Spell `Wait 0` waits on that handle, and `SetAction`/`PlayAttack` arm the "Spell FX 1-4" triggers for `Wait 3`.
 
 **Debugging animation "wrong-anim" bugs — rule out the model first**: dump the model's CPlayList slot→raw mapping straight from the ISO (`esf.OpenISOFile(iso,"CHAR.ESF").FindObject(modelID).(*esf.CSprite)`, then match `PlayList[].AnimDictID[]` against `Animations[].DictID`, mirroring `mesh.go`). If slot 1 (walk) maps to distinct valid raw indices, the model is fine and the bug is in the controller/resolve pipeline, not the model. The client also logs this at load: `Humanoid 0x%08X: N anims, M PL slots: [...]`.
 
@@ -445,6 +468,19 @@ ISO Prompt → Title Screen → Login → Character Select → [Create/Delete] �
 
 `cmd/client/charsave.go`: Per-character JSON state files mirror PS2 memory card saves. Stores position/facing/zone, identity, appearance, equipment. Used to preserve 3D model in character select.
 
+## Offline Mode
+
+`./client --offline` enters the world with no server: no auth, patch, update check or presence, and no save written. It is how rendering and client-side systems are checked without a session.
+
+```bash
+xvfb-run -a ./client --offline --iso "$ISO" [--char NAME] [--pos X,Y,Z] [--facing DEG] \
+    [--hour H[,H...]] [--world N] [--weather WXTYPE] [--npc 0xMODEL[:dead]]... [--npc-dist D] \
+    [--spell 0xEFFECT] [--cam DIST,PITCHDEG,ANGLEDEG] [--size WxH] \
+    [--shot out.png [--shot-wait S] [--shot-frames N]]
+```
+
+`--shot` captures once the world has streamed in, one file per `--hour`. Repeating an hour (`--hour 12,12,12`) takes a sequence `--shot-frames` apart. `--spell` plays an effect from the player at the first NPC. Under Xvfb the client runs at about 5 fps, and physics runs during the loading screen.
+
 ## Gamepad Support
 
 `cmd/client/gamepad.go`: PS2 DualShock 2 mapping → Raylib gamepad. Left stick = movement, right stick = camera orbit/zoom/swim, D-pad = targeting, cross/circle/square/triangle = actions. Auto-shows spell bar on first gamepad frame.
@@ -467,6 +503,10 @@ Auth → patch → server list → world entry. Handshake completes on Guarantee
 
 ### State Channels
 ACK all valid channels (0x00-0xF7). Dirty count 3 for UDP loss resilience. Cap 40 ACKs per packet. XOR delta with 32-entry base history per channel.
+
+**Outgoing RLE** is `run_length_encode` exactly: the short form holds at most 7 literals (8+ sets bit 7, the long-form flag), and zero runs stop at 255.
+
+**Guaranteed-ack mask**: bit 0 = rx+2, unsigned LEB128 (`connection_get_ack_mask`), pinned to a PS2 capture. Body flag **0x04 is never sent**: the PS2 writes an always-zero field there, and no PS2 capture sets it.
 
 ### Reliability
 - Per-message retransmit with RTO (16-sample RTT buffer, 60s kill)
@@ -534,7 +574,7 @@ Byte 0 = update counter, bytes 1-4 = ObjectID (0 = removed). NameColor byte 142:
 
 - Helm scale adjustment (proportional to character height)
 - Ogre face textures (race 9 not in FaceTextures table)
-- Tint color application (VICSpriteCust::$Tints — 14 RGBA colors)
+- Tint color application (VICSpriteCust::Tints — 15 RGBA colors, [14] yellow)
 - Overlay back-face lighting fix
 - `VIWalkControl::UpdatePhysics` — gravity, jumping
 - `VICollSphere` — swept sphere collision

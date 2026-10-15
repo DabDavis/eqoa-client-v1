@@ -646,9 +646,10 @@ func (c *Client) handleInWorldInput() {
 		zt = c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
 	}
 
-	// PS2 VIWalkControl::Move -- 3-probe water detection via ZoneTree BSP.
+	// PS2 VIWalkControl::Move -- the liquid bits, probed at the sphere centre.
 	if zt != nil {
-		c.waterState = zt.ProbeWater(p.X, p.Y, p.Z, charHeight)
+		c.liquidFlags = zt.ProbeLiquid(p.X, p.Y, p.Z)
+		c.waterState = terrain.WaterStateOf(c.liquidFlags)
 	}
 
 	// Track safe position for void-fall recovery.
@@ -713,20 +714,23 @@ func (c *Client) handleInWorldInput() {
 			c.targetFacing = float32(math.Atan2(float64(moveX), float64(moveZ)))
 		}
 
-		// Apply movement using ramped speed.
-		// PS2 Run() in liquid: caps to walkSpeed.
+		// Apply movement using ramped speed. VIWalkControl::Run walks only in
+		// mud: in a liquid when it is mud, out of one when the feet are in mud.
 		speed := c.currentSpeed
-		if c.waterState != terrain.WaterNone && speed > walkSpeedCap {
+		if c.inMud() && speed > walkSpeedCap {
 			speed = walkSpeedCap
 		}
 		oldX, oldZ := p.X, p.Z
 		p.X += moveX * speed * dt
 		p.Z += moveZ * speed * dt
 
-		// PS2 VIWalkControl::CalcFit -- iterative collide-and-slide (Skitter).
+		// PS2 VIWalkControl::Move's sphere sweep -- collide and skitter.
 		if zt != nil && !c.gmNoClip {
-			fit := zt.CalcFit(oldX, p.Y, oldZ, p.X, p.Z)
+			fit := zt.CalcFit(oldX, p.Y, oldZ, p.X, p.Z, c.onGround, c.liquidFlags&terrain.LiquidIn != 0)
 			p.X, p.Z = fit.X, fit.Z
+			if fit.PushedOut {
+				c.currentSpeed = 0 // Move zeroes horizontal force and velocity
+			}
 		}
 
 		// PS2 VIWalkControl::CalcFloor — ground snap for horizontal movement.
@@ -784,7 +788,7 @@ func (c *Client) handleInWorldInput() {
 		} else {
 			// Still decelerating — continue moving in last direction.
 			speed := c.currentSpeed
-			if c.waterState != terrain.WaterNone && speed > walkSpeedCap {
+			if c.inMud() && speed > walkSpeedCap {
 				speed = walkSpeedCap
 			}
 			oldX, oldZ := p.X, p.Z
@@ -792,8 +796,11 @@ func (c *Client) handleInWorldInput() {
 			p.Z += c.lastMoveZ * speed * dt
 
 			if zt != nil && !c.gmNoClip {
-				fit := zt.CalcFit(oldX, p.Y, oldZ, p.X, p.Z)
+				fit := zt.CalcFit(oldX, p.Y, oldZ, p.X, p.Z, c.onGround, c.liquidFlags&terrain.LiquidIn != 0)
 				p.X, p.Z = fit.X, fit.Z
+				if fit.PushedOut {
+					c.currentSpeed = 0
+				}
 			}
 			if zt != nil && c.onGround && !c.gmNoClip {
 				oldY := p.Y
@@ -985,19 +992,22 @@ func (c *Client) handleInWorldInput() {
 			if c.swimVelY == 0 {
 				c.velocityY = 0
 			}
-		} else {
-			// Submerged: $WGravity = (0, -1.0, 0) — slow downward pull.
-			if c.swimVelY == 0 {
-				c.velocityY += -waterGravity * dt
-			}
+		} else if c.swimVelY == 0 {
+			// Submerged: $WGravity = (0, -1.0, 0), and UpdatePhysics damps a
+			// body in liquid by m_swimDamping^dt (0.02 a second) — which is
+			// what stops a plunge. Without it a fall carried on to the bottom.
+			damp := float32(math.Pow(0.02, float64(dt)))
+			c.velocityY = (c.velocityY - waterGravity*dt) * damp
 		}
 
 		// Step 3: Integrate position.
 		p.Y += c.velocityY * dt
 
-		// Step 4: Surface clamp — don't rise above water surface.
-		if surfY, ok := zt.FindWaterSurfaceY(p.X, p.Y, p.Z, charHeight); ok {
-			maxY := surfY - 0.7
+		// Step 4: Surface clamp — the centre (feet + 1.2) no higher than the
+		// surface, inside the ±0.1 band Move calls "at the surface"; any
+		// higher and the probe would see dry land and drop the swimmer.
+		if surfY, ok := zt.FindLiquidSurfaceY(p.X, p.Y, p.Z, charHeight); ok {
+			maxY := surfY - 1.2
 			if p.Y > maxY {
 				p.Y = maxY
 				if c.velocityY > 0 {
@@ -1232,4 +1242,13 @@ func navPointInTri(px, pz, ax, az, bx, bz, cx, cz float32) bool {
 	hasNeg := d1 < 0 || d2 < 0 || d3 < 0
 	hasPos := d1 > 0 || d2 > 0 || d3 > 0
 	return !(hasNeg && hasPos)
+}
+
+// inMud is VIWalkControl::Run's walk-speed test: in a liquid, IN_MUD; out of
+// one, mud at the feet.
+func (c *Client) inMud() bool {
+	if c.liquidFlags&terrain.LiquidAny != 0 {
+		return c.liquidFlags&terrain.LiquidMud != 0
+	}
+	return c.liquidFlags&terrain.LiquidFeetInMud != 0
 }

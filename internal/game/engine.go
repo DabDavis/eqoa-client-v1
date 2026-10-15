@@ -52,13 +52,13 @@ type Engine struct {
 	facingResolver FacingResolver // set by visual client for entity facing angle
 
 	// PlayAttack callback (set by visual client for spell effect animation triggers)
-	playAttackCB func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32)
+	playAttackCB func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32) int
 
 	// SetAction callback (set by visual client for cast/action animation triggers)
-	setActionCB func(actorObjID uint32, actionType int32)
+	setActionCB func(actorObjID uint32, actionType int32) int
 
 	// IsActionComplete callback (set by visual client for Wait sub-type 0)
-	isActionCompleteCB func(actorObjID uint32) bool
+	isActionCompleteCB func(actorObjID uint32, handle int) bool
 
 	// Trigger callbacks for spell FX HasTripped (Wait sub-type 3)
 	findTriggerCB  func(actorObjID uint32, triggerName string) (int, bool)
@@ -103,6 +103,11 @@ type Engine struct {
 	PosOverrideX     float32
 	PosOverrideY     float32
 	PosOverrideZ     float32
+
+	// Offline puts the engine straight into PhaseInWorld on its first Tick,
+	// without auth, patch or a connection (the visual client's --offline mode).
+	// Everything that sends is already skipped when Conn is nil.
+	Offline bool
 }
 
 // NewEngine creates a new Engine with the given connection parameters.
@@ -150,20 +155,22 @@ func (e *Engine) SetFacingResolver(resolve FacingResolver) {
 }
 
 // SetPlayAttackCallback sets a callback for PlayAttack spell events (type 15).
-// Called with (actorObjID, animPairIndex) when a spell effect triggers an attack animation.
-func (e *Engine) SetPlayAttackCallback(cb func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32)) {
+// Called with (actorObjID, animPairIndex) when a spell effect triggers an attack
+// animation; it returns the action handle (SetAttackAction's), or -1.
+func (e *Engine) SetPlayAttackCallback(cb func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32) int) {
 	e.playAttackCB = cb
 }
 
 // SetSetActionCallback sets a callback for SetAction spell events (type 2).
-// Called with (actorObjID, actionType) when a spell effect triggers a cast/action animation.
-func (e *Engine) SetSetActionCallback(cb func(actorObjID uint32, actionType int32)) {
+// Called with (actorObjID, actionType) when a spell effect triggers a
+// cast/action animation; it returns the action handle (SetAction's), or -1.
+func (e *Engine) SetSetActionCallback(cb func(actorObjID uint32, actionType int32) int) {
 	e.setActionCB = cb
 }
 
-// SetIsActionCompleteCallback sets a callback for Wait sub-type 0.
-// PS2 checks VICSprite::IsActionComplete — returns true when play-once action finishes.
-func (e *Engine) SetIsActionCompleteCallback(cb func(actorObjID uint32) bool) {
+// SetIsActionCompleteCallback sets a callback for Wait sub-type 0:
+// VICSprite::IsActionComplete(handle) on the actor.
+func (e *Engine) SetIsActionCompleteCallback(cb func(actorObjID uint32, handle int) bool) {
 	e.isActionCompleteCB = cb
 }
 
@@ -231,6 +238,11 @@ func (e *Engine) Tick() {
 				}
 				e.State.SpellFXSys = e.SpellFX
 			}
+		}
+		if e.Offline {
+			e.State.Phase = PhaseInWorld
+			e.State.StatusMsg = "Offline"
+			return
 		}
 		// Kick off startup I/O off-thread. The blocking auth/patch/connect runs
 		// in a goroutine, but its results are applied to GameState on the main
@@ -332,6 +344,8 @@ func (e *Engine) Tick() {
 				}
 			}
 		}
+	} else if e.Offline && e.State.Phase == PhaseInWorld && e.SpellFX != nil {
+		e.SpellFX.Process()
 	}
 
 	if e.State.Conn != nil && time.Since(e.lastFlush) > 100*time.Millisecond {

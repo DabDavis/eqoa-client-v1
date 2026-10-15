@@ -59,9 +59,9 @@ const (
 	nhAnimAttack2      = 23 // CL slot 23: Attack2 (same slot as humanoid)
 	nhAnimHitStun      = 34 // CL slot 34: HitReaction (universal across all SkelTypes)
 	nhAnimCastSpell    = 37 // CL slot 37: SpellCast (universal across all SkelTypes)
-	nhAnimDeath        = 15 // CL slot 15: Death
-	nhAnimBattleStance = 17 // CL slot 17: BattleStance/Special (slot 16 doesn't exist)
-	nhAnimSpecialIdle  = 17 // CL slot 17: Special
+	nhAnimDeath        = 14 // CL slot 14: death, for every skeleton (SetAnimation's m_dead)
+	nhAnimBattleStance = 17 // CL slot 17: combat idle (slot 16 doesn't exist)
+	nhAnimSpecialIdle  = 15 // CL slot 15: special idle, for every skeleton
 )
 
 // deriveLocomotion implements PS2 VIWalkControl::UpdateLocomotion (0x00487178)
@@ -810,29 +810,19 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		return animLanding, 0 // landing is full body, no split
 	}
 
-	// Resolve final animations from controller.
-	locoID, actionID := ctrl.Resolve()
-	locoAnim = byte(locoID)
+	return layerAnims(ctrl)
+}
 
-	// If action is active and differs from loco, decide split vs full-body.
-	isMoving := locoAnim == animWalk || locoAnim == animRun || locoAnim == animSwim || locoAnim == animStrafe
-	if actionID >= 0 {
-		actByte := byte(actionID)
-		if actByte != locoAnim {
-			// Death is always full-body.
-			if actByte == animDeath {
-				return actByte, 0
-			}
-			if isMoving {
-				actionAnim = actByte // split: upper=action, lower=locomotion
-			} else {
-				locoAnim = actByte // idle: action controls full body
-			}
-		} else {
-			locoAnim = actByte
-		}
+// layerAnims maps the controller's two layers onto the renderer's arguments:
+// the lower body plays layer 1's animation (locoAnim), and when layer 0 plays
+// something else the upper body plays that (actionAnim); otherwise the whole
+// body plays the one animation.
+func layerAnims(ctrl *models.SpriteAnimController) (locoAnim, actionAnim byte) {
+	upper, lower := ctrl.Resolve()
+	locoAnim = byte(lower)
+	if upper != lower {
+		actionAnim = byte(upper)
 	}
-
 	return locoAnim, actionAnim
 }
 
@@ -935,28 +925,7 @@ func (am *AnimationManager) ResolveEntityAnim(ent *game.Entity, now time.Time) (
 		dbgLabel:           ent.Name,
 	})
 
-	// Resolve final animations from controller.
-	locoID, actionID := ctrl.Resolve()
-	locoAnim = byte(locoID)
-
-	isMoving := locoAnim == animWalk || locoAnim == animRun || locoAnim == animSwim || locoAnim == animStrafe
-	if actionID >= 0 {
-		actByte := byte(actionID)
-		if actByte != locoAnim {
-			if actByte == animDeath || actByte == nhAnimDeath {
-				return actByte, 0
-			}
-			if isMoving {
-				actionAnim = actByte
-			} else {
-				locoAnim = actByte
-			}
-		} else {
-			locoAnim = actByte
-		}
-	}
-
-	return locoAnim, actionAnim
+	return layerAnims(ctrl)
 }
 
 // animDur returns the animation duration for a model, with 800ms fallback.

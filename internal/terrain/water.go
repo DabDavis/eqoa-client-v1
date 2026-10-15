@@ -185,40 +185,97 @@ func (zt *ZoneTerrain) FindWaterSurfaceY(x, footY, z, charHeight float32) (float
 	return lo, true
 }
 
-// ProbeWater performs the PS2 3-probe water detection.
-// PS2 VIWalkControl::Move probes at center, +offset, and -offset to determine
-// whether the player is under, at surface, or above water.
-//
-// probeY is the player's foot Y. charHeight is the character height.
-func (zt *ZoneTerrain) ProbeWater(x, footY, z, charHeight float32) WaterState {
+// The liquid bits of VIWalkPhysics, as VIWalkControl::Move sets them each
+// tick. "In" is the liquid at the sphere centre, feet + 1.2; "at" is its
+// surface within 0.1 of the centre (liquid below the centre, none above);
+// FeetInMud is mud at the feet.
+const (
+	LiquidInWater   uint32 = 0x0004
+	LiquidAtWater   uint32 = 0x0008
+	LiquidInLava    uint32 = 0x0010
+	LiquidAtLava    uint32 = 0x0020
+	LiquidInSlime   uint32 = 0x0040
+	LiquidAtSlime   uint32 = 0x0080
+	LiquidInMud     uint32 = 0x0800
+	LiquidAtMud     uint32 = 0x1000
+	LiquidFeetInMud uint32 = 0x2000
+
+	LiquidIn      = LiquidInWater | LiquidInLava | LiquidInSlime | LiquidInMud // 0x854
+	LiquidAt      = LiquidAtWater | LiquidAtLava | LiquidAtSlime | LiquidAtMud // 0x10A8
+	LiquidAny     = LiquidIn | LiquidAt                                        // IN_LIQUID
+	LiquidMud     = LiquidInMud | LiquidAtMud                                  // IN_MUD
+	envLiquidMask = EnvFlagWater | EnvFlagSlime | EnvFlagLava | EnvFlagMud
+)
+
+// ProbeLiquid is the environment half of VIWalkControl::Move: the liquid bits
+// for a walker whose feet are at footY.
+func (zt *ZoneTerrain) ProbeLiquid(x, footY, z float32) uint32 {
 	if zt.Tree == nil {
-		return WaterNone
+		return 0
 	}
-
-	// PS2 probes: center of body, top of head, feet
-	centerY := footY + charHeight*0.5
-	topY := footY + charHeight
-	bottomY := footY + 0.1
-
-	centerFlags := zt.Tree.GetEnvFlags(x, centerY, z)
-	topFlags := zt.Tree.GetEnvFlags(x, topY, z)
-	bottomFlags := zt.Tree.GetEnvFlags(x, bottomY, z)
-
-	centerWater := centerFlags&EnvFlagWater != 0
-	topWater := topFlags&EnvFlagWater != 0
-	bottomWater := bottomFlags&EnvFlagWater != 0
-
-	if centerWater && topWater {
-		return WaterUnder // fully submerged
+	c := footY + charCollY
+	env := zt.Tree.GetEnvFlags(x, c, z)
+	up := zt.Tree.GetEnvFlags(x, c+0.1, z)
+	dn := zt.Tree.GetEnvFlags(x, c-0.1, z)
+	var f uint32
+	for _, l := range [4]struct{ env, in, at uint32 }{
+		{EnvFlagWater, LiquidInWater, LiquidAtWater},
+		{EnvFlagLava, LiquidInLava, LiquidAtLava},
+		{EnvFlagSlime, LiquidInSlime, LiquidAtSlime},
+		{EnvFlagMud, LiquidInMud, LiquidAtMud},
+	} {
+		if env&l.env != 0 {
+			f |= l.in
+		}
+		if up&l.env == 0 && dn&l.env != 0 {
+			f |= l.at
+		}
 	}
-	if centerWater || bottomWater {
-		// Center or feet in water, but head above — at surface
+	if zt.Tree.GetEnvFlags(x, footY, z)&EnvFlagMud != 0 {
+		f |= LiquidFeetInMud
+	}
+	return f
+}
+
+// WaterStateOf reduces the liquid bits to the client's swim states: none,
+// at the surface of a liquid (IsAtLiquidSurface), or under one
+// (IsUnderLiquid). Any of the four liquids counts, as in UpdatePhysics.
+func WaterStateOf(f uint32) WaterState {
+	switch {
+	case f&LiquidAt != 0:
 		return WaterSurface
+	case f&LiquidIn != 0:
+		return WaterUnder
 	}
-	if topWater && !centerWater {
-		// Head in water zone but center isn't — edge case, treat as surface
-		return WaterSurface
-	}
-
 	return WaterNone
+}
+
+// ProbeWater is ProbeLiquid reduced to a swim state. The water is only
+// swum in once it reaches the walker's centre, 1.2 above the feet — the old
+// probe at the feet put the player into swimming in ankle-deep water.
+func (zt *ZoneTerrain) ProbeWater(x, footY, z float32) WaterState {
+	return WaterStateOf(zt.ProbeLiquid(x, footY, z))
+}
+
+// FindLiquidSurfaceY is FindWaterSurfaceY for any of the four liquids.
+func (zt *ZoneTerrain) FindLiquidSurfaceY(x, footY, z, height float32) (float32, bool) {
+	if zt.Tree == nil {
+		return 0, false
+	}
+	lo, hi := footY, footY+height
+	if zt.Tree.GetEnvFlags(x, lo, z)&envLiquidMask == 0 {
+		return 0, false
+	}
+	if zt.Tree.GetEnvFlags(x, hi, z)&envLiquidMask != 0 {
+		return hi, true
+	}
+	for i := 0; i < 12; i++ {
+		mid := (lo + hi) * 0.5
+		if zt.Tree.GetEnvFlags(x, mid, z)&envLiquidMask != 0 {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return lo, true
 }

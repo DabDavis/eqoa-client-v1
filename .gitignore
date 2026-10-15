@@ -2,3 +2,7 @@ client-dev
 
 # Deploy secrets — update-server credentials, never commit.
 scripts/.deploy-secrets
+
+# Local login config (holds the dev account password) and a one-off race build.
+client.json
+headless-race

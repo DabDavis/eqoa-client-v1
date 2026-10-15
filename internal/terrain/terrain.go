@@ -24,6 +24,8 @@ type TileKey struct {
 }
 
 // Triangle holds three 3D vertices with position, UV, normal, and color+alpha.
+// Its colour is the PS2's per-vertex light input, not a tint: RGB is light
+// added to the ambient and sun, and alpha gates the sun (a shadow term).
 type Triangle struct {
 	X0, Y0, Z0, U0, V0, NX0, NY0, NZ0, R0, G0, B0, A0 float32
 	X1, Y1, Z1, U1, V1, NX1, NY1, NZ1, R1, G1, B1, A1 float32
@@ -31,6 +33,9 @@ type Triangle struct {
 	TexID                                                int32
 	Layer                                                int32   // 0 = base, 1+ = overlay
 	URate, VRate                                         float32 // UV scroll (per-material, not per-texture)
+	Blend                                                int32   // material layer blend mode (0 opaque .. 4 multiply)
+	LayerColor                                           [4]byte // material layer colour
+	Emissive                                             [4]byte // material emissive colour (added to the ambient)
 }
 
 // Tile holds all triangles that fall within a tile grid cell.
@@ -80,7 +85,7 @@ type Loader struct {
 	file      *esf.ObjFile
 	proxies   *esf.WorldZoneProxies
 	worldTree *esf.WorldTree      // PS2 spatial quadtree for O(log N) zone lookup
-	Regions   *esf.WorldRegions   // biome region IDs per zone proxy (for ambient sounds)
+	World     *esf.WorldBase      // header + terrain-profile grid (ProfileBlend)
 	zones     []*esf.ObjInfo
 
 	mu            sync.Mutex
@@ -136,19 +141,20 @@ func NewLoaderFromFile(file *esf.ObjFile) (*Loader, error) {
 	proxies := proxiesObj.(*esf.WorldZoneProxies)
 	log.Printf("terrain: loaded %d zone proxies", len(proxies.Zones))
 
-	// Load WorldTree and WorldRegions for spatial lookup and ambient sounds.
+	// Load WorldTree and the terrain-profile grid.
 	var worldTree *esf.WorldTree
-	var worldRegions *esf.WorldRegions
+	var worldData *esf.WorldBase
 	wbObj, err := file.GetObject(worldBase)
 	if err == nil && wbObj != nil {
 		wb := wbObj.(*esf.WorldBase)
+		worldData = wb
 		if wb.Tree != nil {
 			worldTree = wb.Tree
 			log.Printf("terrain: loaded world tree (%d nodes, %d leaf zones)", len(worldTree.Nodes), len(worldTree.LeafZones))
 		}
-		if wb.Regions != nil {
-			worldRegions = wb.Regions
-			log.Printf("terrain: loaded world regions (%d entries)", len(worldRegions.RegionIDs))
+		if wb.Regions != nil && wb.Header != nil {
+			log.Printf("terrain: loaded terrain-profile grid (%dx%d cells, subdiv %d, %d entries)",
+				wb.Header.NumRows, wb.Header.NumCols, wb.Header.Subdiv, len(wb.Regions.Profiles))
 		}
 	}
 
@@ -164,7 +170,7 @@ func NewLoaderFromFile(file *esf.ObjFile) (*Loader, error) {
 		file:      file,
 		proxies:   proxies,
 		worldTree: worldTree,
-		Regions:   worldRegions,
+		World:     worldData,
 		zones:     zones,
 	}, nil
 }
@@ -711,6 +717,7 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 				noMatPalCount++
 			}
 			bakedOff := 0 // tracks vertex offset into sp.BakedColors across vertex lists
+			pbType := pb.Type // the loop below shadows pb with a vertex
 		if len(sp.BakedColors) > 0 {
 			bakedLitCount++
 		}
@@ -730,8 +737,10 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 					VRate     float32
 				}
 				var layers []layerInfo
+				var emissive [4]byte
 				if pb.MatPal != nil && vl.Material < len(pb.MatPal.Materials) {
 					mat := pb.MatPal.Materials[vl.Material]
+					emissive = mat.EmissiveCol
 					for li, layer := range mat.Layers {
 						totalLayers++
 						if layer.Surface == nil {
@@ -768,7 +777,7 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 					}
 				}
 				if len(layers) == 0 {
-					layers = []layerInfo{{TexID: 0}}
+					layers = []layerInfo{{TexID: 0, Color: [4]byte{255, 255, 255, 255}}}
 				}
 				if len(layers) > 1 {
 					multiLayerCount++
@@ -792,11 +801,14 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 					sp.Transform(&pb)
 					sp.Transform(&pc)
 
-					ar, ag, ab := ensureColor(a.R, a.G, a.B)
-					br, bg, bb := ensureColor(b.R, b.G, b.B)
-					cr, cg, cb := ensureColor(c.R, c.G, c.B)
+					// The PS2's light inputs per vertex (VU1 VIRStrip2/3): RGB is
+					// light ADDED to the ambient and sun, alpha gates the sun.
+					ar, ag, ab, aa := a.R, a.G, a.B, a.A
+					br, bg, bb, ba := b.R, b.G, b.B, b.A
+					cr, cg, cb, ca := c.R, c.G, c.B, c.A
 
-					// Apply baked static lighting (per-vertex RGBA from ColorBuffer).
+					// A ColorBuffer (baked static lighting) REPLACES the vertex
+					// colours: VIColorBuffer::Color writes over the stream.
 					if len(sp.BakedColors) > 0 {
 						var ai, bi, ci int
 						if i%2 == 0 {
@@ -806,18 +818,29 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 						}
 						if ci < len(sp.BakedColors) {
 							bc := sp.BakedColors[ai]
-							ar *= float32(bc.R) / 255
-							ag *= float32(bc.G) / 255
-							ab *= float32(bc.B) / 255
+							ar, ag, ab, aa = float32(bc.R)/255, float32(bc.G)/255, float32(bc.B)/255, float32(bc.A)/255
 							bc = sp.BakedColors[bi]
-							br *= float32(bc.R) / 255
-							bg *= float32(bc.G) / 255
-							bb *= float32(bc.B) / 255
+							br, bg, bb, ba = float32(bc.R)/255, float32(bc.G)/255, float32(bc.B)/255, float32(bc.A)/255
 							bc = sp.BakedColors[ci]
-							cr *= float32(bc.R) / 255
-							cg *= float32(bc.G) / 255
-							cb *= float32(bc.B) / 255
+							cr, cg, cb, ca = float32(bc.R)/255, float32(bc.G)/255, float32(bc.B)/255, float32(bc.A)/255
 						}
+					}
+					switch pbType {
+					case 2:
+						// PackVUNC (VIRStrip2) adds the actor's static-lighting
+						// colour (VIActor::m_p70, the zone actor record's colour;
+						// rooms use (0,0,0,1)) and scales the sun by its alpha.
+						sr := float32(sp.Color[0]) / 255
+						sg := float32(sp.Color[1]) / 255
+						sb := float32(sp.Color[2]) / 255
+						sa := float32(sp.Color[3]) / 255
+						ar, ag, ab, aa = ar+sr, ag+sg, ab+sb, aa*sa
+						br, bg, bb, ba = br+sr, bg+sg, bb+sb, ba*sa
+						cr, cg, cb, ca = cr+sr, cg+sg, cb+sb, ca*sa
+					case 0:
+						// VUNC (VIRStrip) does not gate the sun: its vertex
+						// alpha is the output alpha instead.
+						aa, ba, ca = 1, 1, 1
 					}
 
 					for li, layer := range layers {
@@ -837,13 +860,16 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 						v2 := c.U*m[1] + c.V*m[4] + m[7]
 
 						tri := Triangle{
-							X0: pa.X, Y0: pa.Y, Z0: pa.Z, U0: u0, V0: v0, NX0: a.NX, NY0: a.NY, NZ0: a.NZ, R0: ar, G0: ag, B0: ab, A0: a.A,
-							X1: pb.X, Y1: pb.Y, Z1: pb.Z, U1: u1, V1: v1, NX1: b.NX, NY1: b.NY, NZ1: b.NZ, R1: br, G1: bg, B1: bb, A1: b.A,
-							X2: pc.X, Y2: pc.Y, Z2: pc.Z, U2: u2, V2: v2, NX2: c.NX, NY2: c.NY, NZ2: c.NZ, R2: cr, G2: cg, B2: cb, A2: c.A,
-							TexID: layer.TexID,
-							Layer: int32(li),
-							URate: layer.URate,
-							VRate: layer.VRate,
+							X0: pa.X, Y0: pa.Y, Z0: pa.Z, U0: u0, V0: v0, NX0: a.NX, NY0: a.NY, NZ0: a.NZ, R0: ar, G0: ag, B0: ab, A0: aa,
+							X1: pb.X, Y1: pb.Y, Z1: pb.Z, U1: u1, V1: v1, NX1: b.NX, NY1: b.NY, NZ1: b.NZ, R1: br, G1: bg, B1: bb, A1: ba,
+							X2: pc.X, Y2: pc.Y, Z2: pc.Z, U2: u2, V2: v2, NX2: c.NX, NY2: c.NY, NZ2: c.NZ, R2: cr, G2: cg, B2: cb, A2: ca,
+							TexID:      layer.TexID,
+							Layer:      int32(li),
+							URate:      layer.URate,
+							VRate:      layer.VRate,
+							Blend:      layer.BlendMode,
+							LayerColor: layer.Color,
+							Emissive:   emissive,
 						}
 
 						if isDegenerate(tri) {
@@ -1047,15 +1073,6 @@ func addTriToZone(zt *ZoneTerrain, tri Triangle) {
 	if key.TZ > zt.MaxTZ {
 		zt.MaxTZ = key.TZ
 	}
-}
-
-// ensureColor returns the vertex colors as-is unless all are zero, in which
-// case it returns white (1,1,1) so untinted textures remain visible.
-func ensureColor(r, g, b float32) (float32, float32, float32) {
-	if r == 0 && g == 0 && b == 0 {
-		return 1, 1, 1
-	}
-	return r, g, b
 }
 
 func isDegenerate(t Triangle) bool {

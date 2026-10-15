@@ -1,7 +1,6 @@
 package sky
 
 import (
-	"image"
 	"log"
 	"math"
 	"runtime"
@@ -110,7 +109,7 @@ func NewSkyFromFile(file *esf.ObjFile) *Sky {
 	}
 
 	s := &Sky{
-		scale:    5.0, // dome ~339 units → ~1700 radius
+		scale:    1.0, // the PS2 draws the dome (~339 units) unscaled at the camera (RenderSky)
 		texCache: make(map[int32]rl.Texture2D),
 	}
 
@@ -776,8 +775,7 @@ func (s *Sky) Cleanup() {
 // uploadSurfaceDirect uploads a surface texture to GPU unconditionally (no cache).
 // Used for billboard textures that may share DictID with dome surfaces.
 func (s *Sky) uploadSurfaceDirect(surf *esf.Surface, label string) rl.Texture2D {
-	img := scalePS2Alpha(surf.Image)
-	rlImg := rl.NewImageFromImage(img)
+	rlImg := rl.NewImageFromImage(surf.Image)
 	tex := rl.LoadTextureFromImage(rlImg)
 	rl.UnloadImage(rlImg)
 	rl.GenTextureMipmaps(&tex)
@@ -797,8 +795,7 @@ func (s *Sky) uploadSurface(surf *esf.Surface) {
 	if _, ok := s.texCache[texID]; ok {
 		return
 	}
-	img := scalePS2Alpha(surf.Image)
-	rlImg := rl.NewImageFromImage(img)
+	rlImg := rl.NewImageFromImage(surf.Image)
 	tex := rl.LoadTextureFromImage(rlImg)
 	rl.UnloadImage(rlImg)
 	rl.GenTextureMipmaps(&tex)
@@ -1007,19 +1004,3 @@ func resolveOverlay(mp *esf.MaterialPalette, matIdx int) (*esf.Surface, float32)
 	return layer1.Surface, scale
 }
 
-// scalePS2Alpha scales PS2 alpha values (0-128 = transparent-opaque) to
-// OpenGL range (0-255).
-func scalePS2Alpha(img *image.NRGBA) *image.NRGBA {
-	bounds := img.Bounds()
-	out := image.NewNRGBA(bounds)
-	copy(out.Pix, img.Pix)
-	for i := 3; i < len(out.Pix); i += 4 {
-		a := int(out.Pix[i])
-		a *= 2
-		if a > 255 {
-			a = 255
-		}
-		out.Pix[i] = uint8(a)
-	}
-	return out
-}

@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"image"
 	"log"
 	"path/filepath"
 
@@ -91,8 +90,9 @@ func NewVIUIFromFile(uiFile *esf.ObjFile) *VIUI {
 			continue
 		}
 
-		img := scalePS2Alpha(surf.Image)
-		rlImg := rl.NewImageFromImage(img)
+		// Upload alpha unchanged: the palette already holds 0..255 and the PS2
+		// halves it at draw time (a blended layer's vertex alpha is 64, not 128).
+		rlImg := rl.NewImageFromImage(surf.Image)
 		tex := rl.LoadTextureFromImage(rlImg)
 		rl.UnloadImage(rlImg)
 
@@ -352,100 +352,93 @@ func (v *VIUI) BlitBar(containerTex, fillTex int, x, y, w, h, frac float32, tint
 	rl.DrawTexturePro(tex, src, dst, rl.Vector2{}, 0, tint)
 }
 
-// BlitFrame draws a 9-slice frame border (no fill).
-// From PS2 decompilation of VIUI::BlitFrame:
-//  1. Look up corner dimensions
-//  2. Tile edges between corners
-//  3. Draw 4 corners at their positions
+// BlitFrame is VIUI::BlitFrame: the edges between the corners, then the
+// corners. Every piece is placed by the CORNERS' sizes — the bottom edge at
+// the bottom-left corner's height, the right edge at the top-right corner's
+// width — and drawn with its own flip flags.
 func (v *VIUI) BlitFrame(x, y, w, h float32, fp UIFrameParam, tint rl.Color) {
 	tl := entry(fp.TLCorner)
 	tr := entry(fp.TRCorner)
-	bl := entry(fp.BLCorner)
 	br := entry(fp.BRCorner)
+	bl := entry(fp.BLCorner)
 	if tl == nil || tr == nil || bl == nil || br == nil {
 		return
 	}
-
 	tlW, tlH := float32(tl.Width), float32(tl.Height)
 	trW, trH := float32(tr.Width), float32(tr.Height)
-	blW, blH := float32(bl.Width), float32(bl.Height)
 	brW, brH := float32(br.Width), float32(br.Height)
+	blW, blH := float32(bl.Width), float32(bl.Height)
+	f := fp.Flip
 
-	// Top edge: tile from x+tlW to x+w-trW at y
-	topLen := int(w - tlW - trW)
-	if topLen > 0 {
-		v.BlitHorz(fp.TopEdge, x+tlW, y, topLen, tint)
-	}
+	v.tilePiece(fp.TopEdge, x+tlW, y, w-tlW-trW, true, f.Top, tint)
+	v.tilePiece(fp.BottomEdge, x+blW, y+h-blH, w-blW-brW, true, f.Bottom, tint)
+	v.tilePiece(fp.LeftEdge, x, y+tlH, h-tlH-blH, false, f.Left, tint)
+	v.tilePiece(fp.RightEdge, x+w-trW, y+trH, h-trH-brH, false, f.Right, tint)
 
-	// Bottom edge: tile from x+blW to x+w-brW at y+h-botH
-	botEdge := entry(fp.BottomEdge)
-	botH := float32(0)
-	if botEdge != nil {
-		botH = float32(botEdge.Height)
-	}
-	botLen := int(w - blW - brW)
-	if botLen > 0 {
-		v.BlitHorz(fp.BottomEdge, x+blW, y+h-botH, botLen, tint)
-	}
-
-	// Left edge: tile from y+tlH to y+h-blH at x
-	leftLen := int(h - tlH - blH)
-	if leftLen > 0 {
-		v.BlitVert(fp.LeftEdge, x, y+tlH, leftLen, tint)
-	}
-
-	// Right edge: tile from y+trH to y+h-brH at x+w-rightW
-	rightEdge := entry(fp.RightEdge)
-	rightW := float32(0)
-	if rightEdge != nil {
-		rightW = float32(rightEdge.Width)
-	}
-	rightLen := int(h - trH - brH)
-	if rightLen > 0 {
-		v.BlitVert(fp.RightEdge, x+w-rightW, y+trH, rightLen, tint)
-	}
-
-	// 4 corners at their positions
-	v.Blit(fp.TLCorner, x, y, tint)
-	v.Blit(fp.TRCorner, x+w-trW, y, tint)
-	v.Blit(fp.BLCorner, x, y+h-blH, tint)
-	v.Blit(fp.BRCorner, x+w-brW, y+h-brH, tint)
+	v.blitPiece(fp.TLCorner, x, y, tlW, tlH, f.TL, tint)
+	v.blitPiece(fp.TRCorner, x+w-trW, y, trW, trH, f.TR, tint)
+	v.blitPiece(fp.BLCorner, x, y+h-blH, blW, blH, f.BL, tint)
+	v.blitPiece(fp.BRCorner, x+w-brW, y+h-brH, brW, brH, f.BR, tint)
 }
 
-// BlitFillFrame draws a filled 9-slice frame: fill interior first, then border on top.
+// blitPiece draws the top-left (w, h) of a TexID at (x, y) with the given
+// flip flags in place of the atlas entry's own (VIUI::BlitEx): a short last
+// tile is cropped, not squeezed.
+func (v *VIUI) blitPiece(texID int, x, y, w, h float32, flags uint8, tint rl.Color) {
+	e := entry(texID)
+	if e == nil || w <= 0 || h <= 0 {
+		return
+	}
+	tex, ok := v.sheets[e.Sheet]
+	if !ok {
+		return
+	}
+	// The texels from the entry's origin, mirrored in place when flipped —
+	// raylib's negative source size, as the raster's swapped UVs.
+	src := rl.Rectangle{X: float32(e.SrcX), Y: float32(e.SrcY), Width: w, Height: h}
+	if flags&1 != 0 {
+		src.Width = -w
+	}
+	if flags&2 != 0 {
+		src.Height = -h
+	}
+	rl.DrawTexturePro(tex, src, rl.Rectangle{X: x, Y: y, Width: w, Height: h}, rl.Vector2{}, 0, tint)
+}
+
+// tilePiece repeats a TexID along an edge for n pixels — VIUI::BlitHorz /
+// BlitVert — cropping the last tile.
+func (v *VIUI) tilePiece(texID int, x, y, n float32, horizontal bool, flags uint8, tint rl.Color) {
+	e := entry(texID)
+	if e == nil || n <= 0 {
+		return
+	}
+	tw, th := float32(e.Width), float32(e.Height)
+	for done := float32(0); done < n; {
+		if horizontal {
+			step := min(tw, n-done)
+			v.blitPiece(texID, x+done, y, step, th, flags, tint)
+			done += step
+		} else {
+			step := min(th, n-done)
+			v.blitPiece(texID, x, y+done, tw, step, flags, tint)
+			done += step
+		}
+	}
+}
+
+// BlitFillFrame is VIUI::BlitFillFrame: the fill tiled inside the top-left
+// and bottom-right CORNERS (not the edges), then the frame over it.
 func (v *VIUI) BlitFillFrame(x, y, w, h float32, fp UIFrameParam, fillTex int, tint rl.Color) {
 	tl := entry(fp.TLCorner)
-	bl := entry(fp.BLCorner)
-	tr := entry(fp.TRCorner)
-	if tl == nil || bl == nil || tr == nil {
+	br := entry(fp.BRCorner)
+	if tl == nil || br == nil || entry(fillTex) == nil {
 		return
 	}
-	leftEdge := entry(fp.LeftEdge)
-	topEdge := entry(fp.TopEdge)
-	if leftEdge == nil || topEdge == nil {
-		return
+	tlW, tlH := float32(tl.Width), float32(tl.Height)
+	brW, brH := float32(br.Width), float32(br.Height)
+	if fw, fh := w-tlW-brW, h-tlH-brH; fw > 0 && fh > 0 {
+		v.BlitRect(fillTex, x+tlW, y+tlH, fw, fh, tint)
 	}
-
-	// Fill interior (inside the edge borders)
-	lw := float32(leftEdge.Width)
-	rightEdge := entry(fp.RightEdge)
-	rw := float32(0)
-	if rightEdge != nil {
-		rw = float32(rightEdge.Width)
-	}
-	th := float32(topEdge.Height)
-	botEdge := entry(fp.BottomEdge)
-	bh := float32(0)
-	if botEdge != nil {
-		bh = float32(botEdge.Height)
-	}
-	fillW := w - lw - rw
-	fillH := h - th - bh
-	if fillW > 0 && fillH > 0 {
-		v.BlitRect(fillTex, x+lw, y+th, fillW, fillH, tint)
-	}
-
-	// Frame border on top
 	v.BlitFrame(x, y, w, h, fp, tint)
 }
 
@@ -458,17 +451,3 @@ func (v *VIUI) TexSize(texID int) (int, int) {
 	return e.Width, e.Height
 }
 
-// scalePS2Alpha scales PS2 alpha values (0-128 → 0-255) for OpenGL.
-func scalePS2Alpha(img *image.NRGBA) *image.NRGBA {
-	bounds := img.Bounds()
-	out := image.NewNRGBA(bounds)
-	copy(out.Pix, img.Pix)
-	for i := 3; i < len(out.Pix); i += 4 {
-		a := int(out.Pix[i]) * 2
-		if a > 255 {
-			a = 255
-		}
-		out.Pix[i] = uint8(a)
-	}
-	return out
-}

@@ -186,8 +186,7 @@ func (ps *ParticleSystem) CreateZoneEmitter(pd *esf.ParticleDefinition, pos, rot
 	// Upload texture if provided and not already cached
 	if tex != nil && pd.TexDictID != 0 {
 		if _, ok := ps.texCache[pd.TexDictID]; !ok {
-			img := scalePS2AlphaParticle(tex)
-			rlImg := rl.NewImageFromImage(img)
+			rlImg := rl.NewImageFromImage(tex)
 			t := rl.LoadTextureFromImage(rlImg)
 			rl.UnloadImage(rlImg)
 			rl.SetTextureFilter(t, rl.FilterBilinear)
@@ -1013,9 +1012,9 @@ func (ps *ParticleSystem) ensureTexture(dictID int32) {
 		return
 	}
 
-	// Scale PS2 alpha (0-128 → 0-255) for proper transparency
-	img := scalePS2AlphaParticle(surf.Image)
-	rlImg := rl.NewImageFromImage(img)
+	// Alpha is uploaded unchanged: the palette holds 0..255, and the PS2's
+	// billboard pass sends a blended particle's vertex alpha as 64 (half).
+	rlImg := rl.NewImageFromImage(surf.Image)
 	tex := rl.LoadTextureFromImage(rlImg)
 	rl.UnloadImage(rlImg)
 
@@ -1024,32 +1023,6 @@ func (ps *ParticleSystem) ensureTexture(dictID int32) {
 	rl.SetTextureWrap(tex, rl.WrapClamp)
 
 	ps.texCache[dictID] = tex
-}
-
-// scalePS2AlphaParticle converts PS2 alpha (0-128) to standard (0-255).
-func scalePS2AlphaParticle(src *image.NRGBA) *image.NRGBA {
-	bounds := src.Bounds()
-	dst := image.NewNRGBA(bounds)
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			i := src.PixOffset(x, y)
-			r := src.Pix[i+0]
-			g := src.Pix[i+1]
-			b := src.Pix[i+2]
-			a := src.Pix[i+3]
-			// PS2 GS alpha is 0-128, scale to 0-255
-			a2 := int(a) * 255 / 128
-			if a2 > 255 {
-				a2 = 255
-			}
-			j := dst.PixOffset(x, y)
-			dst.Pix[j+0] = r
-			dst.Pix[j+1] = g
-			dst.Pix[j+2] = b
-			dst.Pix[j+3] = uint8(a2)
-		}
-	}
-	return dst
 }
 
 // billboardVectors computes camera right and up vectors for billboard rendering.
@@ -1122,8 +1095,7 @@ func (ps *ParticleSystem) CreateModelEmitter(pd *esf.ParticleDefinition, pos [3]
 	// Upload texture if provided and not already cached
 	if tex != nil && pd.TexDictID != 0 {
 		if _, ok := ps.texCache[pd.TexDictID]; !ok {
-			img := scalePS2AlphaParticle(tex)
-			rlImg := rl.NewImageFromImage(img)
+			rlImg := rl.NewImageFromImage(tex)
 			t := rl.LoadTextureFromImage(rlImg)
 			rl.UnloadImage(rlImg)
 			rl.SetTextureFilter(t, rl.FilterBilinear)

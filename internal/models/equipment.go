@@ -5,7 +5,8 @@ package models
 // Source: PS2 VICSpriteCust::$Armor table at EE 0x004FB910 stores VIRaster pool
 // indices. DictIDs resolved from runtime VIRaster pool in EE memory dump
 // (pool at 0x0076B5A0, VISurface+0x00 = DictID).
-// Sets 0-8 are the PS2 sets. Set 9 is client-side only — see ArmorSetOrnatePlate.
+// Sets 0-8 are the PS2 sets. Sets 9-10 are client-side only — see
+// ArmorSetOrnatePlate and ArmorSetTemplarPlate.
 var ArmorTextures = [ArmorSetCount][5]int32{
 	{0, 0, 0, 0, 0},                                                                     // 0 = none (base model texture)
 	{-1085571574, 1648643354, -2066550155, 750072456, 2060964273},                        // 1 = cloth
@@ -17,10 +18,11 @@ var ArmorTextures = [ArmorSetCount][5]int32{
 	{637778783, 596508817, -343199798, -1925225009, -614333192},                           // 7 = scale
 	{1071320539, -2127282779, 90341958, 241961123, 1552852940},                            // 8 = monk
 	{1085332903, -348034519, 104354322, -184150041, 1126741776},                           // 9 = ornate plate (same IDs as 4, CHAR.ESF art)
+	{-1326051557, -718269054, -718269054, -718269054, -718269054},                         // 10 = templar plate (CHAR.ESF model 0xD1300BD3)
 }
 
 // ArmorSetCount is the number of selectable armor sets, including client-side ones.
-const ArmorSetCount = 10
+const ArmorSetCount = 11
 
 // ArmorSetOrnatePlate is a cosmetic set with no PS2 $Armor entry. It reuses the
 // plate DictIDs but resolves them from CHAR.ESF instead of CHARCUST.CSF.
@@ -33,14 +35,42 @@ const ArmorSetCount = 10
 // extracted-assets/gold-silver-armor/README.md.
 const ArmorSetOrnatePlate byte = 9
 
+// ArmorSetTemplarPlate is a second cosmetic set with no PS2 $Armor entry,
+// adapted from the armor worn by CHAR.ESF model 0xD1300BD3 (-785380397): silver
+// plate with a blue tabard and gold shoulder medallions.
+//
+// Unlike the ornate set, these DictIDs are unique to CHAR.ESF — CHARCUST.CSF has
+// no surface under either, so nothing shadows them. That model packs its armor
+// into just two atlases, which is why four slots share one DictID: the donor
+// lays its limb art out across the legs, boots, bracer and gloves UV tiles of a
+// single 128x128 texture, exactly the tiles the player body samples for those
+// slots. Chest gets its own 128x128.
+//
+// Derived and measured with `npctex -fit -ref 1893243078 -dict -785380397`,
+// which matches an untagged donor's materials to the player body's per-slot UV
+// footprints. That model carries no CSpriteTSlotList, so it is invisible to
+// `-compat`/`-matrix` and never appeared in the 63-pair NPC survey. Per slot the
+// winning texture is unopposed (no other material has any coverage of the tile),
+// and the art covers 0.97/0.71/0.91/0.96/0.91 of the footprint the player
+// actually samples for chest/bracer/gloves/legs/boots.
+//
+// The donor's face (1379008418) and hair (1842279120) are deliberately NOT
+// carried: an armor set is only the five $Armor text slots, so the wearer keeps
+// their own head. See claude-notes/npc-armor-texture-survey.md.
+const ArmorSetTemplarPlate byte = 10
+
 // armorSetFromCharESF marks sets whose textures must be read from CHAR.ESF
 // rather than through the default CHARCUST-first search order.
-var armorSetFromCharESF = [ArmorSetCount]bool{ArmorSetOrnatePlate: true}
+var armorSetFromCharESF = [ArmorSetCount]bool{
+	ArmorSetOrnatePlate:  true,
+	ArmorSetTemplarPlate: true,
+}
 
 // ArmorSetNames labels each armor set for UI.
 var ArmorSetNames = [ArmorSetCount]string{
 	"None", "Cloth", "Leather", "Chainmail", "Plate",
 	"Padded", "Banded Mail", "Scale", "Monk", "Ornate Plate",
+	"Templar Plate",
 }
 
 // TextSlot indices for ArmorTextures second dimension.
@@ -57,8 +87,10 @@ type TintColor struct {
 	R, G, B, A uint8
 }
 
-// Tints maps tint index to RGBA color.
-var Tints = [14]TintColor{
+// Tints maps tint index to RGBA color: VICSpriteCust::Tints[15]. Index 14 is
+// yellow; with only 14 entries it fell through to white. SetArmorSlot turns
+// any index of 15 or more into 0, as GetTintColor does.
+var Tints = [15]TintColor{
 	{0xFF, 0xFF, 0xFF, 0xFF}, // 0 = White
 	{0x5A, 0x5A, 0x5A, 0xFF}, // 1 = DarkGray
 	{0x00, 0xB4, 0xFF, 0xFF}, // 2 = Cyan
@@ -73,12 +105,13 @@ var Tints = [14]TintColor{
 	{0xDC, 0xBE, 0x96, 0xFF}, // 11 = Tan
 	{0x00, 0xC8, 0xB4, 0xFF}, // 12 = Teal
 	{0x96, 0x00, 0x3C, 0xFF}, // 13 = Purple
+	{0xF0, 0xF0, 0x00, 0xFF}, // 14 = Yellow
 }
 
 // TintNames labels each entry of Tints for UI.
 var TintNames = [len(Tints)]string{
 	"White", "Dark Gray", "Cyan", "Brown", "Navy", "Green", "Gold",
-	"Olive", "Red", "Ice Blue", "Silver", "Tan", "Teal", "Purple",
+	"Olive", "Red", "Ice Blue", "Silver", "Tan", "Teal", "Purple", "Yellow",
 }
 
 // RobeTextures maps [robeStyle] to ESF Surface DictIDs.

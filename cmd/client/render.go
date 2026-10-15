@@ -128,7 +128,8 @@ func (c *Client) drawWorld() {
 
 	// Update audio listener position for 3D sound
 	if c.audioSys != nil {
-		c.audioSys.SetListener(camera.Position.X, camera.Position.Y, camera.Position.Z)
+		look := rl.Vector3Subtract(camera.Target, camera.Position)
+		c.audioSys.SetListener(camera.Position.X, camera.Position.Y, camera.Position.Z, look.X, look.Y, look.Z)
 		c.audioSys.Update()
 		c.audioSys.UpdateBGM()
 		c.audioSys.UpdateAmbient()
@@ -185,6 +186,17 @@ func (c *Client) drawWorld() {
 
 	}
 
+	// The terrain profiles blended at the camera (VIWorld::CalcProfileBlend)
+	// decide the fog, the overcast weight and the ambient track, and their far
+	// distance is the camera's far plane (VIScene::SetFarPlane).
+	profiles := terrain.DefaultProfileMix
+	if c.terrainLoader != nil {
+		profiles = c.terrainLoader.ProfileBlend(camera.Position.X, camera.Position.Z)
+	}
+	_, farPlane := profiles.ClipPlanes()
+	rl.SetClipPlanes(1.0, float64(farPlane))
+	defer rl.SetClipPlanes(1.0, 5000.0)
+
 	rl.BeginMode3D(camera)
 
 	// Set camera position for per-bone animation LOD (PS2 ProcessPlayList channelFilter).
@@ -211,59 +223,50 @@ func (c *Client) drawWorld() {
 		if c.engine.State.TimeValid {
 			gameHour = c.engine.State.GameHour()
 		}
-		// Point lights (torches + player lanterns) only active at dusk/night.
-		c.pointLightBuf = c.pointLightBuf[:0]
 		isDusk := gameHour >= 19.0 || gameHour < 6.0
 		if c.engine.SpellFX != nil && c.engine.SpellFX.Particles != nil {
 			c.engine.SpellFX.Particles.ZoneLightsOn = isDusk
 		}
-		// Collect point lights from all loaded zones.
-		for idx := range c.loadedZoneIdxs {
-			zt := c.terrainLoader.GetZoneTerrain(idx)
-			if zt == nil {
-				continue
-			}
-			for _, pl := range zt.PointLights {
-				if pl.AlwaysOn || isDusk {
-					c.pointLightBuf = append(c.pointLightBuf, pl)
-				}
-			}
-		}
-		// Player and entity lanterns at night — warm glow on all players.
-		if isDusk {
-			c.pointLightBuf = append(c.pointLightBuf, esf.PointLightPlacement{
-				Pos:    esf.Point{X: p.X, Y: p.Y + 2.5, Z: p.Z},
-				Radius: 25.0,
-				Color:  esf.Color32F{R: 1.0, G: 0.69, B: 0.36, A: 1},
-			})
-			c.terrainRender.SetPlayerLight(true, p.X, p.Y+2.5, p.Z, 25.0, 1.0, 0.69, 0.36)
-			// Other players get lanterns too
-			for _, ent := range gs.Entities {
-				if ent.IsPlayer && ent.ObjectID != 0 {
-					c.pointLightBuf = append(c.pointLightBuf, esf.PointLightPlacement{
-						Pos:    esf.Point{X: ent.X, Y: ent.Y + 2.5, Z: ent.Z},
-						Radius: 25.0,
-						Color:  esf.Color32F{R: 1.0, G: 0.69, B: 0.36, A: 1},
-					})
-				}
-			}
-		} else {
-			c.terrainRender.SetPlayerLight(false, 0, 0, 0, 0, 0, 0, 0)
-		}
-		c.terrainRender.SetLightingUniforms(camera.Position.X, camera.Position.Y, camera.Position.Z, gameHour, c.pointLightBuf)
 
-		// Play ambient track: region ID from WorldRegions → day/night track arrays
+		// The lantern — the PS2's only point light (VIRaster::MaxPointLights
+		// is 1; zone point lights never reach the GPU). CLIENT calls
+		// SetPersonalLight(actor, 20, (1, .69, .36)), which lifts it 3 units up
+		// the player's actor, and SetupTimeOfDayLights grows its radius at
+		// 2 units/s while it is wanted — before 6:00, after 16:00, or under an
+		// overcast storm outdoors — and shrinks it at the same rate otherwise.
+		wantLantern := gameHour < 6 || gameHour > 16
+		if w := c.weather; w != nil && w.Intensity > 0 && w.Outdoors > 0.05 && w.OvercastInterp > 0.5 {
+			wantLantern = true
+		}
+		if wantLantern {
+			c.lanternRadius += 2 * rl.GetFrameTime()
+		} else {
+			c.lanternRadius -= 2 * rl.GetFrameTime()
+		}
+		c.lanternRadius = mathutil.ClampF(c.lanternRadius, 0, 20)
+		c.terrainRender.SetPlayerLight(c.lanternRadius > 0, p.X, p.Y+3, p.Z, c.lanternRadius, 1.0, 0.69, 0.36)
+		if c.weather != nil {
+			c.terrainRender.Overcast = c.weather.OvercastInterp
+			c.terrainRender.Flash = c.weather.LightningBrightness
+			c.terrainRender.Outdoors = c.weather.Outdoors
+		}
+		c.terrainRender.Profile = profiles
+		c.terrainRender.EnvFlags = 0
+		if zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx); zt != nil {
+			c.terrainRender.EnvFlags = zt.GetEnvFlags(camera.Position.X, camera.Position.Y, camera.Position.Z)
+		}
+		c.terrainRender.SetLightingUniforms(camera.Position.X, camera.Position.Y, camera.Position.Z, gameHour)
+
+		// Ambient track (VIScene::SetSoundTrack): the (day, night) pair of the
+		// heaviest-weighted terrain profile at the camera.
 		if len(c.ambientTracks) > 0 {
-			regionID := 0
-			if c.terrainLoader != nil && c.terrainLoader.Regions != nil {
-				if c.terrainZoneIdx < len(c.terrainLoader.Regions.RegionIDs) {
-					regionID = int(c.terrainLoader.Regions.RegionIDs[c.terrainZoneIdx])
-				}
-			}
-			ambID := audio.SelectAmbientTrack(regionID, isDusk)
+			night := gameHour < 5 || gameHour > 20
+			ambID := audio.AmbientTrackFor(profiles.Heaviest().Music, night)
 			if ambID != c.lastAmbientID {
 				if track, ok := c.ambientTracks[ambID]; ok {
 					c.audioSys.PlayAmbientPCM(audio.AmbientKey(ambID), track.PCM, track.SampleRate, 0.15)
+				} else if ambID == 0 {
+					c.audioSys.StopAmbient()
 				}
 				c.lastAmbientID = ambID
 			}
@@ -273,19 +276,31 @@ func (c *Client) drawWorld() {
 		// Primary zone first — claims depth at boundary edges.
 		// Secondary zones drawn after — GL_LESS fails at equal depth,
 		// so primary zone's colors always win at shared edges.
-		// Compute visible rooms for portal culling (indoor zones).
+		// Portal culling, VIWorld::RenderByPortals: only from an INDOOR room
+		// — the camera's zone-tree leaf room without bit 0 — and only in the
+		// primary zone, whose rooms are the ones loaded. From an outdoor room
+		// (nearly all of them) the world renders by frustum alone.
+		// (c.portalNav is the pathfinder's and only exists when the zone was
+		// resident as it became primary; the rooms are all this needs.)
 		var visibleRooms map[int]bool
-		if c.portalNav != nil {
-			visibleRooms = c.portalNav.GetVisibleRooms(p.X, p.Y, p.Z)
+		if zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx); zt != nil && len(zt.Rooms) > 0 &&
+			c.terrainRender.RoomsAssigned(c.terrainZoneIdx) &&
+			c.terrainLoader.FindZone(camera.Position.X, camera.Position.Z) == c.terrainZoneIdx {
+			if room := zt.RoomAt(camera.Position.X, camera.Position.Y, camera.Position.Z); room >= 0 && !zt.Rooms[room].Outdoor() {
+				fwd := rl.Vector3Normalize(rl.Vector3Subtract(camera.Target, camera.Position))
+				visibleRooms = terrain.NewPortalNav(zt.Rooms).VisibleFrom(room,
+					camera.Position.X, camera.Position.Y, camera.Position.Z, fwd.X, fwd.Y, fwd.Z)
+			}
 		}
 
 		if zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx); zt != nil {
 			if !c.terrainRender.IsZoneBuilt(c.terrainZoneIdx) {
 				c.terrainRender.UploadZoneBatch(c.terrainZoneIdx, zt, 10)
-				// Assign room IDs to mesh groups after first build
-				if len(zt.Rooms) > 0 {
-					c.terrainRender.AssignRooms(zt.Rooms)
-				}
+			}
+			// Rooms are assigned once the zone's meshes are all built — also
+			// when it was built earlier, as a secondary zone.
+			if len(zt.Rooms) > 0 && c.terrainRender.IsZoneBuilt(c.terrainZoneIdx) && !c.terrainRender.RoomsAssigned(c.terrainZoneIdx) {
+				c.terrainRender.AssignRooms(c.terrainZoneIdx, zt.Rooms)
 			}
 			c.terrainRender.DrawZone(c.terrainZoneIdx, &frust, true, visibleRooms)
 		}
@@ -562,25 +577,23 @@ func (c *Client) drawWorld() {
 
 	// Draw zone effect volumes (fog, dust, leaves, light shafts).
 	if c.effectVolumes != nil {
-		c.effectVolumes.Update(dt, camera.Position.X, camera.Position.Y, camera.Position.Z)
+		c.effectVolumes.Update(dt, camera.Position.X, camera.Position.Y, camera.Position.Z, c.engine.State.GameHour())
 		c.effectVolumes.Render(camera)
 	}
 
-	// Draw weather particles (rain, snow, etc).
+	// Weather (PS2 VIAtmosphere): precipitation, splashes, lightning, thunder.
+	// There is no indoor switch on the PS2: rain stops at a roof because each
+	// particle's ray finds the roof, and the outdoors factor — the baked sun
+	// gate below the camera — scales the rain and thunder volumes and the flash.
 	if c.weather != nil {
 		gh := c.engine.State.GameHour()
-		// Suppress weather inside buildings (PS2: VIEnvRay per-particle roof check)
-		c.weather.Indoor = c.portalNav != nil && c.portalNav.FindRoom(p.X, p.Y, p.Z) >= 0
-		c.weather.Update(dt, gh, camera.Position.X, camera.Position.Y, camera.Position.Z)
+		if c.weather.Ground == nil {
+			c.weather.Ground = c.weatherGround
+		}
+		c.weather.Outdoors = c.outdoorsIntensity(camera, dt)
+		c.weather.Update(dt, gh, camera)
 		c.weather.Render(camera)
 
-		// PS2 lightning screen flash (GetLightning at 0x0041AA58)
-		if c.weather.LightningBrightness > 0.01 {
-			a := uint8(c.weather.LightningBrightness * 180)
-			rl.DrawRectangle(0, 0, screenWidth, screenHeight, rl.Color{R: 220, G: 220, B: 255, A: a})
-		}
-
-		// PS2 weather sound: rain ambient loop + thunder cracks (ProcessTransitions)
 		if c.audioSys != nil {
 			camPos := [3]float32{camera.Position.X, camera.Position.Y, camera.Position.Z}
 			if c.weather.WantsRainLoop() {
@@ -592,8 +605,8 @@ func (c *Client) drawWorld() {
 				c.audioSys.StopLoop(9990)
 				c.weather.SetRainSoundPlaying(false)
 			}
-			if c.weather.PopThunder() {
-				c.audioSys.Play(c.weather.ThunderSoundDictID, 9991, camPos, 0.7, 9999)
+			if vol, ok := c.weather.PopThunder(); ok {
+				c.audioSys.Play(c.weather.ThunderSoundDictID, 9991, camPos, vol, 9999)
 			}
 		}
 	}
@@ -1242,9 +1255,12 @@ func (c *Client) playBGMFromISO(bgmName string) {
 
 // triggerSpellAnim forces an animation on an entity from a spell effect callback.
 // Used by PlayAttack (type 15) and SetAction (type 2) to trigger attack/cast anims.
-func (c *Client) triggerSpellAnim(actorObjID uint32, animByte byte) {
+//
+// It returns the action handle SetAction gave (VICSprite::SetAction's), which
+// the spell's Wait 0 hands back to IsActionComplete; -1 without a controller.
+func (c *Client) triggerSpellAnim(actorObjID uint32, animByte byte) int {
 	if c.animMgr == nil {
-		return
+		return -1
 	}
 	// For the local player, use the player combat state + set action on controller.
 	if c.engine != nil && c.engine.State != nil && actorObjID == c.engine.State.Player.ObjectID {
@@ -1257,11 +1273,11 @@ func (c *Client) triggerSpellAnim(actorObjID uint32, animByte byte) {
 		cs.combatAnimEnd = time.Now().Add(c.animMgr.animDur(modelID, animByte))
 		cs.lastActivity = time.Now()
 		// Set action on controller so applySkeletal tracks play-once completion
-		// and IsActionFinished() returns true when the anim finishes.
+		// and IsActionComplete can tell when the anim finishes.
 		if ctrl := c.animMgr.PlayerController(); ctrl != nil {
-			ctrl.SetAction(int(animByte))
+			return ctrl.SetAction(int(animByte))
 		}
-		return
+		return -1
 	}
 	// For other entities, use the per-entity combat state.
 	if c.animMgr.entityStates == nil {
@@ -1287,8 +1303,9 @@ func (c *Client) triggerSpellAnim(actorObjID uint32, animByte byte) {
 	es.lastActivity = time.Now()
 	// Set action on controller so applySkeletal tracks play-once completion.
 	if ctrl := c.animMgr.EntityController(actorObjID); ctrl != nil {
-		ctrl.SetAction(int(animByte))
+		return ctrl.SetAction(int(animByte))
 	}
+	return -1
 }
 
 // updateBoneEmitters manages CSprite bone-attached particle emitters for all entities.
@@ -1632,3 +1649,51 @@ func (c *Client) drawNavDebug(gs *game.GameState) {
 	}
 }
 
+
+// weatherGround is the weather's per-particle ray (VIAtmosphere::
+// ProcessWeather casts a collision ray and an environment ray from 5000 above
+// to 5000 below): the topmost surface at (x, z), or the water over it.
+func (c *Client) weatherGround(x, z float32) (float32, bool, bool) {
+	if c.terrainLoader == nil {
+		return 0, false, false
+	}
+	zt := c.terrainLoader.GetZoneTerrain(c.terrainLoader.FindZone(x, z))
+	if zt == nil {
+		return 0, false, false
+	}
+	y, ok := zt.TopSurfaceY(x, z)
+	if !ok {
+		return 0, false, false
+	}
+	if wy, wet := zt.FindWaterSurfaceY(x, y+0.01, z, 200); wet && wy > y {
+		return wy, true, true
+	}
+	return y, false, true
+}
+
+// outdoorsIntensity is VIScene::CalcOutdoorsIntensity: the baked sun gate of
+// the world 15 units below the camera, which the stored value walks toward at
+// 0.2 per second. Where nothing is hit it holds its value.
+func (c *Client) outdoorsIntensity(cam rl.Camera3D, dt float32) float32 {
+	if !c.outdoorsInit {
+		c.outdoors = 1
+	}
+	if c.terrainLoader == nil {
+		return c.outdoors
+	}
+	zt := c.terrainLoader.GetZoneTerrain(c.terrainLoader.FindZone(cam.Position.X, cam.Position.Z))
+	if zt == nil {
+		return c.outdoors
+	}
+	gate, ok := zt.SunGateBelow(cam.Position.X, cam.Position.Y, cam.Position.Z, 15)
+	if !ok {
+		return c.outdoors
+	}
+	if !c.outdoorsInit {
+		c.outdoors, c.outdoorsInit = gate, true
+		return c.outdoors
+	}
+	step := 0.2 * dt
+	c.outdoors += mathutil.ClampF(gate-c.outdoors, -step, step)
+	return c.outdoors
+}

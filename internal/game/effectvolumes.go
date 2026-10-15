@@ -21,8 +21,6 @@ import (
 const (
 	maxVolumes         = 512
 	maxParticlesPerVol = 512
-	volumeCullDist     = float32(100)
-	volumeCullDistSq   = volumeCullDist * volumeCullDist
 	fogTemplateCount   = 8 // PS2 GlobalInit creates 8 rotated billboard templates
 )
 
@@ -46,20 +44,29 @@ type EffectVolume struct {
 	Center     [3]float32
 	Dims       [3]float32 // half-extents
 	EffectType esf.EffectVolumeType
-	Density    float32
-	Speed      float32 // ESF speed/animation rate
+	Density    float32 // m_density: particle count and the (1-d)/2+1/2 alpha factor
+	Intensity  float32 // m_p28: fog/dust alpha, dust size and life, leaf life
+	// Origin is the actor's position, which the fade is measured from.
+	Origin    [3]float32
+	HourStart float32 // m_p34
+	HourEnd   float32 // m_p38
+	FadeRange float32 // m_p30
+	Flags     uint32  // m_flags
+	// fade and dayNight are VIEffectVolume::Render's two gains: distance from
+	// the camera, and the hour against [HourStart, HourEnd].
+	fade       float32
+	dayNight   float32
 	particles  []EffectParticle
 	birthAccum float32
 	tex        rl.Texture2D // GPU texture from ESF Surface (0 if none)
 	hasTex     bool
-	fogAlpha   uint8 // PS2 per-volume alpha: speed * densityMod * 255
 	// Flock (type=5): Reynolds boids with random waypoint targeting.
 	flockTarget [3]float32 // current waypoint target
 	flockTimer  float32    // time until next waypoint (3-12s)
 	birdMesh    rl.Mesh     // CSprite bird model mesh (uploaded to GPU)
 	birdMat     rl.Material // simple unlit material for bird silhouette
 	hasBirdMesh bool
-	culled      bool // true when far from camera — skip update and render
+	culled      bool // past FadeRange (fade 0) — skip update and render
 }
 
 // EffectParticle is a single particle within an effect volume.
@@ -125,7 +132,12 @@ func (s *EffectVolumeSystem) LoadZoneVolumes(placements []esf.EffectVolumePlacem
 			BBox:       p.BBox,
 			EffectType: p.EffectType,
 			Density:    p.Density,
-			Speed:      p.Speed,
+			Intensity:  p.Intensity,
+			Origin:     [3]float32{p.Pos.X, p.Pos.Y, p.Pos.Z},
+			HourStart:  p.HourStart,
+			HourEnd:    p.HourEnd,
+			FadeRange:  p.FadeRange,
+			Flags:      p.Flags,
 		}
 		vol.Center[0] = (p.BBox.MinX + p.BBox.MaxX) * 0.5
 		vol.Center[1] = (p.BBox.MinY + p.BBox.MaxY) * 0.5
@@ -134,20 +146,12 @@ func (s *EffectVolumeSystem) LoadZoneVolumes(placements []esf.EffectVolumePlacem
 		vol.Dims[1] = (p.BBox.MaxY - p.BBox.MinY) * 0.5
 		vol.Dims[2] = (p.BBox.MaxZ - p.BBox.MinZ) * 0.5
 
-		// Default density if zero.
-		if vol.Density <= 0 {
-			vol.Density = 1.0
-		}
-
-		// PS2 fog alpha: speed * densityMod
-		densityMod := (1.0-vol.Density)*0.5 + 0.5
-		vol.fogAlpha = uint8(mathutil.ClampF(vol.Speed*densityMod*255, 1, 255))
 
 		// Upload particle texture to GPU.
 		if (vol.EffectType == esf.EffectTypeGroundFog || vol.EffectType == esf.EffectTypeDustStorm || vol.EffectType == esf.EffectTypeFallingLeaves) && p.Texture != nil {
 			// Fog/Dust/Leaves: ESF texture with radial alpha mask + additive blending.
 			// Premultiplied edges contribute nothing under additive blend.
-			img := applyRadialAlphaMask(scalePS2AlphaEffectVol(p.Texture))
+			img := applyRadialAlphaMask(p.Texture)
 			rlImg := rl.NewImageFromImage(img)
 			vol.tex = rl.LoadTextureFromImage(rlImg)
 			rl.UnloadImage(rlImg)
@@ -155,8 +159,7 @@ func (s *EffectVolumeSystem) LoadZoneVolumes(placements []esf.EffectVolumePlacem
 			rl.SetTextureWrap(vol.tex, rl.WrapClamp)
 			vol.hasTex = vol.tex.ID > 0
 		} else if p.Texture != nil {
-			img := scalePS2AlphaEffectVol(p.Texture)
-			rlImg := rl.NewImageFromImage(img)
+			rlImg := rl.NewImageFromImage(p.Texture)
 			vol.tex = rl.LoadTextureFromImage(rlImg)
 			rl.UnloadImage(rlImg)
 			rl.SetTextureFilter(vol.tex, rl.FilterBilinear)
@@ -191,9 +194,9 @@ func (s *EffectVolumeSystem) LoadZoneVolumes(placements []esf.EffectVolumePlacem
 		if vol.hasTex {
 			texStr = fmt.Sprintf(" tex=%dx%d", vol.tex.Width, vol.tex.Height)
 		}
-		log.Printf("effectvol: [%d] %s center=(%.0f,%.0f,%.0f) dims=(%.0f,%.0f,%.0f) density=%.2f speed=%.2f%s",
+		log.Printf("effectvol: [%d] %s center=(%.0f,%.0f,%.0f) dims=(%.0f,%.0f,%.0f) density=%.2f intensity=%.2f hours=[%.2f,%.2f]%s",
 			i, vol.EffectType, vol.Center[0], vol.Center[1], vol.Center[2],
-			vol.Dims[0], vol.Dims[1], vol.Dims[2], vol.Density, vol.Speed, texStr)
+			vol.Dims[0], vol.Dims[1], vol.Dims[2], vol.Density, vol.Intensity, vol.HourStart, vol.HourEnd, texStr)
 		s.volumes = append(s.volumes, vol)
 	}
 	log.Printf("effectvol: loaded %d volumes (capped from %d)", len(s.volumes), len(placements))
@@ -220,17 +223,16 @@ func (s *EffectVolumeSystem) IsReady() bool {
 	return s.volumesReady
 }
 
-// Update ticks all volumes: spawns/kills particles, updates positions.
-// Distance culling skips updates for volumes far from camera.
-func (s *EffectVolumeSystem) Update(dt, camX, camY, camZ float32) {
+// Update ticks all volumes: spawns/kills particles, updates positions. It
+// first takes VIEffectVolume::Render's two gains for the frame: a volume past
+// its fade range draws nothing and is not updated.
+func (s *EffectVolumeSystem) Update(dt, camX, camY, camZ, hour float32) {
 	totalParticles := 0
 	activeVolumes := 0
 	for _, vol := range s.volumes {
-		// Distance cull — skip updates for far volumes
-		dx := vol.Center[0] - camX
-		dy := vol.Center[1] - camY
-		dz := vol.Center[2] - camZ
-		if dx*dx+dy*dy+dz*dz > volumeCullDistSq {
+		vol.fade = volumeFade(vol.Origin, [3]float32{camX, camY, camZ}, vol.FadeRange)
+		vol.dayNight = volumeDayNight(vol.HourStart, vol.HourEnd, hour)
+		if vol.fade <= 0 {
 			vol.culled = true
 			continue
 		}
@@ -278,6 +280,65 @@ func (s *EffectVolumeSystem) Update(dt, camX, camY, camZ float32) {
 	}
 }
 
+// volumeFade is VIEffectVolume::Render's distance gain: 1 within three
+// quarters of the range from the volume's origin, falling to 0 at the range.
+func volumeFade(origin, cam [3]float32, rng float32) float32 {
+	dx, dy, dz := cam[0]-origin[0], cam[1]-origin[1], cam[2]-origin[2]
+	dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
+	near := rng * 0.75
+	if dist < near {
+		return 1
+	}
+	if rng < dist {
+		return 0
+	}
+	return mathutil.ClampF(1-(dist-near)/(rng*0.25), 0, 1)
+}
+
+// volumeDayNight is VIEffectVolume::Render's hour gain over [t0, t1]: a
+// window under a quarter-hour wide is never on (or always, if t0 >= t1), one
+// 23.75 h or wider always on (never, if t0 >= t1), and otherwise on inside the
+// window — which may wrap midnight — with a five-minute ramp either side.
+func volumeDayNight(t0, t1, h float32) float32 {
+	const ramp = 0.083333336
+	span := float32(math.Abs(float64(t0 - t1)))
+	switch {
+	case span <= 0.25:
+		if t0 < t1 {
+			return 0
+		}
+		return 1
+	case 23.75 <= span:
+		if t0 < t1 {
+			return 1
+		}
+		return 0
+	}
+	e := t1
+	if e < t0 {
+		if h < e {
+			h += 24
+		}
+		e += 24
+	}
+	if t0 <= h && h <= e {
+		return 1
+	}
+	if e+ramp < h {
+		h -= 24
+	} else if h < t0-ramp {
+		h += 24
+	}
+	var g float32
+	switch {
+	case t0-ramp < h && h <= t0:
+		g = (h - (t0 - ramp)) / ramp
+	case e <= h && h < e+ramp:
+		g = (e + ramp - h) / ramp
+	}
+	return mathutil.ClampF(g, 0, 1)
+}
+
 // Render draws all visible effect volume particles.
 // Fog uses pre-built rl.Mesh + DrawMesh (same pipeline as terrain/entities).
 // Other types use immediate-mode Begin/End quads.
@@ -294,6 +355,11 @@ func (s *EffectVolumeSystem) Render(camera rl.Camera3D) {
 
 	for _, vol := range s.volumes {
 		if vol.culled || len(vol.particles) == 0 {
+			continue
+		}
+		// Every type but the leaves (which thin instead) multiplies by the
+		// hour gain, so a volume outside its hours draws nothing.
+		if vol.dayNight == 0 {
 			continue
 		}
 
@@ -335,14 +401,21 @@ func (s *EffectVolumeSystem) renderGroundFogBillboard(vol *EffectVolume, camera 
 	texH := float32(vol.tex.Height)
 	source := rl.Rectangle{X: 0, Y: 0, Width: texW, Height: texH}
 
-	// PS2 alpha factors for fog/dust
+	// PS2 alpha: m_p28 * sin(age/life*pi) * k * m_fade * m_dayNight, with
+	// k = (1 - density)/2 + 1/2 (RenderGroundFog, RenderDustStorm).
 	densityMod := float32((1.0-float64(vol.Density))*0.5 + 0.5)
-	baseAlpha := vol.Speed * densityMod
+	baseAlpha := vol.Intensity * densityMod * vol.fade * vol.dayNight
 	if vol.EffectType == esf.EffectTypeDustStorm {
 		baseAlpha *= 0.5
 	}
 
-	for i := range vol.particles {
+	// RenderFallingLeaves draws the first dayNight * n leaves, at life * fade.
+	n := len(vol.particles)
+	if vol.EffectType == esf.EffectTypeFallingLeaves {
+		n = int(vol.dayNight * float32(n))
+	}
+
+	for i := range vol.particles[:n] {
 		p := &vol.particles[i]
 
 		var a uint8
@@ -361,7 +434,7 @@ func (s *EffectVolumeSystem) renderGroundFogBillboard(vol *EffectVolume, camera 
 			if leafAlpha <= 0 {
 				continue
 			}
-			a = uint8(mathutil.ClampF(leafAlpha*vol.Speed*255, 0, 255))
+			a = uint8(mathutil.ClampF(leafAlpha*vol.fade*255, 0, 255))
 			// PS2 leaf size: scale value directly (already [0.5, 1.3])
 			sizeXZ = p.Size
 			sizeY = p.Size
@@ -591,7 +664,7 @@ func (vol *EffectVolume) spawnDustStorm() {
 		count = maxParticlesPerVol
 	}
 
-	speedMod := vol.Speed*0.5 + 0.5
+	speedMod := vol.Intensity*0.5 + 0.5
 
 	vol.particles = make([]EffectParticle, count)
 	for i := range vol.particles {
@@ -602,7 +675,7 @@ func (vol *EffectVolume) spawnDustStorm() {
 		vy := rand.Float32() * 0.3
 
 		// PS2 lifespan: (2-speed)*(rand*0.7+1.0)
-		lifespan := (2.0 - vol.Speed) * (rand.Float32()*0.7 + 1.0)
+		lifespan := (2.0 - vol.Intensity) * (rand.Float32()*0.7 + 1.0)
 		if lifespan < 0.5 {
 			lifespan = 0.5
 		}
@@ -641,7 +714,7 @@ func (vol *EffectVolume) updateDustStorm(dt float32) {
 	bboxSizeX := vol.BBox.MaxX - vol.BBox.MinX
 	bboxSizeY := vol.BBox.MaxY - vol.BBox.MinY
 	bboxSizeZ := vol.BBox.MaxZ - vol.BBox.MinZ
-	speedMod := vol.Speed*0.5 + 0.5
+	speedMod := vol.Intensity*0.5 + 0.5
 
 	for i := range vol.particles {
 		p := &vol.particles[i]
@@ -656,7 +729,7 @@ func (vol *EffectVolume) updateDustStorm(dt float32) {
 			p.X = vol.Center[0] + (rand.Float32()-rand.Float32())*(bboxSizeX*0.5)
 			p.Y = vol.Center[1] + (rand.Float32()-0.5)*bboxSizeY*0.5
 			p.Z = vol.Center[2] + (rand.Float32()-rand.Float32())*(bboxSizeZ*0.5)
-			p.Lifespan = (2.0 - vol.Speed) * (rand.Float32()*0.7 + 1.0)
+			p.Lifespan = (2.0 - vol.Intensity) * (rand.Float32()*0.7 + 1.0)
 			if p.Lifespan < 0.5 {
 				p.Lifespan = 0.5
 			}
@@ -819,8 +892,8 @@ func (vol *EffectVolume) spawnLightShafts() {
 		// PS2 sizeY: bboxSizeY * (rand*0.2 + 0.8)
 		sizeY := bboxSizeY * (rand.Float32()*0.2 + 0.8)
 		// PS2 lifespan: base=(1-speed)*60+4, variance=(1-speed)*10+2
-		base := (1.0-vol.Speed)*60.0 + 4.0
-		variance := (1.0-vol.Speed)*10.0 + 2.0
+		base := (1.0-vol.Intensity)*60.0 + 4.0
+		variance := (1.0-vol.Intensity)*10.0 + 2.0
 		lifespan := base + rand.Float32()*variance
 		// Randomize initial age
 		age := lifespan * rand.Float32()
@@ -851,8 +924,8 @@ func (vol *EffectVolume) updateLightShafts(dt float32) {
 			p.Size = (rand.Float32()*0.4 + 1.5) * 0.5
 			bboxSizeY := vol.BBox.MaxY - vol.BBox.MinY
 			p.SizeY = bboxSizeY * (rand.Float32()*0.2 + 0.8)
-			base := (1.0-vol.Speed)*60.0 + 4.0
-			variance := (1.0-vol.Speed)*10.0 + 2.0
+			base := (1.0-vol.Intensity)*60.0 + 4.0
+			variance := (1.0-vol.Intensity)*10.0 + 2.0
 			p.Lifespan = base + rand.Float32()*variance
 			p.Age = 0
 		}
@@ -882,9 +955,9 @@ func (vol *EffectVolume) spawnFlock() {
 			X:    vol.Center[0] + (rand.Float32()-0.5)*vol.Dims[0],
 			Y:    vol.Center[1] + yOffset,
 			Z:    vol.Center[2] + (rand.Float32()-0.5)*vol.Dims[2],
-			VX:   (rand.Float32() - 0.5) * 2.0 * vol.Speed,
-			VY:   (rand.Float32() - 0.5) * 0.5 * vol.Speed,
-			VZ:   (rand.Float32() - 0.5) * 2.0 * vol.Speed,
+			VX:   (rand.Float32() - 0.5) * 2.0 * vol.Density,
+			VY:   (rand.Float32() - 0.5) * 0.5 * vol.Density,
+			VZ:   (rand.Float32() - 0.5) * 2.0 * vol.Density,
 			Size: 0.3 + rand.Float32()*0.2, // small bird size
 		}
 	}
@@ -905,7 +978,9 @@ func (vol *EffectVolume) updateFlock(dt float32) {
 		vol.flockTimer = 3.0 + rand.Float32()*9.0 // PS2: 3-12 seconds
 	}
 
-	maxSpeed := vol.Speed * 5.0
+	// Invented boid speed; it was always fed the real density (the field
+	// misread as "Speed"), so it keeps that value.
+	maxSpeed := vol.Density * 5.0
 	if maxSpeed < 2.0 {
 		maxSpeed = 2.0
 	}
@@ -1077,9 +1152,9 @@ func (vol *EffectVolume) particleColor(p *EffectParticle) rl.Color {
 
 	switch vol.EffectType {
 	case esf.EffectTypeLightShafts:
-		// PS2: alpha = sin(progress * PI) * speed (stationary, fade cycle)
+		// RenderLightShafts: sin(age/life*pi) * fade * dayNight * ((1-density)/2+1/2).
 		sinAlpha := float32(math.Sin(float64(progress) * math.Pi))
-		finalAlpha := sinAlpha * vol.Speed
+		finalAlpha := sinAlpha * vol.fade * vol.dayNight * ((1-vol.Density)*0.5 + 0.5)
 		a := uint8(mathutil.ClampF(finalAlpha*255, 0, 255))
 		if vol.hasTex {
 			return rl.Color{R: 255, G: 255, B: 255, A: a}
@@ -1183,24 +1258,3 @@ func applyRadialAlphaMask(src *image.NRGBA) *image.NRGBA {
 	return dst
 }
 
-// scalePS2AlphaEffectVol converts PS2 alpha (0-128) to standard (0-255).
-func scalePS2AlphaEffectVol(src *image.NRGBA) *image.NRGBA {
-	bounds := src.Bounds()
-	dst := image.NewNRGBA(bounds)
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			i := src.PixOffset(x, y)
-			a := src.Pix[i+3]
-			a2 := int(a) * 255 / 128
-			if a2 > 255 {
-				a2 = 255
-			}
-			j := dst.PixOffset(x, y)
-			dst.Pix[j+0] = src.Pix[i+0]
-			dst.Pix[j+1] = src.Pix[i+1]
-			dst.Pix[j+2] = src.Pix[i+2]
-			dst.Pix[j+3] = uint8(a2)
-		}
-	}
-	return dst
-}

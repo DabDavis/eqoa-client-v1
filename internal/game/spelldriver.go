@@ -103,24 +103,27 @@ type SpellEventDriver struct {
 	waitSubType  int32        // Fields[0] of wait event
 	waitDuration int32        // ms: Fields[1] for sub-type 1, Fields[2] for sub-type 3
 
-	// Projectile state (phase 1)
-	// PS2 creates TWO emitters per projectile (activeEvent+0x78 = src, +0x7C = dst).
-	// Both use the same PD DictID. Source tracks flight position, destination tracks target.
-	// PS2 uses frame-based progress accumulation, NOT a timer. Completion is distance-based.
-	projectileActive     bool
-	projectileStart      time.Time
-	projectileFlightMode int32            // (Fields[2]>>8) & 0x0F: 0=linear, 1=arc/spiral, 2=scatter, 3=tracking
-	projectilePDDictID   int32            // PD DictID for projectile trail particles
-	projectileSrcEmitter *ParticleEmitter // source emitter — follows flight path
-	projectileDstEmitter *ParticleEmitter // destination emitter — tracks target position
-	projectilePos        [3]float32       // current projectile position (velocity-integrated)
-	projectileStartPos   [3]float32       // initial position (for PS2 distance-traveled arrival check)
-	projectileVel        [3]float32       // current velocity vector (units/sec)
-	projectileLastTick   time.Time        // last update time for dt computation
-	projectileProgress   float32          // PS2 offset 0x9C: rotation angle (mode 1), arrival state (mode 2)
-	projectileArcHeight  float32          // PS2 offset 0xA0: Y offset for arc (mode 1)
-	projectileInitDist   float32          // initial caster-to-target distance (for speed calc)
-	projectileEvent      *esf.SpellEvent  // source event for field access during flight
+	// Projectile state (phase 1) — the PS2's m_projectile. PlayTargetProjectile
+	// hands it to the TARGET (or area) driver it creates, so that driver's own
+	// events — the impact — wait for the arrival while the caster's carry on.
+	// It flies at a constant Floats[0] units/s toward the target's node 4 and
+	// arrives when it stops closing in within 3 units (ProcessProjectileEvent).
+	projectileActive   bool
+	projectileStart    time.Time
+	projectileEvent    *esf.SpellEvent
+	projectileSource   uint32        // the caster actor it left from
+	projectileMode     int32         // (Fields[2] >> 8) & 0xF: 0 straight, 1 orbit, 2 jitter, 3 lob
+	projectilePos      [3]float32    // m_v14: where it is
+	projectileStartPos [3]float32    // m_v20: where it started
+	projectileA        [2][3]float32 // m_a: the two ends' offsets (two-ended projectiles)
+	projectileB        [2][3]float32 // m_b: jitter endpoints, previous
+	projectileC        [2][3]float32 // m_c: jitter endpoints, next
+	projectileAngle    float32       // m_f9C: orbit angle (mode 1) / jitter phase (mode 2)
+	projectileRadius   float32       // m_fA0: orbit radius (mode 1, one end)
+	projectileEmitters [2]*ParticleEmitter
+	projectileEmitIDs  [2]int32
+	projectileDrawPos  [3]float32 // this frame's lead point, for rendering
+	projectileLastTick time.Time
 
 	// PS2 actionNodeID at +0x34. Return value from SetAttackAction/SetAttackAltAction.
 	// Used by Wait(sub-type 0) to check IsActionComplete for the specific action.
@@ -132,13 +135,14 @@ type SpellEventDriver struct {
 	// Checked by Wait(sub-type 3) via HasTripped.
 	animNodes [4]int // trigger indices (-1 = not set)
 
-	// Lightning state (phase 2)
+	// Lightning state (phase 2) — like the projectile, the PS2 hands it to
+	// the target driver; the bolt runs from lightningSource to this driver's actor.
+	lightningSource  uint32
 	lightningActive  bool
 	lightningStart   time.Time
 	lightningDurMS   int32        // duration from Fields[2] (PS2: event->Fields[2])
 	lightningColor   [3]float32   // RGB from Floats[0-2] (PS2: event->Floats[0-2])
-	lightningFlashed   bool         // true after timer expired (charge flash sent)
-	lightningFlashTime time.Time    // when the flash was triggered (for decay timing)
+	lightningHeld      bool         // within Fields[2] ms: the bolt is held at full charge
 	lightningMaxBranch int32        // max branches from Fields[3] (clamped 0-3)
 	lightningBoneMode  int32        // source bone mode from Fields[1] low byte (0-3)
 
@@ -283,13 +287,9 @@ func (d *SpellEventDriver) processWait(now time.Time) {
 		// Wait for actor action completion.
 		// PS2: if actionNodeID == -1, clear immediately (no action to wait for).
 		// Otherwise: GetActorSpritePtr → check state==5 → IsActionComplete(sprite, actionNodeID).
-		if d.actionNodeID == -1 {
-			d.waitEvent = nil
-		} else if d.effDriver.system != nil && d.effDriver.system.IsActionComplete != nil {
-			if d.effDriver.system.IsActionComplete(d.actorID) {
-				d.waitEvent = nil
-			}
-		} else {
+		sys := d.effDriver.system
+		if d.actorID == 0xFFFFFFFF || d.actionNodeID == -1 || sys == nil || sys.IsActionComplete == nil ||
+			!d.isCSprite() || sys.IsActionComplete(d.actorID, d.actionNodeID) {
 			d.waitEvent = nil
 		}
 
@@ -352,177 +352,173 @@ func (d *SpellEventDriver) processWait(now time.Time) {
 	}
 }
 
-// processProjectile updates active projectile position via velocity integration.
-// PS2 ProcessProjectileEvent at 0x00478FE8: per-frame velocity-based movement.
-// PS2 uses progress accumulation (not timer) and timeScale = min(dist*0.6, 1.0).
-// Flight modes: 0=direct, 1=arc/spiral, 2=scatter, 3=tracking.
-// Completion is distance-based (arrival at target), not timer-based.
+// processProjectile is VISpellEventDriver::ProcessProjectileEvent.
 func (d *SpellEventDriver) processProjectile(now time.Time) {
-	if d.effDriver.resolvePos == nil {
+	ev := d.projectileEvent
+	// The target is gone (NotifyActorWasDestroyed set it to -1): done.
+	if ev == nil || d.actorID == 0xFFFFFFFF || d.effDriver.resolvePos == nil {
+		d.completeProjectile()
 		return
 	}
-
-	// Safety fallback: prevent infinite flight (30s max, well beyond any spell)
+	// Safety net only; the PS2 has none, but a target that vanishes from the
+	// resolver would otherwise hold the driver forever.
 	if now.Sub(d.projectileStart).Seconds() > 30.0 {
 		d.completeProjectile()
 		return
 	}
-
-	// Compute dt since last update
-	dt := float32(now.Sub(d.projectileLastTick).Seconds())
+	dt := d.frameDelta(now, d.projectileLastTick)
 	d.projectileLastTick = now
-	if dt <= 0 || dt > 0.2 {
-		dt = 0.033 // clamp to ~30fps
+
+	tx, ty, tz := d.resolveActorPos(d.actorID, 4) // the target's node 4
+	tgt := [3]float32{tx, ty, tz}
+	pos := d.projectilePos
+	total := vlen(vsub(tgt, d.projectileStartPos))
+	dist := vlen(vsub(pos, tgt))
+
+	// The flight frame: forward toward the target, right and up from it.
+	dv := vsub(tgt, pos)
+	fwd := dv
+	right := vcross([3]float32{0, 1, 0}, fwd)
+	up := vcross(fwd, right)
+	right, up, fwd = vnorm(right), vnorm(up), vnorm(fwd)
+	frame := func(q [3]float32) [3]float32 { // VIMatrix44::Mul, row vectors
+		return [3]float32{
+			q[0]*right[0] + q[1]*up[0] + q[2]*fwd[0] + pos[0],
+			q[0]*right[1] + q[1]*up[1] + q[2]*fwd[1] + pos[1],
+			q[0]*right[2] + q[1]*up[2] + q[2]*fwd[2] + pos[2],
+		}
+	}
+	scale := min(dist*0.6, 1) // eases the ends in from the source; not the speed
+	speed := ev.Floats[0]
+	twoEnds := d.projectileEmitters[1] != nil
+	var p0, p1 [3]float32
+	switch d.projectileMode {
+	case 0:
+		if twoEnds {
+			p0 = frame(vscale(d.projectileA[0], scale))
+			p1 = frame(vscale(d.projectileA[1], scale))
+		} else {
+			p0 = pos
+		}
+	case 1:
+		roll := func(q [3]float32) [3]float32 { // RotateHPR(0, 0, angle)
+			c, sn := float32(math.Cos(float64(d.projectileAngle))), float32(math.Sin(float64(d.projectileAngle)))
+			return [3]float32{q[0]*c - q[1]*sn, q[0]*sn + q[1]*c, q[2]}
+		}
+		angle := d.projectileAngle
+		if twoEnds {
+			p0 = frame(roll(vscale(d.projectileA[0], scale)))
+			p1 = frame(roll(vscale(d.projectileA[1], scale)))
+		} else {
+			d.projectileRadius = min(d.projectileRadius+dt*3, ev.Floats[1])
+			p0 = frame(roll([3]float32{d.projectileRadius * scale, 0, 0}))
+		}
+		d.projectileAngle = angle + ev.Floats[2]*5*dt
+	case 2:
+		jitter := func(base [3]float32) [3]float32 {
+			return [3]float32{
+				(base[0] + virand()*0.2) * ev.Floats[1],
+				(base[1] + virand()*0.2) * ev.Floats[1],
+				(base[2] + virand()*0.05) * ev.Floats[1],
+			}
+		}
+		ends := 1
+		if twoEnds {
+			ends = 2
+		}
+		if d.projectileAngle >= 1 {
+			for i := 0; i < ends; i++ {
+				d.projectileB[i] = d.projectileC[i]
+				base := [3]float32{}
+				if twoEnds {
+					base = d.projectileA[i]
+				}
+				d.projectileC[i] = jitter(base)
+			}
+			d.projectileAngle = 0
+		}
+		lerp := func(i int) [3]float32 {
+			b, c := d.projectileB[i], d.projectileC[i]
+			t := d.projectileAngle
+			return vscale([3]float32{b[0] + (c[0]-b[0])*t, b[1] + (c[1]-b[1])*t, b[2] + (c[2]-b[2])*t}, scale)
+		}
+		p0 = frame(lerp(0))
+		if twoEnds {
+			p1 = frame(lerp(1))
+		}
+		d.projectileAngle += dt * 15
+	case 3:
+		if twoEnds {
+			p0 = frame(vscale(d.projectileA[0], scale))
+			p1 = frame(vscale(d.projectileA[1], scale))
+		} else {
+			p0 = pos
+		}
+		if total > 0 && speed != 0 {
+			h := float32(math.Sin(float64(vlen(vsub(pos, d.projectileStartPos))/total*math.Pi))) /
+				(speed * speed) * total * total
+			p0[1] += h
+			p1[1] += h
+		}
 	}
 
-	// Get current target position (target may be moving)
-	tx, ty, tz := d.effDriver.resolvePos(d.effDriver.targetObjID)
+	facing := float32(math.Atan2(float64(dv[0]), float64(dv[2])))
+	for i, p := range [2][3]float32{p0, p1} {
+		if em := d.projectileEmitters[i]; em != nil {
+			em.SetPosition(p[0], p[1], p[2])
+			em.SetFacing(facing)
+		}
+	}
+	d.projectileDrawPos = p0
 
-	// Distance to target
-	dx := tx - d.projectilePos[0]
-	dy := ty - d.projectilePos[1]
-	dz := tz - d.projectilePos[2]
-	dist := mathutil.Dist3D(tx, ty, tz, d.projectilePos[0], d.projectilePos[1], d.projectilePos[2])
-	if dist < 0.001 {
-		d.projectilePos = [3]float32{tx, ty, tz}
+	step := vscale(vnorm(dv), speed*dt)
+	d.projectilePos = [3]float32{pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]}
+	dist1 := vlen(vsub(d.projectilePos, tgt))
+	if dist <= dist1 && dist1 < 3 {
 		d.completeProjectile()
-		return
-	}
-
-	// PS2 speed comes from event->Floats[0], NOT computed from distance.
-	var speed float32
-	if d.projectileEvent != nil {
-		speed = d.projectileEvent.Floats[0]
-	}
-	if speed <= 0 {
-		speed = 10.0 // fallback if event has no speed
-	}
-
-	// Compute distance traveled from start
-	travelDX := d.projectilePos[0] - d.projectileStartPos[0]
-	travelDY := d.projectilePos[1] - d.projectileStartPos[1]
-	travelDZ := d.projectilePos[2] - d.projectileStartPos[2]
-	distTraveled := float32(math.Sqrt(float64(travelDX*travelDX + travelDY*travelDY + travelDZ*travelDZ)))
-
-	// PS2 timeScale = min(distFromSrc * 0.6, 1.0) — accelerates away from source
-	// NOT distance-to-target (which would decelerate near target)
-	timeScale := distTraveled * 0.6
-	if timeScale > 1.0 {
-		timeScale = 1.0
-	}
-
-	switch d.projectileFlightMode {
-	case 0: // Direct — velocity * timeScale toward target
-		// PS2 arrival: distFromSrc > distToTarget (overshot midpoint) OR distToTarget < 3.0
-		if distTraveled > dist || dist < 3.0 {
-			d.projectilePos = [3]float32{tx, ty, tz}
-			d.completeProjectile()
-			return
-		}
-		d.projectileVel[0] = (dx / dist) * speed * timeScale
-		d.projectileVel[1] = (dy / dist) * speed * timeScale
-		d.projectileVel[2] = (dz / dist) * speed * timeScale
-
-	case 1: // Arc/spiral — rotation angle accumulates, arc height grows
-		// PS2 arrival: distFromSrc > distToTarget (overshot midpoint) OR distToTarget < 3.0
-		if distTraveled > dist || dist < 3.0 {
-			d.projectilePos = [3]float32{tx, ty, tz}
-			d.completeProjectile()
-			return
-		}
-		rotRate := float32(1.0)
-		if d.projectileEvent != nil {
-			rotRate = d.projectileEvent.Floats[2]
-			if rotRate == 0 {
-				rotRate = 1.0
-			}
-		}
-		d.projectileProgress += rotRate * 5.0 * dt
-		d.projectileArcHeight += dt * 3.0
-		// PS2 at 0x004795C0-0x004795DC: clamp arc height at event Floats[1]
-		if d.projectileEvent != nil && d.projectileArcHeight > d.projectileEvent.Floats[1] && d.projectileEvent.Floats[1] > 0 {
-			d.projectileArcHeight = d.projectileEvent.Floats[1]
-		}
-
-		d.projectileVel[0] = (dx / dist) * speed * timeScale
-		d.projectileVel[1] = (dy / dist) * speed * timeScale
-		d.projectileVel[2] = (dz / dist) * speed * timeScale
-
-		// Add arc Y component (parabolic arc that peaks mid-flight)
-		arcY := d.projectileArcHeight * timeScale * float32(math.Sin(float64(d.projectileProgress)))
-		d.projectilePos[1] += arcY * dt
-
-	case 2: // Scatter — settling vibration at target with decay
-		// PS2: maintains prevPos/jitterPos pairs, interpolates by progress,
-		// jitter amplitude decays by Floats[1] each cycle, progress accumulates at dt*15.0.
-		// projectileArcHeight stores current jitter amplitude (initialized to 1.0).
-		if d.projectileProgress >= 1.0 {
-			// Decay jitter amplitude by Floats[1] each cycle
-			decay := d.projectileEvent.Floats[1]
-			if decay <= 0 {
-				decay = 0.5 // fallback if unset
-			}
-			d.projectileArcHeight *= decay
-			// PS2: completes when amplitude drops below threshold
-			if d.projectileArcHeight < 0.01 {
-				d.completeProjectile()
-				return
-			}
-			// Random scatter jitter scaled by current amplitude
-			// PS2: rand() scaled by 0.2 (XZ) and 0.05 (Y)
-			scale := d.projectileArcHeight
-			d.projectilePos[0] = tx + (randFloat()*0.4-0.2)*scale
-			d.projectilePos[1] = ty + (randFloat()*0.1-0.05)*scale
-			d.projectilePos[2] = tz + (randFloat()*0.4-0.2)*scale
-			d.projectileProgress = 0 // PS2 resets to 0 each cycle
-		}
-		d.projectileProgress += dt * 15.0
-		goto updateEmitters
-
-	case 3: // Tracking — velocity toward target with parabolic arc
-		// PS2 arrival: distFromSrc > distToTarget (overshot midpoint) OR distToTarget < 3.0
-		if distTraveled > dist || dist < 3.0 {
-			d.projectilePos = [3]float32{tx, ty, tz}
-			d.completeProjectile()
-			return
-		}
-		d.projectileProgress += dt * 15.0
-		d.projectileVel[0] = (dx / dist) * speed * timeScale
-		d.projectileVel[1] = (dy / dist) * speed * timeScale
-		d.projectileVel[2] = (dz / dist) * speed * timeScale
-		// PS2 parabolic arc: Y offset peaks at midpoint
-		if d.projectileInitDist > 0 && speed > 0 {
-			arcAngle := (dist / d.projectileInitDist) * math.Pi
-			sinArc := float32(math.Sin(float64(arcAngle)))
-			invSpeed := 1.0 / speed
-			arcY := sinArc * invSpeed * invSpeed * d.projectileInitDist * d.projectileInitDist
-			d.projectileVel[1] += arcY * dt
-		}
-	}
-
-	// Integrate position
-	d.projectilePos[0] += d.projectileVel[0] * dt
-	d.projectilePos[1] += d.projectileVel[1] * dt
-	d.projectilePos[2] += d.projectileVel[2] * dt
-
-updateEmitters:
-	// Update source emitter — follows flight path
-	if d.projectileSrcEmitter != nil {
-		d.projectileSrcEmitter.SetPosition(d.projectilePos[0], d.projectilePos[1], d.projectilePos[2])
-	}
-	// Update destination emitter — tracks target position
-	if d.projectileDstEmitter != nil {
-		d.projectileDstEmitter.SetPosition(tx, ty, tz)
 	}
 }
 
-// completeProjectile marks the projectile as done and cleans up emitters.
+// frameDelta is the step a spell motion advances by: the system's
+// VIParticleSystem::DeltaTime, or — with no system, as in a test — the clock
+// difference under the same 0.1 s cap.
+func (d *SpellEventDriver) frameDelta(now, last time.Time) float32 {
+	if sys := d.effDriver.system; sys != nil && sys.deltaTime > 0 {
+		return sys.deltaTime
+	}
+	return min(max(float32(now.Sub(last).Seconds()), 0), 0.1)
+}
+
+// completeProjectile retires the projectile: its emitters stop emitting and
+// drain, as the PS2's move to the inactive list does.
 func (d *SpellEventDriver) completeProjectile() {
 	d.projectileActive = false
-	d.projectileSrcEmitter = nil
-	d.projectileDstEmitter = nil
+	for i, em := range d.projectileEmitters {
+		if em != nil && d.effDriver.particles != nil {
+			d.effDriver.particles.DrainEmitter(d.projectileEmitIDs[i])
+		}
+	}
+	d.projectileEmitters = [2]*ParticleEmitter{}
 	d.projectileEvent = nil
 }
+
+func vsub(a, b [3]float32) [3]float32 { return [3]float32{a[0] - b[0], a[1] - b[1], a[2] - b[2]} }
+func vlen(a [3]float32) float32       { return float32(math.Sqrt(float64(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]))) }
+func vscale(a [3]float32, k float32) [3]float32 {
+	return [3]float32{a[0] * k, a[1] * k, a[2] * k}
+}
+func vcross(a, b [3]float32) [3]float32 {
+	return [3]float32{a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]}
+}
+func vnorm(a [3]float32) [3]float32 {
+	if l := vlen(a); l > 0 {
+		return vscale(a, 1/l)
+	}
+	return a
+}
+
+// virand is the PS2's VIRAND, (rand() - rand()) / 2^31: -1..1.
+func virand() float32 { return rand.Float32() - rand.Float32() }
 
 // processLightning updates active lightning bolt.
 // PS2 ProcessLightningEvent at 0x004789A8: duration from Fields[2] ms.
@@ -530,18 +526,20 @@ func (d *SpellEventDriver) completeProjectile() {
 // charge to decay to 0 via VILightning::Update before removing.
 // Charge starts at 1.0 and decays at ~1.5/sec, so the bolt persists
 // ~0.67s after the flash before fully fading out.
+// VISpellEventDriver::ProcessLightningEvent: while the event is no older than
+// Fields[2] ms the bolt is put back to full charge every frame (SetCharge(1));
+// after that VILightning::Update lets it decay at 5/s, and the event ends once
+// it is past the duration and the charge is spent — 200 ms at most.
 func (d *SpellEventDriver) processLightning(now time.Time) {
 	elapsedMS := now.Sub(d.lightningStart).Milliseconds()
-	if int64(d.lightningDurMS) < elapsedMS {
-		if !d.lightningFlashed {
-			// PS2: SetCharge(1.0) on all bolts for final bright flash
-			d.lightningFlashed = true
-			d.lightningFlashTime = now
-		}
-		// Wait for charge decay (~0.67s at 1.5/sec from charge=1.0)
-		if now.Sub(d.lightningFlashTime).Milliseconds() > 700 {
-			d.lightningActive = false
-		}
+	d.lightningHeld = elapsedMS <= int64(d.lightningDurMS)
+	if d.lightningHeld {
+		return
+	}
+	// A source or target that is gone draws nothing, so nothing is left to decay.
+	if d.actorID == 0xFFFFFFFF || d.lightningSource == 0xFFFFFFFF ||
+		elapsedMS > int64(d.lightningDurMS)+200 {
+		d.lightningActive = false
 	}
 }
 
@@ -704,11 +702,8 @@ func (d *SpellEventDriver) processActive(now time.Time, dt float32) {
 			// PS2: Fields[3] as auto-expire timer (handled by ae.maxLife + expired() check above)
 		case 6: // SetEmitterMotif — PS2 does per-frame interpolation over duration.
 			// We apply the change instantly (no blender), auto-expire via maxLife.
-		case 8: // PlayTargetProjectile emitter variant — PS2 updates per-frame
-			// PS2 ProcessCreateEmitter variant for type 8: updates emitter position/motif
-			// per frame. Currently handled by the projectile state machine (processProjectile),
-			// which updates projectileSrcEmitter/projectileDstEmitter directly.
-			// Active event auto-expires via maxLife.
+		case 8: // PlayTargetProjectile — never an active event: the projectile
+			// lives on the target driver and processProjectile moves its emitters.
 		case 9: // CreateSprite — track per-frame (auto-expires via maxLife)
 			// Sprite stays attached to actor; position resolved at render time.
 		case 11: // CreateSound — PS2 updates position/volume per-frame
@@ -981,117 +976,116 @@ func (d *SpellEventDriver) newSetEmitterAttractor(ev *esf.SpellEvent) {
 	}
 }
 
-// newPlayTargetProjectile creates a projectile from caster to target.
-// PS2 NewPlayTargetProjectile at 0x00476CD8:
-//   Fields[0] bitmask: bit 0 = Target list (1) for targetActorID,
-//                      bit 1 = Area list (2) for secondary targets
-//   Fields[1] = PD DictID for projectile trail particles (negative = skip emitter creation)
-//   Fields[2] bits 8-11 = emitType/flightMode (SAME bits for both bone selection AND flight):
-//     0=center/direct, 1=bone1/arc, 2=midpoint/scatter, 3=both-bones/tracking
-//   Fields[2] low byte (bits 0-7): sub-mode within emitType 1 (3=instant, else random init angle)
-//   PS2: NO duration in ms — flight is frame-based with distance-based arrival.
+// targetDrivers creates the drivers a PlayTarget event asks for — PS2
+// NewPlayTargetProjectile / NewPlayTargetLightning walk i = 0..numSecondary:
+// the Target list for the primary target at i = 0 when Fields[0] bit 0 is set,
+// the Area list for secondary i-1 at every later i when bit 1 is.
+func (d *SpellEventDriver) targetDrivers(flags int32) []*SpellEventDriver {
+	var out []*SpellEventDriver
+	eff := d.effDriver
+	for i := 0; i <= len(eff.secondary); i++ {
+		var nd *SpellEventDriver
+		if i == 0 && flags&1 != 0 {
+			nd = eff.addEventDriver(1, eff.targetObjID)
+		}
+		if i != 0 && flags&2 != 0 {
+			nd = eff.addEventDriver(2, eff.secondary[i-1])
+		}
+		if nd != nil {
+			out = append(out, nd)
+		}
+	}
+	return out
+}
+
+// newPlayTargetProjectile is VISpellEventDriver::NewPlayTargetProjectile: a
+// projectile per target driver, starting at the caster.
+//
+//	Fields[0]  bit 0 = Target list for the target, bit 1 = Area list per secondary
+//	Fields[1]  the trail's particle definition (-1 or 0 = none)
+//	Fields[2]  low byte: where it leaves the caster — node 0, node 1, their
+//	           midpoint, or both (two ends); bits 8-11 the flight mode;
+//	           bit 12 the caster's item projectile as an actor (not drawn here)
+//	Floats[0]  speed; Floats[1] orbit radius / jitter size; Floats[2] orbit rate
 func (d *SpellEventDriver) newPlayTargetProjectile(ev *esf.SpellEvent, now time.Time) {
-	// Create Target/Area event drivers based on Fields[0] bitmask
-	flags := ev.Fields[0]
-	if flags&1 != 0 {
-		d.effDriver.addEventDriver(1, d.effDriver.targetObjID) // Target list for target
+	if d.actorID == 0xFFFFFFFF {
+		return
 	}
-	if flags&2 != 0 {
-		d.effDriver.addEventDriver(2, d.effDriver.targetObjID) // Area list (secondary targets)
-	}
-
-	d.projectileActive = true
-	d.projectileStart = now
-	d.projectileLastTick = now
-	d.projectileFlightMode = (ev.Fields[2] >> 8) & 0x0F
-	d.projectilePDDictID = ev.Fields[1]
-	d.projectileEvent = ev
-	d.projectileArcHeight = 0
-
-	// Initialize progress per flight mode (PS2 at 0x00476FDC-0x00477034)
-	// PS2: flightMode = Fields[2] & 0xFF (low byte, sub-mode within emitType 1)
-	lowByte := ev.Fields[2] & 0xFF
-	switch d.projectileFlightMode {
-	case 0: // Direct — progress not used
-		d.projectileProgress = 0
-	case 1: // Arc/spiral
-		if lowByte == 3 {
-			d.projectileProgress = 0 // "instant" — no initial rotation
-		} else {
-			// PS2: rand() / 5347.0 gives random initial rotation angle (0-6.13 rad)
-			d.projectileProgress = randFloat() * 6.13
-		}
-	case 2: // Scatter — PS2: initialAngle=1.0 (progress), jitterAmplitude=1.0 (ae+0xA0)
-		d.projectileProgress = 1.0
-		d.projectileArcHeight = 1.0 // PS2: jitterAmplitude must start > 0 for visible scatter
-	default: // Mode 3+ — progress not used initially
-		d.projectileProgress = 0
-	}
-
-	// PS2 NewPlayTargetProjectile: emitType = (Fields[2] >> 8) & 0x0F — SAME bits as flightMode.
-	// On PS2, bone selection IS the flight mode value:
-	//   0 = GetActorLocation (entity center, no bone)
-	//   1 = GetNodeTransform(actorID, 1) — bone 1 (right hand / cast point)
-	//   2 = midpoint of bones 0 and 1
-	//   3 = both bones 0 and 1, averaged for srcPos
-	var startPos [3]float32
-	switch d.projectileFlightMode {
-	case 0: // Direct — entity center (no bone)
-		if d.effDriver.resolvePos != nil {
-			sx, sy, sz := d.effDriver.resolvePos(d.effDriver.casterObjID)
-			startPos = [3]float32{sx, sy, sz}
-		}
-	case 1: // Arc/spiral — bone 1 (right hand / cast point)
-		sx, sy, sz := d.resolveActorPos(d.actorID, 1)
-		startPos = [3]float32{sx, sy, sz}
-	case 2: // Scatter — midpoint of bones 0 and 1
-		x0, y0, z0 := d.resolveActorPos(d.actorID, 0)
-		x1, y1, z1 := d.resolveActorPos(d.actorID, 1)
-		startPos = [3]float32{(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2}
-	default: // 3+ (tracking) — both bones 0 and 1, averaged
-		x0, y0, z0 := d.resolveActorPos(d.actorID, 0)
-		x1, y1, z1 := d.resolveActorPos(d.actorID, 1)
-		startPos = [3]float32{(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2}
-	}
-	d.projectilePos = startPos
-	d.projectileStartPos = startPos
-	log.Printf("[SPELL]   projectile start: mode=%d pos=(%.2f,%.2f,%.2f) caster=0x%08X",
-		d.projectileFlightMode, startPos[0], startPos[1], startPos[2], d.effDriver.casterObjID)
-
-	// Compute initial distance for speed calculation
-	d.projectileInitDist = 1.0 // fallback
-	if d.effDriver.resolvePos != nil {
-		tx, ty, tz := d.effDriver.resolvePos(d.effDriver.targetObjID)
-		dx := tx - startPos[0]
-		dy := ty - startPos[1]
-		dz := tz - startPos[2]
-		d.projectileInitDist = float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
-		if d.projectileInitDist < 1.0 {
-			d.projectileInitDist = 1.0
-		}
-	}
-
-	// PS2 creates source emitter always (if PD DictID >= 0).
-	// Destination emitter (activeEvent+0x7C) only created for emitType 3 (both-bones mode).
-	if d.effDriver.particles != nil && ev.Fields[1] >= 0 {
-		var offset [3]float32 // zero offset — PS2 positions from actor transform
-		// Generous emitter lifetime (10s) — projectile manages cleanup via completeProjectile
-		emLife := 10 * time.Second
-
-		// Source emitter at caster position — use unique temp IDs to avoid cross-contamination
-		srcID := d.effDriver.particles.NextTempEmitterID()
-		d.projectileSrcEmitter = d.effDriver.particles.CreateEmitter(srcID, ev.Fields[1], startPos, offset, emLife)
-
-		// PS2: Destination emitter only created for emitType/flightMode 3 (both-bones)
-		if d.projectileFlightMode == 3 {
-			var dstPos [3]float32
-			if d.effDriver.resolvePos != nil {
-				x, y, z := d.effDriver.resolvePos(d.effDriver.targetObjID)
-				dstPos = [3]float32{x, y, z}
+	for _, td := range d.targetDrivers(ev.Fields[0]) {
+		td.projectileActive = true
+		td.projectileStart = now
+		td.projectileLastTick = now
+		td.projectileEvent = ev
+		td.projectileSource = d.actorID
+		td.projectileMode = (ev.Fields[2] >> 8) & 0xF
+		td.projectileAngle, td.projectileRadius = 0, 0
+		td.projectileB, td.projectileC = [2][3]float32{}, [2][3]float32{}
+		switch td.projectileMode {
+		case 1:
+			// rand() is 0..2^31-1 on this build, so this is an angle of up to
+			// ~401,000 rad, and at that size a float32 steps in 1/32s: the
+			// PS2's orbit advances in quantised steps, and so does this.
+			if ev.Fields[2]&0xFF != 3 {
+				td.projectileAngle = float32(rand.Int31()) / 5347
 			}
-			dstID := d.effDriver.particles.NextTempEmitterID()
-			d.projectileDstEmitter = d.effDriver.particles.CreateEmitter(dstID, ev.Fields[1], dstPos, offset, emLife)
+		case 2:
+			td.projectileAngle = 1
 		}
+
+		// The start, off the caster's nodes (GetNodeTransform).
+		n0x, n0y, n0z := d.resolveActorPos(d.actorID, 0)
+		n1x, n1y, n1z := d.resolveActorPos(d.actorID, 1)
+		n0, n1 := [3]float32{n0x, n0y, n0z}, [3]float32{n1x, n1y, n1z}
+		mid := [3]float32{(n0[0] + n1[0]) / 2, (n0[1] + n1[1]) / 2, (n0[2] + n1[2]) / 2}
+		var start [3]float32
+		twoEnds := false
+		switch ev.Fields[2] & 0xFF {
+		case 0:
+			start = n0
+		case 1:
+			start = n1
+		case 2:
+			start = mid
+		case 3:
+			start = mid
+			twoEnds = true
+			// The two ends' offsets from the midpoint, in the caster's own
+			// frame (its transform inverted); in flight they are laid along
+			// the projectile's frame instead.
+			facing := float32(0)
+			if d.effDriver.resolveFacing != nil {
+				facing = d.effDriver.resolveFacing(d.actorID)
+			}
+			c, sn := float32(math.Cos(float64(facing))), float32(math.Sin(float64(facing)))
+			local := func(w [3]float32) [3]float32 {
+				o := vsub(w, mid)
+				return [3]float32{c*o[0] - sn*o[2], o[1], sn*o[0] + c*o[2]}
+			}
+			td.projectileA = [2][3]float32{local(n0), local(n1)}
+			td.projectileC = td.projectileA
+		default:
+			start = mid
+		}
+		td.projectilePos = start
+		td.projectileStartPos = start
+		td.projectileDrawPos = start
+
+		td.projectileEmitters = [2]*ParticleEmitter{}
+		// The file holds a DictID; the PS2 parser resolves it to an index and
+		// turns -1 or 0 into -1, so its `m_id >= 0` means "has a definition".
+		if eff := d.effDriver; eff.particles != nil && ev.Fields[1] != -1 && ev.Fields[1] != 0 {
+			ends := 1
+			if twoEnds {
+				ends = 2
+			}
+			for i := 0; i < ends; i++ {
+				id := eff.particles.NextTempEmitterID()
+				td.projectileEmitIDs[i] = id
+				td.projectileEmitters[i] = eff.particles.CreateEmitter(id, ev.Fields[1], start, [3]float32{}, 60*time.Second)
+			}
+		}
+		log.Printf("[SPELL]   projectile 0x%08X -> 0x%08X: mode=%d from=%d speed=%.1f",
+			d.actorID, td.actorID, td.projectileMode, ev.Fields[2]&0xFF, ev.Floats[0])
 	}
 }
 
@@ -1100,13 +1094,7 @@ func (d *SpellEventDriver) newPlayTargetProjectile(ev *esf.SpellEvent, now time.
 //   bit 0 = create Target list (index 1) driver for targetActorID
 //   bit 1 = create Area list (index 2) driver for each secondary target (we use targetObjID)
 func (d *SpellEventDriver) newPlayTargetInstant(ev *esf.SpellEvent) {
-	flags := ev.Fields[0]
-	if flags&1 != 0 {
-		d.effDriver.addEventDriver(1, d.effDriver.targetObjID) // Target list for target
-	}
-	if flags&2 != 0 {
-		d.effDriver.addEventDriver(2, d.effDriver.targetObjID) // Area list (secondary targets)
-	}
+	d.targetDrivers(ev.Fields[0])
 }
 
 // newCreateSprite creates a sprite active event.
@@ -1200,26 +1188,26 @@ func (d *SpellEventDriver) newCreateSound(ev *esf.SpellEvent, now time.Time) {
 //   Fields[2] = duration in ms
 //   Floats[0-2] = lightning color RGB
 func (d *SpellEventDriver) newPlayTargetLightning(ev *esf.SpellEvent, now time.Time) {
-	// Create Target/Area event drivers based on Fields[0] bitmask
-	// PS2: bit 0 = Target list (1) for targetActorID, bit 1 = Area list (2) for secondary targets
-	flags := ev.Fields[0]
-	if flags&1 != 0 {
-		d.effDriver.addEventDriver(1, d.effDriver.targetObjID) // Target list for target
+	if d.actorID == 0xFFFFFFFF {
+		return
 	}
-	if flags&2 != 0 {
-		d.effDriver.addEventDriver(2, d.effDriver.targetObjID) // Area list (secondary targets)
+	// The bolt belongs to each target driver, from this (the caster's) actor.
+	for _, td := range d.targetDrivers(ev.Fields[0]) {
+		if td.lightningActive {
+			continue
+		}
+		td.lightningSource = d.actorID
+		td.lightningActive = true
+		td.lightningHeld = true
+		td.lightningStart = now
+		td.lightningDurMS = ev.Fields[2]
+		td.lightningColor = [3]float32{ev.Floats[0], ev.Floats[1], ev.Floats[2]}
+		td.lightningMaxBranch = ev.Fields[3]
+		if td.lightningMaxBranch > 3 {
+			td.lightningMaxBranch = 3
+		}
+		td.lightningBoneMode = ev.Fields[1] & 0xFF
 	}
-
-	d.lightningActive = true
-	d.lightningFlashed = false
-	d.lightningStart = now
-	d.lightningDurMS = ev.Fields[2]
-	d.lightningColor = [3]float32{ev.Floats[0], ev.Floats[1], ev.Floats[2]}
-	d.lightningMaxBranch = ev.Fields[3]
-	if d.lightningMaxBranch > 3 {
-		d.lightningMaxBranch = 3
-	}
-	d.lightningBoneMode = ev.Fields[1] & 0xFF
 }
 
 // newFadeSprite starts a sprite opacity fade.
@@ -1290,16 +1278,51 @@ func (d *SpellEventDriver) newDestroyByType(ev *esf.SpellEvent, matchType uint32
 	}
 }
 
+// newSetAction is VISpellEventDriver::NewSetAction: the actor plays action
+// Fields[0] (a CPlayList slot), the handle is kept for Wait 0, and the
+// animation's "Spell FX 1-4" triggers are armed for Wait 3 — which used to
+// wait out its timeout instead, because only PlayAttack armed them.
 func (d *SpellEventDriver) newSetAction(ev *esf.SpellEvent) {
-	// SetAction is a one-shot animation trigger (no ActiveEvent created).
-	// PS2 NewSetAction at 0x00476200: calls VICSprite::SetAction(actor, Fields[0], Floats[0]).
-	// Fields[0] = action type (maps to cast/action animations on PS2).
-	// Only fires if actor's state == 5 (action complete); we skip that check since
-	// we don't track actor action state.
-	actionType := ev.Fields[0]
+	sys := d.effDriver.system
+	if d.actorID == 0xFFFFFFFF || sys == nil {
+		return
+	}
+	if !d.isCSprite() {
+		d.actionNodeID = -1
+		d.animNodes = [4]int{-1, -1, -1, -1}
+		return
+	}
+	d.actionNodeID = -1
+	if sys.OnSetAction != nil {
+		d.actionNodeID = sys.OnSetAction(d.actorID, ev.Fields[0])
+	}
+	d.armSpellFXTriggers()
+}
 
-	if d.effDriver.system != nil && d.effDriver.system.OnSetAction != nil {
-		d.effDriver.system.OnSetAction(d.actorID, actionType)
+// isCSprite is the PS2's `GetActorSpritePtr(m_actor)->m_type == 5`; with
+// no way to ask, every actor counts as one.
+func (d *SpellEventDriver) isCSprite() bool {
+	sys := d.effDriver.system
+	return sys == nil || sys.IsCSprite == nil || sys.IsCSprite(d.actorID)
+}
+
+// armSpellFXTriggers finds the actor's "Spell FX 1".."Spell FX 4" triggers
+// and resets each one found — the tail NewSetAction and NewPlayAttack share.
+func (d *SpellEventDriver) armSpellFXTriggers() {
+	sys := d.effDriver.system
+	triggerNames := [4]string{"Spell FX 1", "Spell FX 2", "Spell FX 3", "Spell FX 4"}
+	for i := 0; i < 4; i++ {
+		d.animNodes[i] = -1
+		if sys.FindTrigger != nil {
+			if idx, ok := sys.FindTrigger(d.actorID, triggerNames[i]); ok {
+				d.animNodes[i] = idx
+			}
+		}
+	}
+	for _, idx := range d.animNodes {
+		if idx != -1 && sys.ResetTrigger != nil {
+			sys.ResetTrigger(d.actorID, idx)
+		}
 	}
 }
 
@@ -1318,15 +1341,19 @@ func (d *SpellEventDriver) newPlayAttack(ev *esf.SpellEvent) {
 	trailID := ev.Fields[1]
 
 	sys := d.effDriver.system
-	if sys == nil {
+	if d.actorID == 0xFFFFFFFF || sys == nil {
+		return
+	}
+	if !d.isCSprite() {
+		d.actionNodeID = -1
+		d.animNodes = [4]int{-1, -1, -1, -1}
 		return
 	}
 
-	// Trigger attack animation.
-	// PS2 stores SetAttackAction return value as actionNodeID for Wait(type 0).
-	if sys.OnPlayAttack != nil {
-		sys.OnPlayAttack(d.actorID, animPair, trailColor, trailID)
-		d.actionNodeID = 0 // 0 = "action set" (vs -1 = "no action")
+	// The attack animation; SetAttackAction's handle is what Wait 0 waits on.
+	// Only types 0-3 set one: the PS2's switch has no default.
+	if sys.OnPlayAttack != nil && animPair >= 0 && animPair <= 3 {
+		d.actionNodeID = sys.OnPlayAttack(d.actorID, animPair, trailColor, trailID)
 	}
 
 	// PS2 SetWeaponTrail: stores trail attachment ID + RGBA color on CSprite.
@@ -1335,21 +1362,8 @@ func (d *SpellEventDriver) newPlayAttack(ev *esf.SpellEvent) {
 		sys.SetWeaponTrail(d.actorID, trailID, trailColor)
 	}
 
-	// PS2: Find and reset "Spell FX 1-4" trigger points on the actor's HSprite.
-	// These triggers fire at animation keyframes. Wait(sub-type 3) checks HasTripped
-	// on these indices to know when the swing animation has reached its impact point.
-	triggerNames := [4]string{"Spell FX 1", "Spell FX 2", "Spell FX 3", "Spell FX 4"}
-	for i := 0; i < 4; i++ {
-		d.animNodes[i] = -1
-		if sys.FindTrigger != nil {
-			if idx, ok := sys.FindTrigger(d.actorID, triggerNames[i]); ok {
-				d.animNodes[i] = idx
-				if sys.ResetTrigger != nil {
-					sys.ResetTrigger(d.actorID, idx)
-				}
-			}
-		}
-	}
+	// The "Spell FX 1-4" triggers: Wait 3 waits for the swing to reach one.
+	d.armSpellFXTriggers()
 }
 
 func (d *SpellEventDriver) newShakeCamera(ev *esf.SpellEvent) {
@@ -1443,6 +1457,9 @@ type SpellEffectDriver struct {
 	resolveFacing FacingResolver // facing angle resolver for emitter direction
 	emitterPDs   []int32         // PD DictIDs of emitters created (for cleanup)
 	system       *SpellEffectSystem // back-reference for camera shake etc.
+	// secondary are the effect's secondary targets (AddSecondaryTarget, at
+	// most 8): the Area list plays on each of them.
+	secondary []uint32
 }
 
 func newSpellEffectDriver(effect *esf.SpellEffect, caster, target uint32, ps *ParticleSystem, resolve PosResolver, resolveBone BoneResolver, resolveFacing FacingResolver, sys *SpellEffectSystem) *SpellEffectDriver {
@@ -1489,16 +1506,15 @@ func (d *SpellEffectDriver) Trigger(durationMS, flags int, startTime time.Time) 
 // PS2: Called by PlayTargetProjectile/Lightning/Instant to create Target event drivers
 // on-demand from the Caster event list's PlayTarget* events.
 // Fields[0] bitmask: bit 0 = create driver for casterObjID, bit 1 = create driver for targetObjID.
-func (d *SpellEffectDriver) addEventDriver(listIndex int, actorID uint32) {
+// The PS2's AddSpellEventDriver creates one even for an empty list: a target
+// driver with no events still carries the projectile or bolt it was made for.
+func (d *SpellEffectDriver) addEventDriver(listIndex int, actorID uint32) *SpellEventDriver {
 	if listIndex < 0 || listIndex > 2 {
-		return
+		return nil
 	}
-	events := d.effect.EventLists[listIndex]
-	if len(events) == 0 {
-		return
-	}
-	ed := newSpellEventDriver(d, events, actorID, listIndex)
+	ed := newSpellEventDriver(d, d.effect.EventLists[listIndex], actorID, listIndex)
 	d.eventDrivers = append(d.eventDrivers, ed)
+	return ed
 }
 
 // trackEmitter records an emitter ID (Fields[0]) for cleanup when this driver finishes.
@@ -1565,6 +1581,12 @@ type SpellEffectSystem struct {
 	lastProcess     time.Time    // tracks time between Process() calls for actual dt
 	ExternalParticles bool       // when true, Process() skips particle Update (visual client handles it)
 
+	// deltaTime is VIParticleSystem::DeltaTime, the step every spell motion
+	// runs on: the frame's clock difference capped at 0.1 s and averaged over
+	// eight frames. A slow frame slows a projectile rather than jumping it.
+	deltaTime float32
+	dtHistory [8]float32
+
 	// Camera shake state (from ShakeCamera event type 17)
 	ShakeStartTime time.Time
 	ShakeDuration  time.Duration
@@ -1576,16 +1598,18 @@ type SpellEffectSystem struct {
 	// PlayAttack callback — visual client sets this to receive animation triggers.
 	// Called with (actorObjID, animPairIndex, trailColor, trailID). One-shot.
 	// PS2 also calls SetWeaponTrail with color from Floats[0-2] and ID from Fields[1].
-	OnPlayAttack func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32)
+	// Returns the action handle SetAttackAction gave, or -1.
+	OnPlayAttack func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32) int
 
 	// SetAction callback — visual client sets this to receive action/cast animation triggers.
 	// PS2 NewSetAction calls VICSprite::SetAction(actor, Fields[0], Floats[0]).
 	// Fields[0] = action type, Floats[0] = parameter (unused by most actions).
-	OnSetAction func(actorObjID uint32, actionType int32)
+	// Returns the action handle SetAction gave, or -1.
+	OnSetAction func(actorObjID uint32, actionType int32) int
 
-	// IsActionComplete callback — PS2 Wait sub-type 0 checks actor animation state.
-	// Returns true when the actor's play-once action animation has finished.
-	IsActionComplete func(actorObjID uint32) bool
+	// IsActionComplete is VICSprite::IsActionComplete(handle) on the actor —
+	// Wait sub-type 0.
+	IsActionComplete func(actorObjID uint32, handle int) bool
 
 	// FindTrigger finds the trigger index for a named trigger on an actor's HSprite.
 	// PS2 FindTrigger at 0x004464E8: linear search trigger array for name hash match.
@@ -1600,9 +1624,9 @@ type SpellEffectSystem struct {
 	// PS2 HasTripped at 0x00446538: returns triggerArray[idx*16+4] != 0.
 	HasTripped func(actorObjID uint32, triggerIdx int) bool
 
-	// IsCSprite returns true if the actor is a CSprite (skeletal model with equipment).
-	// PS2 checks sprite->state == 5. Non-CSprite actors (creatures, SimpleSprites)
-	// skip HasTripped in Wait type 3 and clear immediately.
+	// IsCSprite reports whether the actor's sprite is a VICSprite — the PS2's
+	// `m_type == 5`. Every character model is one, creatures included; for
+	// anything else SetAction/PlayAttack do nothing and Wait 3 clears at once.
 	IsCSprite func(actorObjID uint32) bool
 
 	// SetWeaponTrail callback — visual client sets this to activate weapon swing trails.
@@ -1625,7 +1649,11 @@ func NewSpellEffectSystem(db *SpellFXDB) *SpellEffectSystem {
 // casterObjID/targetObjID = entity ObjectIDs.
 // startTime = when the cast began (zero = now). Allows backdating triggerTime
 // so Wait(sub-type 2) expires relative to actual cast start, not arrival time.
-func (sys *SpellEffectSystem) Play(effectID uint32, castTimeMS uint16, casterObjID, targetObjID uint32, startTime time.Time) {
+//
+// secondary are the effect's secondary targets: the PS2 plays an effect ONCE
+// with up to eight of them (VISpellEffectSystem::Play's AddSecondaryTarget),
+// and its PlayTarget events run the Area list on each.
+func (sys *SpellEffectSystem) Play(effectID uint32, castTimeMS uint16, casterObjID, targetObjID uint32, startTime time.Time, secondary ...uint32) {
 	if sys == nil || sys.db == nil {
 		return
 	}
@@ -1651,6 +1679,12 @@ func (sys *SpellEffectSystem) Play(effectID uint32, castTimeMS uint16, casterObj
 		effectID, castTimeMS, casterObjID, targetObjID)
 
 	driver := newSpellEffectDriver(se, casterObjID, targetObjID, sys.Particles, sys.ResolvePos, sys.ResolveBone, sys.ResolveFacing, sys)
+	for _, a := range secondary {
+		if len(driver.secondary) == 8 {
+			break
+		}
+		driver.secondary = append(driver.secondary, a)
+	}
 	// PS2 Play() at 0x0047BCA8: Trigger(castTime, 10000) — flags hardcoded to 0x2710
 	driver.Trigger(int(castTimeMS), 10000, startTime)
 	sys.drivers = append(sys.drivers, driver)
@@ -1673,6 +1707,17 @@ func (sys *SpellEffectSystem) Process() {
 		}
 	}
 	sys.lastProcess = now
+
+	// VIParticleSystem::Render's delta: min(0.1, step), then the mean of it
+	// and the previous seven.
+	step := min(dt, 0.1)
+	sum := step
+	for _, h := range sys.dtHistory[:7] {
+		sum += h
+	}
+	copy(sys.dtHistory[1:], sys.dtHistory[:7])
+	sys.dtHistory[0] = step
+	sys.deltaTime = sum * 0.125
 
 	for i := len(sys.drivers) - 1; i >= 0; i-- {
 		drv := sys.drivers[i]
@@ -1810,6 +1855,55 @@ func (sys *SpellEffectSystem) StopAll() {
 	log.Printf("[SPELL] StopAll: cleared all active effects")
 }
 
+// NotifyActorWasDestroyed is VISpellEffectSystem::NotifyActorWasDestroyed,
+// called by CLIENT when it releases an entity's actor: every driver forgets
+// the actor, so a projectile flying at it retires at once instead of heading
+// for wherever a missing entity resolves to.
+func (sys *SpellEffectSystem) NotifyActorWasDestroyed(actor uint32) {
+	if sys == nil {
+		return
+	}
+	const gone = 0xFFFFFFFF
+	for _, drv := range sys.drivers {
+		if drv.casterObjID == actor {
+			drv.casterObjID = gone
+		}
+		if drv.targetObjID == actor {
+			drv.targetObjID = gone
+		}
+		for i := range drv.secondary {
+			if drv.secondary[i] == actor {
+				drv.secondary[i] = gone
+			}
+		}
+		for _, ed := range drv.eventDrivers {
+			if ed.actorID == actor {
+				ed.actorID = gone
+			}
+		}
+	}
+}
+
+// StopIfThisWasCaster stops every effect the actor is casting. CLIENT calls
+// it the moment an entity dies, right after VICSprite::SetDeath.
+func (sys *SpellEffectSystem) StopIfThisWasCaster(actor uint32) {
+	if sys == nil {
+		return
+	}
+	kept := sys.drivers[:0]
+	for _, drv := range sys.drivers {
+		if drv.casterObjID == actor {
+			drv.cleanupEmitters()
+			continue
+		}
+		kept = append(kept, drv)
+	}
+	for i := len(kept); i < len(sys.drivers); i++ {
+		sys.drivers[i] = nil
+	}
+	sys.drivers = kept
+}
+
 // ActiveCount returns the number of currently playing effects.
 func (sys *SpellEffectSystem) ActiveCount() int {
 	if sys == nil {
@@ -1866,7 +1960,7 @@ type VisualFX struct {
 	LightningMaxBranch int32 // max branching bolts (0-3, from Fields[3])
 	LightningBoneMode  int32 // source bone mode (0-3, from Fields[1] low byte)
 	LightningDurMS     int32 // duration in ms (from Fields[2])
-	LightningFlashed   bool  // true after charge flash (timer expired)
+	LightningHeld      bool  // within its duration: hold the bolt at full charge
 }
 
 // VisualEffects returns all renderable spell effects for the current frame.
@@ -1882,33 +1976,29 @@ func (sys *SpellEffectSystem) VisualEffects() []VisualFX {
 			// Projectile — position comes from velocity integration in processProjectile
 			if ed.projectileActive {
 				elapsed := float32(now.Sub(ed.projectileStart).Seconds())
-				// Compute progress from distance (0=at caster, 1=at target)
+				// Progress 0 at the start, 1 at the target.
 				var progress float32
-				if ed.projectileInitDist > 0.01 && drv.resolvePos != nil {
-					tx, ty, tz := drv.resolvePos(drv.targetObjID)
-					dx := tx - ed.projectilePos[0]
-					dy := ty - ed.projectilePos[1]
-					dz := tz - ed.projectilePos[2]
-					distToTarget := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
-					progress = mathutil.ClampF(1.0-distToTarget/ed.projectileInitDist, 0, 1)
+				tx, ty, tz := ed.resolveActorPos(ed.actorID, 4)
+				if total := vlen(vsub([3]float32{tx, ty, tz}, ed.projectileStartPos)); total > 0.01 {
+					progress = mathutil.ClampF(1-vlen(vsub([3]float32{tx, ty, tz}, ed.projectilePos))/total, 0, 1)
 				}
 				fx := VisualFX{
 					Type:        VFXProjectile,
-					SourceObjID: drv.casterObjID,
-					TargetObjID: drv.targetObjID,
+					SourceObjID: ed.projectileSource,
+					TargetObjID: ed.actorID,
 					Progress:    progress,
 					Age:         elapsed,
 					MaxAge:      10.0, // generous — projectile completes via distance
 				}
 				// Store current projectile position in Color fields for rendering
-				fx.ColorR = ed.projectilePos[0]
-				fx.ColorG = ed.projectilePos[1]
-				fx.ColorB = ed.projectilePos[2]
+				fx.ColorR = ed.projectileDrawPos[0]
+				fx.ColorG = ed.projectileDrawPos[1]
+				fx.ColorB = ed.projectileDrawPos[2]
 				effects = append(effects, fx)
 			}
 
 			// Lightning
-			if ed.lightningActive {
+			if ed.lightningActive && ed.actorID != 0xFFFFFFFF && ed.lightningSource != 0xFFFFFFFF {
 				durMS := float32(ed.lightningDurMS)
 				if durMS <= 0 {
 					durMS = 1 // avoid division by zero; PS2 expires immediately
@@ -1917,8 +2007,8 @@ func (sys *SpellEffectSystem) VisualEffects() []VisualFX {
 				maxAge := durMS / 1000.0
 				effects = append(effects, VisualFX{
 					Type:               VFXLightning,
-					SourceObjID:        drv.casterObjID,
-					TargetObjID:        drv.targetObjID,
+					SourceObjID:        ed.lightningSource,
+					TargetObjID:        ed.actorID,
 					Progress:           mathutil.ClampF(elapsed/maxAge, 0, 1),
 					Age:                elapsed,
 					MaxAge:             maxAge,
@@ -1928,7 +2018,7 @@ func (sys *SpellEffectSystem) VisualEffects() []VisualFX {
 					LightningMaxBranch: ed.lightningMaxBranch,
 					LightningBoneMode:  ed.lightningBoneMode,
 					LightningDurMS:     ed.lightningDurMS,
-					LightningFlashed:   ed.lightningFlashed,
+					LightningHeld:      ed.lightningHeld,
 				})
 			}
 

@@ -17,7 +17,6 @@ import (
 	"github.com/eqoa/client/internal/sky"
 	"github.com/eqoa/client/internal/terrain"
 	"github.com/eqoa/client/internal/ui"
-	"github.com/DabDavis/eqoa-esf-tools/pkg/esf"
 )
 
 var (
@@ -96,6 +95,7 @@ type Client struct {
 
 	// PS2 VIWalkControl swim state (ported from VIWalkControl::Move at 0x486778)
 	waterState  terrain.WaterState // current water/swim state
+	liquidFlags uint32             // VIWalkPhysics liquid bits (terrain.ProbeLiquid)
 	breathTimer float32            // seconds of breath remaining (60 = full, 0 = drowning)
 
 	// Animation manager (combat, debug cycling, landing)
@@ -350,6 +350,9 @@ type Client struct {
 	// Current world ID — 0=Tunaria (default), changes via MemoryDump/Teleport
 	currentWorld byte
 
+	// --offline mode (offline.go); nil in a normal session.
+	offline *offlineConfig
+
 	// GM teleport auto-reconnect (Sandstorm workaround: disconnect → reconnect → override pos)
 	gmReconnect          bool    // true = skip login, auto-login + auto-select character
 	gmReconnectChar      int     // saved character index to auto-select
@@ -375,7 +378,9 @@ type Client struct {
 
 	// Pre-allocated per-frame entity buffers (avoid allocation every frame)
 	visibleEnts   []*game.Entity             // entities passing frustum cull (reused each frame)
-	pointLightBuf []esf.PointLightPlacement  // point lights buffer (reused each frame)
+	lanternRadius float32 // the personal light's current radius (0..20), grows/shrinks at 2 u/s
+	outdoors      float32 // VIScene::CalcOutdoorsIntensity's eased sun gate below the camera
+	outdoorsInit  bool
 
 	// Equipment preview (inventory menu 3D character model)
 	equipPreviewTex  rl.RenderTexture2D // render target for equipment preview
@@ -406,10 +411,16 @@ func main() {
 	// GOGC=200: trigger at 2x live heap instead of default 1x.
 	debug.SetGCPercent(200)
 
+	// --offline and its options come out first; what is left is positional.
+	offline, args, err := parseOfflineArgs(os.Args[1:])
+	if err != nil {
+		log.Fatalf("arguments: %v", err)
+	}
+
 	// Resolve assets directory: CLI arg > config > ./assets (distro) > ../extracted-assets (dev)
 	assetsDir := ""
-	if len(os.Args) > 1 {
-		assetsDir = os.Args[1]
+	if len(args) > 0 {
+		assetsDir = args[0]
 	}
 	if assetsDir == "" {
 		if cfg := loadLoginConfig(); cfg.AssetsDir != "" {
@@ -432,9 +443,11 @@ func main() {
 		}
 	}
 
-	// Resolve ISO path: config > auto-detect next to binary or in assets dir.
+	// Resolve ISO path: --iso (offline) > config > auto-detect next to binary or in assets dir.
 	isoPath := ""
-	if cfg := loadLoginConfig(); cfg.ISOPath != "" {
+	if offline != nil && offline.iso != "" {
+		isoPath = offline.iso
+	} else if cfg := loadLoginConfig(); cfg.ISOPath != "" {
 		isoPath = cfg.ISOPath
 	}
 	if isoPath == "" {
@@ -575,8 +588,14 @@ func main() {
 		}
 	}
 
-	// Check for updates before showing title/login
-	client.runUpdateCheck()
+	// Check for updates before showing title/login. Offline mode reaches no
+	// server at all, the update server included.
+	client.offline = offline
+	if offline == nil {
+		client.runUpdateCheck()
+	} else {
+		client.titleShown = true
+	}
 
 	// If ISO was provided via the prompt (updater), reload assets.
 	if client.isoPath != isoPath && client.isoPath != "" {
@@ -598,6 +617,9 @@ func main() {
 		// Login screen phase (skipped during GM teleport auto-reconnect)
 		client.engine = nil
 		client.loginWantsExit = false
+		if client.offline != nil {
+			client.engine = client.newOfflineEngine()
+		}
 
 		if client.gmReconnect {
 			// GM teleport auto-reconnect: skip login screen, re-auth silently
@@ -714,7 +736,7 @@ func main() {
 		//   2 → SetAttackAltAction(slot=0) — primary weapon, alt swing
 		//   3 → SetAttackAltAction(slot=1) — secondary weapon, alt swing
 		// PS2 also reads Fields[1]=targetActorID, Floats[0-2]=targetPos for PlayDirectedAttack.
-		engine.SetPlayAttackCallback(func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32) {
+		engine.SetPlayAttackCallback(func(actorObjID uint32, animPair int32, trailColor [3]float32, trailID int32) int {
 			// PS2 NewPlayAttack (0x00476370): Fields[0] selects attack pair.
 			//   0 = SetAttackAction(slot=0)    — primary weapon, primary swing
 			//   1 = SetAttackAction(slot=1)    — secondary weapon, primary swing
@@ -742,38 +764,36 @@ func main() {
 				// but we don't track per-NPC weapon types)
 				animByte = weaponAttackAnims[11][idx]
 			}
-			client.triggerSpellAnim(actorObjID, animByte)
+			handle := client.triggerSpellAnim(actorObjID, animByte)
 
 			// Mark combat active — spell FX PlayAttack means we're in combat.
 			if actorObjID == engine.State.PlayerObjectID {
 				client.animMgr.PlayerCombatActivity()
 			}
+			return handle
 		})
 
 		// SetAction callback — spell effects trigger cast/action animations.
 		// PS2 VICSprite::SetAction at 0x00421770: Fields[0] is a CPlayList slot number
 		// (e.g. 37=spell damage, 38=spell alt, 39=spell buff, 34=hit stun).
-		engine.SetSetActionCallback(func(actorObjID uint32, actionType int32) {
-			client.triggerSpellAnim(actorObjID, byte(actionType))
+		engine.SetSetActionCallback(func(actorObjID uint32, actionType int32) int {
+			return client.triggerSpellAnim(actorObjID, byte(actionType))
 		})
 
-		// IsActionComplete callback — PS2 Wait sub-type 0 checks actor animation state.
-		// Returns true when the actor's play-once action animation has finished.
-		engine.SetIsActionCompleteCallback(func(actorObjID uint32) bool {
+		// IsActionComplete callback — Wait sub-type 0: VICSprite::IsActionComplete
+		// on the handle SetAction/SetAttackAction gave.
+		engine.SetIsActionCompleteCallback(func(actorObjID uint32, handle int) bool {
 			if client.animMgr == nil {
 				return true // no animation system — complete immediately
 			}
+			ctrl := client.animMgr.EntityController(actorObjID)
 			if actorObjID == engine.State.PlayerObjectID {
-				if client.animMgr.PlayerController() != nil {
-					return client.animMgr.PlayerController().IsActionFinished()
-				}
+				ctrl = client.animMgr.PlayerController()
+			}
+			if ctrl == nil {
 				return true
 			}
-			ctrl := client.animMgr.EntityController(actorObjID)
-			if ctrl != nil {
-				return ctrl.IsActionFinished()
-			}
-			return true
+			return ctrl.IsActionComplete(handle)
 		})
 
 		// Trigger callbacks for spell FX Wait(sub-type 3) HasTripped.
@@ -795,8 +815,8 @@ func main() {
 				}
 				return client.modelMgr.HasSpellFXTripped(actorObjID, triggerIdx)
 			},
-			// IsCSprite: check if actor is a humanoid model (CSprite with TSlotList).
-			// PS2 checks sprite->state == 5. Non-CSprite actors clear Wait type 3 immediately.
+			// IsCSprite: the PS2's `m_type == 5` — the actor's model is a
+			// VICSprite, which every character model is, creatures included.
 			func(actorObjID uint32) bool {
 				if client.modelMgr == nil {
 					return false
@@ -811,7 +831,7 @@ func main() {
 				} else if ent, ok := gs.Entities[actorObjID]; ok {
 					modelID = ent.ModelID
 				}
-				return modelID != 0 && client.modelMgr.ModelIsHumanoid(int32(modelID))
+				return modelID != 0 && client.modelMgr.ModelIsCSprite(int32(modelID))
 			},
 			// SetWeaponTrail: activate weapon swing trail on actor.
 			func(actorObjID uint32, trailID int32, color [3]float32) {
@@ -965,7 +985,9 @@ func main() {
 			// the destination). Normal logins just restore the camera.
 			if engine.State.Phase == game.PhaseInWorld && !charSaveLoaded && !client.gmReconnectReady {
 				charSaveLoaded = true
-				startPresence(engine.State.Player.Name)
+				if client.offline == nil {
+					startPresence(engine.State.Player.Name)
+				}
 
 				// Always apply appearance from char select list on world entry.
 				// The char select 0x002C response has authoritative appearance data.
@@ -997,6 +1019,9 @@ func main() {
 					client.camPitch = rp.CamPitch
 					log.Printf("RACECAM: race %d sex %d → dist=%.1f pitch=%.3f",
 						p.Race, p.Sex, client.camDist, client.camPitch)
+				}
+				if client.offline != nil {
+					client.offlineEnterWorld()
 				}
 			}
 
@@ -1092,6 +1117,7 @@ func main() {
 			rl.EndDrawing()
 			// Screenshot after EndDrawing — framebuffer fully composited
 			client.checkScreenshot()
+			client.offlineShotTick()
 		}
 
 		// Revert to windowed 640x480 for login/charselect/title screens.
@@ -1116,6 +1142,9 @@ func main() {
 			client.engine.SendDisconnect()
 			client.engine.State.Conn.Close()
 			client.engine = nil
+		}
+		if client.offline != nil {
+			break
 		}
 	}
 }

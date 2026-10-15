@@ -1,7 +1,6 @@
 package game
 
 import (
-	"image"
 	"log"
 	"math"
 	"runtime"
@@ -268,9 +267,8 @@ func (ss *SpellSpriteSystem) ensureTexture(surf *esf.Surface) rl.Texture2D {
 		return tex
 	}
 
-	// Scale PS2 alpha (0-128 → 0-255)
-	img := scalePS2Alpha(surf.Image)
-	rlImg := rl.NewImageFromImage(img)
+	// Alpha is uploaded unchanged: the palette holds 0..255 already.
+	rlImg := rl.NewImageFromImage(surf.Image)
 	tex := rl.LoadTextureFromImage(rlImg)
 	rl.UnloadImage(rlImg)
 	rl.SetTextureFilter(tex, rl.FilterBilinear)
@@ -278,31 +276,6 @@ func (ss *SpellSpriteSystem) ensureTexture(surf *esf.Surface) rl.Texture2D {
 
 	ss.texCache[surf.DictID] = tex
 	return tex
-}
-
-// scalePS2Alpha converts PS2 alpha (0-128) to standard (0-255).
-func scalePS2Alpha(src *image.NRGBA) *image.NRGBA {
-	bounds := src.Bounds()
-	dst := image.NewNRGBA(bounds)
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			i := src.PixOffset(x, y)
-			r := src.Pix[i+0]
-			g := src.Pix[i+1]
-			b := src.Pix[i+2]
-			a := src.Pix[i+3]
-			a2 := int(a) * 255 / 128
-			if a2 > 255 {
-				a2 = 255
-			}
-			j := dst.PixOffset(x, y)
-			dst.Pix[j+0] = r
-			dst.Pix[j+1] = g
-			dst.Pix[j+2] = b
-			dst.Pix[j+3] = uint8(a2)
-		}
-	}
-	return dst
 }
 
 // spellTriVert holds a single triangle vertex for spell sprite meshes.

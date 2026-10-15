@@ -1,22 +1,21 @@
 package models
 
-import "math/rand"
+import (
+	"math"
+	"math/rand"
+)
 
 // SpriteAnimController manages per-entity animation state with priority-gated
-// replacement, matching the PS2 VICSprite::SetAnimation behavior (0x00422D78).
+// replacement, matching the PS2 VICSprite::SetAnimation behavior (0x00422D78,
+// decomp/src/vicsprite.cpp).
 //
-// PS2 architecture (verified from MIPS disassembly of SetAction at 0x00421770
-// and SetLocomotion at 0x00421AA0): BOTH functions call SetAnimation TWICE for
-// humanoid (skelType==1) — first with pair=0, then pair=1. The unified priority
-// system inside SetAnimation determines which pair(s) accept the animation.
-// For non-humanoid (skelType!=1), a single call with pair=0 is made.
-//
-// This means an attack animation (priority 5) called via SetAction will be
-// accepted on BOTH pairs (since attack priority > locomotion priority 2),
-// producing a full-body attack. Locomotion called via SetLocomotion will be
-// accepted on pair 0 but rejected on pair 1 if a higher-priority action is
-// playing. The VIHSprite per-bone-group blending then uses the channel
-// assignments to control which bones each pair drives.
+// PS2 architecture: SetAction and SetLocomotion both call SetAnimation once
+// per LAYER — layers 0 and 1 for a humanoid (skelType 1), layer 0 alone for
+// any other skeleton. Layer 0 is the upper body and layer 1 the lower, and
+// each has its own priority table: an attack (5) takes the upper layer from a
+// walk (2) but not the lower (walk is 6 there), so a character attacking on
+// the move swings its arms and keeps walking; standing still, the attack
+// takes both layers (idle is 2 on each) and plays full-body.
 //
 // PS2 CPlayList: 66 entries at VICSprite+0x1B8, 52 bytes each.
 // Entry layout (verified from EE memory dump at 0x010DE918):
@@ -40,12 +39,18 @@ import "math/rand"
 //   4=hit stun/emotes, 5=combat, 6=mounted/upper, 7=death(p0), 8=death(p1).
 // PS2 uses slt (signed integer compare) on these values — higher = higher priority.
 
-// AnimPair identifies which animation pair (locomotion or action).
+// AnimPair identifies one of VICSprite's two animation LAYERS. Layer 0 drives
+// the upper body (its animations are each CPlayList entry's m_animation[0],
+// and its triggers the BPU ones), layer 1 the lower body (m_animation[1],
+// BPL). A humanoid plays every request on both layers, each gated by its own
+// priority table, so walking while attacking keeps the walk in the legs (6
+// beats 5 on layer 1) and the swing in the arms (5 beats 2 on layer 0). Any
+// other skeleton uses layer 0 alone (VICSprite::SetAction/SetLocomotion).
 type AnimPair int
 
 const (
-	PairLocomotion AnimPair = 0
-	PairAction     AnimPair = 1
+	LayerUpper AnimPair = 0
+	LayerLower AnimPair = 1
 )
 
 // PairState tracks the current state of one animation pair.
@@ -56,9 +61,9 @@ type PairState struct {
 	Finished bool    // play-once completed (held at last frame)
 }
 
-// SpriteAnimController manages the dual-pair animation state per entity.
+// SpriteAnimController manages the two-layer animation state per entity.
 type SpriteAnimController struct {
-	pairs       [2]PairState
+	pairs       [2]PairState // indexed by layer: LayerUpper, LayerLower
 	isHumanoid  bool
 	idleTimer   float32 // seconds in idle for periodic special idle (PS2: animTimerA)
 	idleTarget  float32 // random target: 20-40s (PS2: GetTime() + 20000 + rand()%20000)
@@ -72,6 +77,13 @@ type SpriteAnimController struct {
 	// blend source should be the action pair's current frame position.
 	// PS2: skelType==1 && pair==0 && pair1_animID==newAnimID → AddInterpolatedPlayWithSync.
 	PairedBlendFromAction bool
+
+	// actionSeq and action are VICSprite's m_actionSeq and m_action: every
+	// SetAction and SetLocomotion takes the next sequence number, and action
+	// is the one whose layer-0 request was last accepted — what
+	// IsActionComplete compares a handle against.
+	actionSeq int
+	action    int
 
 	// TriggerResetPending is set when a new animation is accepted, signaling
 	// that sound/FX triggers should be reset. PS2: FindTrigger×4 + ResetTrigger×4
@@ -87,8 +99,13 @@ func NewSpriteAnimController(isHumanoid bool) *SpriteAnimController {
 			{AnimID: -1},
 		},
 		isHumanoid:  isHumanoid,
+		action:      -1,
 		idleTarget:  randomIdleTarget(),
 		CallerSpeed: 1.0,
+		// m_idleTime starts at 0 and the scene clock runs, so the combat-idle
+		// rule (idle within 5 s of an attack becomes 17) never fires before a
+		// first attack: no battle stance at spawn.
+		combatTimer: math.MaxFloat32,
 	}
 }
 
@@ -105,50 +122,54 @@ func randomIdleTarget() float32 {
 // first with pair=0, then pair=1. The priority system determines acceptance.
 // For non-humanoid: single call with pair=0.
 func (c *SpriteAnimController) SetLocomotion(animID int) {
-	if c.isHumanoid {
-		c.setAnimation(animID, PairLocomotion)
-		c.setAnimation(animID, PairAction)
-	} else {
-		c.setAnimation(animID, PairLocomotion)
-	}
-}
-
-// SetAction sets the action animation.
-// PS2 (0x00421770): for humanoid (skelType==1), calls SetAnimation TWICE —
-// first with pair=0, then pair=1. For non-humanoid: single call with pair=0.
-// Death guard: when dead, PS2's SetAnimation forces animID=14 inside, but
-// we pre-reject non-death anims here as a fast path (same net result).
-func (c *SpriteAnimController) SetAction(animID int) {
-	if c.IsDead {
-		if c.isHumanoid && animID != 14 {
-			return
-		}
-		if !c.isHumanoid && animID != 15 {
-			return
-		}
+	if c.setAnimation(animID, LayerUpper) {
+		c.action = c.actionSeq
 	}
 	if c.isHumanoid {
-		c.setAnimation(animID, PairLocomotion)
-		c.setAnimation(animID, PairAction)
-	} else {
-		c.setAnimation(animID, PairAction)
+		c.setAnimation(animID, LayerLower)
 	}
+	c.actionSeq++
 }
 
-// ClearAction resets pair 1 to empty (no action playing).
-// PS2 dual-call: if pair 0 was set to the same animation from SetAction driving
-// both pairs, clear it too so locomotion can reclaim pair 0.
-//
-// The guard is critical: SetLocomotion ALSO drives both pairs to the same
-// (locomotion) animation. Without the isLocomotionAnim check, clearing the
-// action would wipe the locomotion pair — freezing the legs at idle while the
-// character moves ("walk shows idle / sliding"). Only reclaim pair 0 when it was
-// driven by an actual action animation.
+// SetAction sets an action animation — VICSprite::SetAction (0x00421770),
+// which is SetLocomotion's twin: both layers for a humanoid, layer 0 alone
+// otherwise. When dead, setAnimation turns every request into death (14).
+// It returns the action's handle for IsActionComplete, whether or not the
+// animation was accepted.
+func (c *SpriteAnimController) SetAction(animID int) int {
+	if c.setAnimation(animID, LayerUpper) {
+		c.action = c.actionSeq
+	}
+	if c.isHumanoid {
+		c.setAnimation(animID, LayerLower)
+	}
+	h := c.actionSeq
+	c.actionSeq++
+	return h
+}
+
+// IsActionComplete is VICSprite::IsActionComplete: an action is over once
+// anything later has taken layer 0 (or it never did — a rejected action is
+// complete at once), or when layer 0's play has stopped. An empty layer 0
+// counts as stopped: only ClearAction, which the PS2 lacks, empties one.
+func (c *SpriteAnimController) IsActionComplete(handle int) bool {
+	if c.action != handle {
+		return true
+	}
+	return c.pairs[LayerUpper].AnimID < 0 || c.pairs[LayerUpper].Finished
+}
+
+// ClearAction ends any action still holding a layer, so the next
+// SetLocomotion takes it. The PS2 has no such call — a play-once action
+// simply stops and anything replaces a stopped play — but the combat code
+// uses it to end time-gated actions. Layers playing a locomotion animation
+// are left alone: clearing those froze the legs at idle while moving ("walk
+// shows idle / sliding").
 func (c *SpriteAnimController) ClearAction() {
-	actionAnim := c.pairs[PairAction].AnimID
-	c.pairs[PairAction] = PairState{AnimID: -1}
-	if actionAnim >= 0 && c.pairs[PairLocomotion].AnimID == actionAnim && !isLocomotionAnim(actionAnim) {
-		c.pairs[PairLocomotion] = PairState{AnimID: -1}
+	for i := range c.pairs {
+		if id := c.pairs[i].AnimID; id >= 0 && !isLocomotionAnim(id) {
+			c.pairs[i] = PairState{AnimID: -1}
+		}
 	}
 }
 
@@ -169,8 +190,9 @@ func isLocomotionAnim(animID int) bool {
 // point that both SetLocomotion and SetAction call on both pairs. All animation
 // overrides (combat idle, swim/mounted, death) happen inside this function,
 // matching PS2 exactly. The priority system uses per-pair channel values from
-// the CPlayList to determine acceptance.
-func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) {
+// the CPlayList to determine acceptance. It reports whether the request was
+// accepted, as SetAnimation's return does.
+func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) bool {
 	p := &c.pairs[pair]
 
 	// --- PS2 Phase 1: Special idle override (0x422D88) ---
@@ -179,39 +201,44 @@ func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) {
 	// Functionally equivalent — the timer fires and SetLocomotion(15) is called.
 
 	// --- PS2 Phase 2: Combat idle override (0x422DB8) ---
-	// If animID==0 (idle) and combat timer < 5s → force animID=17 (combat idle).
-	// PS2 also checks GetTime() < 5001 as startup guard (skipped — negligible).
-	if animID == 0 && c.isHumanoid && c.combatTimer < 5.0 {
+	// Idle within 5 s of the last attack becomes 17 (combat idle), for every
+	// skeleton type.
+	if animID == 0 && c.combatTimer < 5.0 {
 		animID = 17
 	}
 
 	// --- PS2 Phase 3a: Swim/mounted combat override (0x422E60) ---
-	// When combat animID (0x16-0x35, not 0x22) and other pair has swim/mounted,
-	// force animID=44 (mounted attack). Prevents standing attack while swimming.
-	if c.isHumanoid && animID >= 0x16 && animID <= 0x35 && animID != 0x22 {
-		otherPair := PairAction
-		if pair == PairAction {
-			otherPair = PairLocomotion
+	// A combat animation (22..53, not 34) while swimming becomes 44, the
+	// swimming attack. A humanoid looks at its LOWER layer's animation, any
+	// other skeleton at layer 0's, and only when setting layer 0.
+	if animID >= 22 && animID <= 53 && animID != 34 {
+		var other int
+		switch {
+		case c.isHumanoid:
+			other = c.pairs[LayerLower].AnimID
+		case pair == LayerUpper:
+			other = c.pairs[LayerUpper].AnimID
+		default:
+			other = -1
 		}
-		otherAnimID := c.pairs[otherPair].AnimID
-		if otherAnimID == 12 || otherAnimID == 13 || otherAnimID == 44 {
+		if other == 12 || other == 13 || other == 44 {
 			animID = 44
 		}
 	}
 
 	// --- PS2 Phase 3b: Death override (0x422EC8) ---
-	// When isDead, force animID=14 unconditionally.
-	if c.IsDead && c.isHumanoid {
+	// When dead, every request is death — slot 14 for every skeleton type.
+	if c.IsDead {
 		animID = 14
 	}
 
 	// --- PS2 Stage 1: Blend-active check (0x422ED8) ---
 	// During active blend (IsBlendComplete==false), compare priorities.
 	// Higher/equal → FreezePlayback + ErasePlay. Lower → reject.
-	if c.blendActive[pair] && c.isHumanoid {
+	if c.blendActive[pair] {
 		newPri := c.getAnimPriorityForPair(animID, pair)
 		if newPri < p.Priority {
-			return
+			return false
 		}
 		c.blendActive[pair] = false
 	}
@@ -219,7 +246,7 @@ func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) {
 	// --- PS2: Same-animID rejection (0x423174) ---
 	// If new == current and playHandle != -1 → return 0 (no change).
 	if p.AnimID == animID {
-		return
+		return false
 	}
 
 	// --- PS2 Stage 2: Priority gating (0x422F9C..0x423068) ---
@@ -231,7 +258,7 @@ func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) {
 		// Still playing: slt priority comparison → reject if strictly lower.
 		newPri := c.getAnimPriorityForPair(animID, pair)
 		if newPri < p.Priority {
-			return
+			return false
 		}
 
 	default:
@@ -243,18 +270,18 @@ func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) {
 	}
 
 	// --- PS2: Paired blend detection (0x00423260) ---
-	// When humanoid pair=0 and pair 1 has same animID: use
-	// AddInterpolatedPlayWithSync for smooth cross-pair blend.
-	if c.isHumanoid && pair == PairLocomotion && c.pairs[PairAction].AnimID == animID {
+	// When humanoid layer 0 takes the animation layer 1 already plays, it
+	// starts in sync with it (AddInterpolatedPlayWithSync).
+	if c.isHumanoid && pair == LayerUpper && c.pairs[LayerLower].AnimID == animID {
 		c.PairedBlendFromAction = true
-	} else if pair == PairLocomotion {
+	} else if pair == LayerUpper {
 		c.PairedBlendFromAction = false
 	}
 
 	// --- PS2: Combat timer update (0x423120) ---
-	// Reset combatIdleTimer for combat anims, EXCLUDING spell-related slots.
+	// m_idleTime = now for combat anims, EXCLUDING spell-related slots.
 	// PS2: (animID 22-43 OR 50-53) AND NOT (31,32,33,35,37,38,39) → reset.
-	if c.isHumanoid && isCombatTimerAnim(animID) {
+	if isCombatTimerAnim(animID) {
 		c.combatTimer = 0
 	}
 
@@ -268,6 +295,7 @@ func (c *SpriteAnimController) setAnimation(animID int, pair AnimPair) {
 	// FindTrigger×4 + ResetTrigger×4 after acceptance. Clears sound/FX
 	// event triggers so they can fire again on the new animation.
 	c.TriggerResetPending = true
+	return true
 }
 
 // isCombatTimerAnim returns true if the animID should reset the combat idle timer.
@@ -284,55 +312,65 @@ func isCombatTimerAnim(animID int) bool {
 	return false
 }
 
-// Resolve returns the current animation IDs for locomotion and action.
-// Returns (locoID, actionID) where actionID is -1 if no action is active.
-func (c *SpriteAnimController) Resolve() (locoID, actionID int) {
-	locoID = c.pairs[PairLocomotion].AnimID
-	if locoID < 0 {
-		locoID = 0 // default to idle
+// Resolve returns the animation each half of the body plays: the upper body
+// layer 0's, the lower body layer 1's (a non-humanoid has only layer 0, which
+// drives both). An empty layer plays idle.
+func (c *SpriteAnimController) Resolve() (upper, lower int) {
+	upper = c.pairs[LayerUpper].AnimID
+	if upper < 0 {
+		upper = 0
 	}
-	actionID = c.pairs[PairAction].AnimID
+	lower = upper
+	if c.isHumanoid {
+		lower = c.pairs[LayerLower].AnimID
+		if lower < 0 {
+			lower = 0
+		}
+	}
 	return
 }
 
-// IsActionFinished returns true if the action pair's play-once animation
-// has completed (held at last frame).
+// IsActionFinished reports whether layer 0's play-once animation has
+// completed — the half of VICSprite::IsActionComplete that tests whether the
+// upper layer's play has stopped.
 func (c *SpriteAnimController) IsActionFinished() bool {
-	return c.pairs[PairAction].Finished
+	return c.pairs[LayerUpper].Finished
 }
 
-// IsActionPlayOnce returns true if the current action animation is play-once.
+// IsActionPlayOnce returns true if layer 0's animation is play-once.
 func (c *SpriteAnimController) IsActionPlayOnce() bool {
-	return c.pairs[PairAction].PlayOnce
+	return c.pairs[LayerUpper].PlayOnce
 }
 
-// IsActionActive returns true if an action animation is playing and not finished.
+// IsActionActive returns true if layer 0 plays an action that has not finished.
 func (c *SpriteAnimController) IsActionActive() bool {
-	return c.pairs[PairAction].AnimID >= 0 && !c.pairs[PairAction].Finished
+	id := c.pairs[LayerUpper].AnimID
+	return id >= 0 && !isLocomotionAnim(id) && !c.pairs[LayerUpper].Finished
 }
 
-// ActionAnimID returns the current action animation ID (-1 if none).
+// ActionAnimID returns layer 0's animation when it is an action (-1 if none):
+// every action reaches layer 0, whose locomotion priorities are the lowest.
 func (c *SpriteAnimController) ActionAnimID() int {
-	return c.pairs[PairAction].AnimID
-}
-
-// LocoAnimID returns the current locomotion animation ID (0 = idle).
-func (c *SpriteAnimController) LocoAnimID() int {
-	id := c.pairs[PairLocomotion].AnimID
-	if id < 0 {
-		return 0
+	if id := c.pairs[LayerUpper].AnimID; id >= 0 && !isLocomotionAnim(id) {
+		return id
 	}
-	return id
+	return -1
 }
 
-// MarkActionFinished is called by applySkeletal when a play-once action
-// animation's time reaches its duration.
-// PS2 dual-call: if pair 0 has the same animation (from SetAction driving
-// both pairs), mark it finished too so locomotion can replace it.
+// LocoAnimID returns the animation the legs play (0 = idle): layer 1 for a
+// humanoid, layer 0 otherwise.
+func (c *SpriteAnimController) LocoAnimID() int {
+	_, lower := c.Resolve()
+	return lower
+}
+
+// MarkActionFinished is called by applySkeletal when the upper body's
+// play-once animation reaches its end: layer 0 has stopped, and layer 1 too
+// when it plays the same animation, so the next SetLocomotion replaces them.
 func (c *SpriteAnimController) MarkActionFinished() {
-	c.pairs[PairAction].Finished = true
-	if c.pairs[PairLocomotion].AnimID == c.pairs[PairAction].AnimID {
-		c.pairs[PairLocomotion].Finished = true
+	c.pairs[LayerUpper].Finished = true
+	if c.pairs[LayerLower].AnimID == c.pairs[LayerUpper].AnimID {
+		c.pairs[LayerLower].Finished = true
 	}
 }
 
@@ -362,16 +400,13 @@ func (c *SpriteAnimController) Update(dt float32) {
 // during idle, triggers special idle animation (CPlayList slot 15 humanoid, F8 ID 6 creature).
 // Timer is recalculated with a new random target after each trigger.
 func (c *SpriteAnimController) UpdateIdleTimer(dt float32, isMoving bool) int {
-	if isMoving || c.pairs[PairAction].AnimID >= 0 {
+	if isMoving || c.ActionAnimID() >= 0 {
 		c.idleTimer = 0
 		return -1
 	}
 	c.idleTimer += dt
 	if c.idleTimer >= c.idleTarget {
-		if c.isHumanoid {
-			return 15 // humanoid special idle (CPlayList slot 15)
-		}
-		return 6 // non-humanoid special idle (F8 ID 6 → CPlayList slot 17 Special)
+		return 15 // special idle: slot 15 for every skeleton (SetAnimation)
 	}
 	return -1
 }
@@ -386,19 +421,14 @@ func (c *SpriteAnimController) ResetIdleTimer() {
 // getAnimPriorityForPair returns the priority for a given animID and pair.
 // PS2 stores per-pair priorities at CPlayList[animID*0x34 + pair*4].
 // These are integer channel indices (0-8) compared via slt.
+// Every CSprite gets the same table (VIESFParse::ParseCSpriteObj calls
+// SetAnimPriorities whatever the skeleton), and a non-humanoid only ever uses
+// layer 0's.
 func (c *SpriteAnimController) getAnimPriorityForPair(animID int, pair AnimPair) float32 {
-	if c.isHumanoid {
-		if pair == PairAction {
-			return humanoidPair1Priority(animID)
-		}
-		return humanoidPriority(animID)
+	if pair == LayerLower {
+		return humanoidPair1Priority(animID)
 	}
-	return nonHumanoidPriority(animID)
-}
-
-// getAnimPriority returns the priority for the given animID using pair 0 (default).
-func (c *SpriteAnimController) getAnimPriority(animID int) float32 {
-	return c.getAnimPriorityForPair(animID, PairLocomotion)
+	return humanoidPriority(animID)
 }
 
 // getPlayOnce returns whether the animation plays once (true) or loops (false).
@@ -526,47 +556,6 @@ func humanoidPlayOnce(animID int) bool {
 // PS2 PlayOnce: Creature attacks/hit/spell are playOnce=0 (loop) on PS2 —
 // the server controls when to stop. Our client uses time-gated play-once
 // for these since entity attacks are controlled by AttackAnimEnd timers.
-
-func nonHumanoidPriority(animID int) float32 {
-	// animID values are CPlayList slots (verified from ESF scan of SkelType 0/2/3).
-	// Creature CPlayList slots: 0,1,2,3,4,5,6,7,10,11,12,13,14,15,17,22,23,30,34,37-39,43,44
-	switch animID {
-	case 0:
-		return 0.0 // Idle
-	case 1:
-		return 0.2 // Walk
-	case 2:
-		return 0.4 // WalkBackward
-	case 3:
-		return 0.4 // Run
-	case 4, 5:
-		return 0.4 // Strafe/StrafeBack
-	case 6:
-		return 0.4 // Turn
-	case 7:
-		return 1.0 // JumpLand
-	case 12, 13:
-		return 0.4 // Swim/SwimFast
-	case 14:
-		return 1.0 // Emote
-	case 15:
-		return 0.6 // Death
-	case 17:
-		return 1.0 // BattleStance/Special
-	case 22, 23:
-		return 0.2 // Attack1/2
-	case 30:
-		return 0.2 // Attack extra
-	case 34:
-		return 0.1 // HitReaction
-	case 37, 38, 39:
-		return 0.4 // SpellCast
-	case 43, 44:
-		return 1.0 // Emote3/4
-	default:
-		return 0.2
-	}
-}
 
 func nonHumanoidPlayOnce(animID int) bool {
 	// PS2 CPlayList PlayOnce values (creature slots):

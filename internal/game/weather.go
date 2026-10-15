@@ -1,17 +1,17 @@
 package game
 
-// Weather particle system — ported from PS2 VIAtmosphere.
+// Weather — a port of the weather half of the PS2's VIAtmosphere
+// (decomp/src/viatmosphere.cpp): SetWeather and ProcessTransitions run the
+// state machine, ProcessWeather moves the 200 camera-relative particles,
+// RenderWeather/RenderSplashes draw them, and ResetLightning/GetLightning run
+// the storm's flash and thunder.
 //
-// PS2 WXTYPE enum (from SetWeather switch table at 0x00BD9F00):
-//   0 = CLEAR, 1 = RAIN, 2 = SNOW, 3 = SLEET, 4 = SANDSTORM,
-//   5 = LAVASTORM, 6 = THUNDERSTORM
-//
-// Wire format: opcodes 0x00C5 (WeatherControl) and 0x00C7 (SkyboxWeather)
-// each send a single byte (0-6). 0xC5 = instant, 0xC7 = fade transition.
-//
-// PS2 ProcessTransitions (0x004198B0): 30-second crossfade.
-// PS2 ProcessWeather (0x00418EE8): position-wrapping particles (no age/lifespan).
-// PS2 GetLightning (0x0041AA58): thunderstorm screen flash + bolt geometry.
+// The weather type is VIAtmosphere::WXTYPE, the byte opcodes 0x00C5 and 0x00C7
+// carry (CLIENT func_00BD9F00 passes 0..6 straight through): 0 clear, 1..3
+// light, medium and heavy rain, 4..6 light, medium and heavy snow. 0xC5 fades
+// over 30 seconds (SetWeather(t, false)); 0xC7 is instant (SetWeather(t, true)).
+// There is no sleet, sandstorm or thunder type: lightning accompanies any rain
+// under a fully overcast sky, and the Lavastorm is a separate per-region effect.
 
 import (
 	"math"
@@ -20,390 +20,508 @@ import (
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
 
-// WeatherType matches PS2 WXTYPE enum.
+// WeatherType is the PS2 WXTYPE.
 type WeatherType int
 
 const (
-	WeatherClear      WeatherType = 0
-	WeatherRain       WeatherType = 1
-	WeatherSnow       WeatherType = 2
-	WeatherSleet      WeatherType = 3
-	WeatherSandstorm  WeatherType = 4
-	WeatherLavastorm  WeatherType = 5
-	WeatherThunder    WeatherType = 6
+	WeatherClear     WeatherType = 0
+	WeatherLightRain WeatherType = 1
+	WeatherRain      WeatherType = 2
+	WeatherHeavyRain WeatherType = 3
+	WeatherLightSnow WeatherType = 4
+	WeatherSnow      WeatherType = 5
+	WeatherHeavySnow WeatherType = 6
 )
 
-// PS2 VIAtmosphere constants (from Init at 0x00416B60).
+// WeatherNames labels each WXTYPE.
+var WeatherNames = [7]string{"Clear", "Light rain", "Rain", "Heavy rain", "Light snow", "Snow", "Heavy snow"}
+
+// weatherLevel is ProcessTransitions' lv[]: the intensity each type settles at.
+var weatherLevel = [7]float32{0, 0.15, 0.5, 1, 0.15, 0.5, 1}
+
+// weatherKind is ProcessTransitions' st[]: 0 none, 1 rain, 2 snow.
+func weatherKind(t WeatherType) int {
+	switch {
+	case t <= WeatherClear:
+		return 0
+	case t >= WeatherLightSnow:
+		return 2
+	}
+	return 1
+}
+
+func (t WeatherType) valid() bool { return t >= WeatherClear && t <= WeatherHeavySnow }
+
+// VIAtmosphere::Init.
 const (
-	weatherMaxParticles = 200    // offset +8 in VIAtmosphere
-	weatherRange        = 40.0   // PS2: 200, scaled for visual density at Go draw distance
-	weatherTransRate    = 1.0 / 30.0 // PS2: 30-second full transition
+	weatherParticles = 200  // m_numParticles
+	weatherRange     = 10.0 // m_range: the box the particles wrap in
+	weatherAhead     = 5.0  // the box is centred on cam + dir*5
+	weatherFadeTime  = 30.0 // ProcessTransitions: m_p608 += dt/30
 )
 
-// weatherParticle — PS2 struct is 36 bytes: pos/vel/groundY/hitGround.
-// PS2 uses position wrapping (no age/lifespan) but we keep age for fade-in.
+// Per-kind particle constants from VIAtmosphere::Init; index 0 is rain, 1 snow.
+var (
+	weatherSize    = [2]float32{0.095, 0.05}                                       // m_p88: billboard half-size
+	weatherSquashW = [2]float32{0, 0}                                              // m_p90
+	weatherSquashH = [2]float32{0.8, 0}                                            // m_p98
+	weatherWobble  = [2][3]float32{{0.0025, 0.008, 0.0025}, {0.0106, 0.01723, 0.0106}} // m_p50
+	weatherFall    = [2]float32{-0.21042, -0.02199}                                // m_p68.y, per 1/60 s
+)
+
+// weatherParticle is VIWeatherParticle: its position is relative to the box
+// centre, groundY (m_p1C) is the world height of the topmost surface beneath
+// it — ground, roof or water — and water (m_p20) says the surface is water.
 type weatherParticle struct {
-	x, y, z    float32 // position relative to camera
-	vx, vy, vz float32 // velocity
-	size       float32 // billboard half-size
-	age        float32 // time since spawn (for fade-in only)
+	x, y, z float32
+	groundY float32
+	water   bool
+	alpha   float32
 }
 
-// weatherSplash — ground contact splash from rain.
-// PS2: 36-byte struct in linked list pool (RenderSplashes at 0x0041B420).
+// weatherSplash is VISplash: one splash billboard stepping through the
+// splash texture's four quadrants.
 type weatherSplash struct {
-	x, y, z    float32 // world position
-	brightness float32 // 0.2-0.6 range
-	frame      int     // 0-3 animation frame (4 = expired)
-	age        float32 // seconds alive
+	x, y, z float32
+	bright  float32
+	frame   int
 }
 
-// WeatherSystem manages weather particle rendering.
-// PS2: VIAtmosphere (0x11A8 bytes).
+// WeatherSystem is the PS2 VIAtmosphere's weather state.
 type WeatherSystem struct {
-	Type       WeatherType
-	TargetType WeatherType
-	Intensity  float32 // 0.0 = off, 1.0 = full (PS2 offset +0x48)
+	Type       WeatherType // m_p5FC: the weather now
+	TargetType WeatherType // m_p600: the weather a transition is heading to
+	pending    WeatherType // m_p604: a request queued while a transition runs
+	t          float32     // m_p608: 0 when idle, else the transition (1 = done)
+	skyNow     int         // m_p5EC: 0 clear sky, 1 overcast
+	skyNext    int         // m_p5F0
+	defaultSky int         // m_p60C: the region's default sky (Init: 1; 2 is overcast)
 
-	// PS2 ProcessTransitions (0x004198B0): transitionProgress 0.0→1.0
-	transitionProgress float32
+	Intensity float32 // m_intensity
+	EffectMix float32 // m_effectMix: 0 all rain .. 1 all snow
 
-	// PS2 overcast interpolation (offset +0x61C, GetOvercastInterp at 0x00418D48).
-	// 0.0 = clear sky, 1.0 = fully overcast. Used by sky dome for:
-	//   - Sky texture crossfade (Sunny→DarkClouds)
-	//   - Sun/corona/moon alpha reduction
-	//   - Star visibility reduction
-	OvercastInterp float32
+	// Read by the sky and the lights each frame.
+	OvercastInterp float32 // GetOvercastInterp
+	NightFactor    float32 // m_p61C: how much of the night sky shows
+	SkyScale       float32 // m_skyScale: sun, corona and moon visibility
+	SunAlpha       uint8   // the alpha ProcessTransitions gives the sun and moon materials
+	CoronaAlpha    uint8   // ... and the corona's, 255-(255-a)*2
 
-	// PS2 effect mix (offset +0x80, SetEffectMix at 0x00418DC0).
-	// Blends between weather types during transitions.
-	EffectMix float32
+	// LightningBrightness is GetLightning's output this frame, 0 when no flash
+	// is in progress. It whitens the sun and lights the sky's flash patches.
+	LightningBrightness float32
 
-	particles []weatherParticle
-	splashes  []weatherSplash // ground splashes (PS2: 200-node linked list pool)
+	// Outdoors is the PS2's m_soundTrack.m_p30 — the baked sun gate below the
+	// camera, eased at 0.2/s (VIScene::CalcOutdoorsIntensity) — set by the caller.
+	Outdoors float32
+
+	// Ground reports the topmost surface at (x, z) — world y, whether it is
+	// water, and whether there is any — for the per-particle ray ProcessWeather
+	// casts from 5000 above to 5000 below. Rain stops at a roof because of it.
+	Ground func(x, z float32) (y float32, water bool, ok bool)
+
+	// Lightning (ResetLightning / GetLightning).
+	cycle     float32 // m_p1198: seconds left in the 8 s cycle
+	flashAt   float32 // m_p119C: when in the cycle the flash starts
+	flashT    float32 // m_p11A0: time into the flash, 0 = none
+	flashDist float32 // m_p11A8: 0.1..0.8, dims the flash and the thunder
+	flashDur  float32 // m_p11A4
+	thunder   []float32
+	rainOn    bool // m_p1190 != -1: the rain voices are started
+
+	particles [weatherParticles]weatherParticle
+	ref       [3]float32 // m_camera: last frame's box centre
+	wobble    [64][3]float32
+	fallVar   [64]float32
+	phase     float32 // m_p84
+	splashes  []weatherSplash
+	splashDt  float32
 	rng       *rand.Rand
 
-	// PS2 VIAtmosphere wind (Update at 0x00418280)
-	windX, windZ float32
-
-	// Previous camera position for camera-relative particle movement (PS2 pattern)
-	prevCamX, prevCamY, prevCamZ float32
-	camInit                      bool
-
-	// Lightning (PS2 GetLightning at 0x0041AA58)
-	lightningTimer      float32 // countdown to next flash
-	lightningProgress   float32 // time into current flash
-	lightningDuration   float32 // how long current flash lasts
-	lightningIntensity  float32 // peak brightness (0.0-1.0)
-	LightningBrightness float32 // current brightness for screen tint (public for render)
-
-	// Indoor suppression — set by caller each frame
-	Indoor bool // true = player is inside a building, suppress particles
-
-	// PS2 VIAtmosphere textures from SKY.ESF
 	rainTex   rl.Texture2D
 	snowTex   rl.Texture2D
 	splashTex rl.Texture2D
-	hasTex    bool
 
-	// PS2 weather sound DictIDs (from SetResources at 0x00417848)
-	RainSoundDictID    int32 // "rain_lt" — looping rain ambient
-	ThunderSoundDictID int32 // "lightning_far02" — thunder crack one-shot
-	rainSoundPlaying   bool  // true when rain loop is active
+	// PS2 weather sounds (SetResources): "rain_lt" and "lightning_far02".
+	RainSoundDictID    int32
+	ThunderSoundDictID int32
+	rainSoundPlaying   bool
 }
 
-// NewWeatherSystem creates a weather system.
+// NewWeatherSystem creates a weather system — VIAtmosphere::Init.
 func NewWeatherSystem() *WeatherSystem {
-	return &WeatherSystem{
-		Type:           WeatherClear,
-		Intensity:      0,
-		particles:      make([]weatherParticle, 0, weatherMaxParticles),
-		splashes:       make([]weatherSplash, 0, weatherMaxParticles),
-		rng:            rand.New(rand.NewSource(42)),
-		lightningTimer: 3.0 + rand.Float32()*5.0,
+	ws := &WeatherSystem{
+		defaultSky:  1,
+		NightFactor: 1,
+		SkyScale:    1,
+		SunAlpha:    255,
+		CoronaAlpha: 255,
+		Outdoors:    1,
+		rng:         rand.New(rand.NewSource(1)),
 	}
+	for i := 0; i < 64; i++ {
+		a := float64(i) * 2 * math.Pi / 64 * 2
+		ws.wobble[i] = [3]float32{float32(math.Sin(a)), float32(math.Cos(a)), float32(math.Cos(a))}
+		ws.fallVar[i] = float32(ws.rng.Intn(256))/255 + 1
+	}
+	for i := range ws.particles {
+		p := &ws.particles[i]
+		p.x = ws.rng.Float32()*weatherRange - weatherRange/2
+		p.y = ws.rng.Float32()*weatherRange - weatherRange/2
+		p.z = ws.rng.Float32()*weatherRange - weatherRange/2
+		p.groundY = -math.MaxFloat32
+		p.alpha = ws.virand()*0.08 + 0.1 // 0.02 .. 0.18
+	}
+	return ws
 }
 
-// SetTextures assigns GPU textures for weather particles.
+// virand is the PS2's VIRAND, (rand() - rand()) / 2^31: -1..1, triangular.
+func (ws *WeatherSystem) virand() float32 {
+	return ws.rng.Float32() - ws.rng.Float32()
+}
+
+// rand255 is ((rand()*131) & 0xFF) / 255.0f: 0..1.
+func (ws *WeatherSystem) rand255() float32 {
+	return float32(ws.rng.Intn(256)) / 255
+}
+
+// SetTextures assigns the rain, snow and splash textures (rain.tga, snow.tga,
+// splash.tga in SKY.ESF).
 func (ws *WeatherSystem) SetTextures(rain, snow, splash rl.Texture2D) {
 	ws.rainTex = rain
 	ws.snowTex = snow
 	ws.splashTex = splash
-	ws.hasTex = rain.ID > 0 || snow.ID > 0 || splash.ID > 0
 }
 
-// SetWeather changes the active weather type.
-// PS2: SetWeather (0x00417F78) — simple stub that sets target state.
-func (ws *WeatherSystem) SetWeather(wt WeatherType, fade bool) {
-	ws.TargetType = wt
-	if !fade {
-		ws.Type = wt
-		if wt == WeatherClear {
-			ws.Intensity = 0
-			ws.particles = ws.particles[:0]
-			ws.splashes = ws.splashes[:0]
-		} else {
-			ws.Intensity = 1.0
-		}
-		ws.transitionProgress = 0
-	}
-}
-
-// weatherConfig holds per-type particle parameters.
-// PS2 color table at 0x4E0740.
-type weatherConfig struct {
-	velY    float32  // downward velocity
-	windMul float32  // wind influence multiplier
-	size    float32  // base particle size (PS2: particleSizeBase 0x088)
-	color   rl.Color // particle tint
-}
-
-func getWeatherConfig(wt WeatherType) weatherConfig {
-	switch wt {
-	case WeatherRain:
-		return weatherConfig{
-			velY: -25.0, windMul: 0.01, size: 0.04,
-			color: rl.Color{R: 180, G: 200, B: 255, A: 100}, // PS2: teal (71,235,174)
-		}
-	case WeatherSnow:
-		return weatherConfig{
-			velY: -1.5, windMul: 0.03, size: 0.06,
-			color: rl.Color{R: 255, G: 255, B: 255, A: 180},
-		}
-	case WeatherSleet:
-		return weatherConfig{
-			velY: -10.0, windMul: 0.02, size: 0.03,
-			color: rl.Color{R: 200, G: 210, B: 240, A: 120},
-		}
-	case WeatherSandstorm:
-		return weatherConfig{
-			velY: -0.5, windMul: 0.10, size: 0.05,
-			color: rl.Color{R: 210, G: 180, B: 120, A: 100}, // PS2: amber (208,166,50)
-		}
-	case WeatherThunder:
-		return weatherConfig{
-			velY: -30.0, windMul: 0.01, size: 0.04,
-			color: rl.Color{R: 160, G: 180, B: 220, A: 110},
-		}
-	default:
-		return weatherConfig{}
-	}
-}
-
-// Update advances the weather simulation by dt seconds.
-// PS2: VIAtmosphere::Update (0x00418280) + ProcessWeather (0x00418EE8) + ProcessTransitions (0x004198B0).
-func (ws *WeatherSystem) Update(dt, gameHour float32, camX, camY, camZ float32) {
-	// PS2 wind: windAngle = gameTime * π/12
-	windAngle := float64(gameHour) * (math.Pi / 12.0)
-	ws.windX = float32(math.Sin(windAngle)) * 35.0
-	ws.windZ = float32(math.Cos(windAngle)) * -35.0
-
-	// Camera delta for position-wrapping (PS2 subtracts camera movement)
-	var camDX, camDY, camDZ float32
-	if ws.camInit {
-		camDX = camX - ws.prevCamX
-		camDY = camY - ws.prevCamY
-		camDZ = camZ - ws.prevCamZ
-	}
-	ws.prevCamX, ws.prevCamY, ws.prevCamZ = camX, camY, camZ
-	ws.camInit = true
-
-	// --- PS2 ProcessTransitions (0x004198B0) ---
-	// Transition speed: deltaTime * (1/30) = 30-second full transition.
-	transitioning := ws.TargetType != ws.Type || (ws.TargetType == WeatherClear && ws.Intensity > 0)
-	if transitioning {
-		ws.transitionProgress += dt * weatherTransRate
-		if ws.transitionProgress >= 1.0 {
-			ws.transitionProgress = 0
-			ws.Type = ws.TargetType
-			if ws.Type == WeatherClear {
-				ws.Intensity = 0
-				ws.particles = ws.particles[:0]
-				ws.splashes = ws.splashes[:0]
-			} else {
-				ws.Intensity = 1.0
-			}
-		} else {
-			if ws.TargetType == WeatherClear {
-				ws.Intensity = 1.0 - ws.transitionProgress
-			} else {
-				ws.Type = ws.TargetType
-				ws.Intensity = ws.transitionProgress
-			}
-		}
-	}
-
-	// --- PS2 GetOvercastInterp (0x00418D48) ---
-	// Determines sky darkening based on current/target weather.
-	isOvercast := func(wt WeatherType) bool {
-		return wt == WeatherRain || wt == WeatherSnow || wt == WeatherSleet ||
-			wt == WeatherThunder || wt == WeatherSandstorm
-	}
-	curOC := isOvercast(ws.Type)
-	tgtOC := isOvercast(ws.TargetType)
-	if !curOC && !tgtOC {
-		ws.OvercastInterp = 0.0 // clear → clear
-	} else if !curOC && tgtOC {
-		ws.OvercastInterp = ws.transitionProgress // clear → overcast
-	} else if curOC && !tgtOC {
-		ws.OvercastInterp = 1.0 - ws.transitionProgress // overcast → clear
-	} else {
-		ws.OvercastInterp = 1.0 // overcast → overcast
-	}
-
-	// --- PS2 effect mix (ProcessTransitions) ---
-	// Controls particle blend between weather types during transition.
-	if !curOC && !tgtOC {
-		ws.EffectMix = 0.0
-	} else if !curOC && tgtOC {
-		ws.EffectMix = 1.0 - ws.transitionProgress
-	} else if curOC && !tgtOC {
-		ws.EffectMix = 1.0
-	} else {
-		ws.EffectMix = 0.5
-	}
-
-	if ws.Type == WeatherClear || ws.Type == WeatherLavastorm {
-		ws.LightningBrightness = 0
+// SetWeather is VIAtmosphere::SetWeather: start a transition to t — instant,
+// or over 30 seconds — or queue it if one is already running.
+func (ws *WeatherSystem) SetWeather(t WeatherType, instant bool) {
+	if !t.valid() {
 		return
 	}
+	if ws.t != 0 {
+		ws.pending = t
+		return
+	}
+	if ws.Type == t {
+		return
+	}
+	if instant {
+		ws.t = 1
+	} else {
+		ws.t = 1e-5
+	}
+	ws.pending = t
+	ws.TargetType = t
+	if t == WeatherClear {
+		ws.skyNext = 0
+		if ws.defaultSky == 2 {
+			ws.skyNext = 1
+		}
+	} else {
+		ws.skyNext = 1
+	}
+}
 
-	cfg := getWeatherConfig(ws.Type)
-	halfRange := float32(weatherRange * 0.5)
+// setIntensity is VIAtmosphere::SetIntensity.
+func (ws *WeatherSystem) setIntensity(f float32) {
+	if f > 0 && ws.Intensity == 0 {
+		ws.splashes = ws.splashes[:0]
+	}
+	ws.Intensity = f
+}
 
-	// --- PS2 ProcessWeather (0x00418EE8): position-wrapping particle update ---
-	activeCount := int(ws.Intensity * weatherMaxParticles)
+// nightFactor is m_p61C outside a transition: 1 at midnight, falling to 0 at
+// 6:00 and rising again from 18:00.
+func nightFactor(hour float32) float32 {
+	switch {
+	case hour < 6:
+		return 1 - hour/6
+	case hour > 18:
+		return (hour - 18) / 6
+	}
+	return 0
+}
 
-	// Ensure we have enough particles (spawn on first need)
-	for len(ws.particles) < activeCount {
-		ws.particles = append(ws.particles, weatherParticle{
-			x:    (ws.rng.Float32()*2 - 1) * weatherRange,
-			y:    ws.rng.Float32() * weatherRange,
-			z:    (ws.rng.Float32()*2 - 1) * weatherRange,
-			vx:   (ws.rng.Float32()*2 - 1) * 0.5,
-			vy:   cfg.velY,
-			vz:   (ws.rng.Float32()*2 - 1) * 0.5,
-			size: cfg.size * (0.7 + ws.rng.Float32()*0.6),
-			age:  0,
-		})
+// resetLightning is VIAtmosphere::ResetLightning: a new 8-second cycle whose
+// flash starts flashDist*6 seconds before its end.
+func (ws *WeatherSystem) resetLightning() {
+	ws.flashDist = ws.rand255()
+	ws.flashDist = min(max(0.1, ws.flashDist), 0.8)
+	ws.cycle = 8
+	ws.flashAt = ws.flashDist * 6
+	ws.flashDur = ws.rand255()*0.6 + 0.6
+}
+
+// overcastInterp is VIAtmosphere::GetOvercastInterp.
+func (ws *WeatherSystem) overcastInterp() float32 {
+	if ws.skyNow == 0 {
+		if ws.skyNext == 0 {
+			return 0
+		}
+		if ws.skyNext == 1 {
+			return ws.t
+		}
+	}
+	if ws.skyNow == 1 && ws.skyNext == 0 {
+		return 1 - ws.t
+	}
+	return 1
+}
+
+// Update advances the weather by dt seconds — VIAtmosphere::Update, which runs
+// ProcessWeather and then ProcessTransitions — and computes this frame's
+// lightning flash (GetLightning, which SetupTimeOfDayLights calls).
+func (ws *WeatherSystem) Update(dt, gameHour float32, camera rl.Camera3D) {
+	ws.processWeather(dt, camera)
+	ws.processTransitions(dt, gameHour)
+	ws.LightningBrightness = ws.getLightning(dt)
+	ws.OvercastInterp = ws.overcastInterp()
+
+	// RenderSplashes steps each splash once per frame of the PS2's 30 Hz loop.
+	ws.splashDt += dt
+	for ws.splashDt >= 1.0/30 {
+		ws.splashDt -= 1.0 / 30
+		alive := ws.splashes[:0]
+		for _, s := range ws.splashes {
+			s.frame++
+			if s.frame < 4 {
+				alive = append(alive, s)
+			}
+		}
+		ws.splashes = alive
+	}
+}
+
+// processTransitions is VIAtmosphere::ProcessTransitions minus the sky-dome
+// material work, which the sky does from t, skyNow and skyNext.
+func (ws *WeatherSystem) processTransitions(dt, hour float32) {
+	if ws.t != 0 {
+		ws.NightFactor = nightFactor(hour)
+		ws.t = min(ws.t+dt/weatherFadeTime, 1)
+
+		var alpha int
+		switch {
+		case ws.skyNow == 0 && ws.skyNext == 1:
+			alpha = 255 - int(ws.t*255)
+			ws.NightFactor *= 1 - ws.t
+		case ws.skyNow == 1 && ws.skyNext == 0:
+			alpha = int(ws.t * 255)
+			ws.NightFactor *= ws.t
+		case ws.skyNow != 0 && ws.skyNext != 0:
+			alpha = 0
+			ws.NightFactor = 0
+		default:
+			alpha = 255
+		}
+		ws.SunAlpha = uint8(alpha)
+		ws.CoronaAlpha = uint8(max(255-(255-alpha)*2, 0))
+		ws.SkyScale = float32(alpha) / 255
+
+		if ws.Type > 0 || ws.TargetType > 0 {
+			from, to := weatherKind(ws.Type), weatherKind(ws.TargetType)
+			switch {
+			case from == 1 && to == 2:
+				ws.EffectMix = ws.t
+			case from == 2 && to == 1:
+				ws.EffectMix = 1 - ws.t
+			case from == 1 && to == 1:
+				ws.EffectMix = 0
+			case from == 2 && to == 2:
+				ws.EffectMix = 1
+			case from == 0:
+				if to == 1 {
+					ws.EffectMix = 0
+				} else {
+					ws.EffectMix = 1
+				}
+			case from == 1:
+				ws.EffectMix = 0
+			default:
+				ws.EffectMix = 1
+			}
+			lf, lt := weatherLevel[ws.Type], weatherLevel[ws.TargetType]
+			ws.setIntensity(lf + (lt-lf)*ws.t)
+			if !ws.rainOn {
+				ws.rainOn = true
+				ws.resetLightning()
+			}
+		} else {
+			ws.setIntensity(0)
+			ws.rainOn = false
+		}
+
+		if ws.t == 1 {
+			ws.skyNow = ws.skyNext
+			ws.Type = ws.TargetType
+			ws.t = 0
+			if ws.pending != ws.Type {
+				ws.SetWeather(ws.pending, false)
+			}
+		}
+	} else if ws.skyNow == 0 {
+		ws.NightFactor = nightFactor(hour)
+		ws.SkyScale = 1
+		ws.SunAlpha, ws.CoronaAlpha = 255, 255
+	} else {
+		ws.NightFactor = 0
+		ws.SkyScale = 0
+		ws.SunAlpha, ws.CoronaAlpha = 0, 0
 	}
 
-	// Update particles (position wrapping, no death)
-	for i := 0; i < len(ws.particles) && i < activeCount; i++ {
+	// Lightning and thunder accompany any rain: an 8-second cycle whose flash
+	// starts flashAt seconds before its end and whose thunder — two voices,
+	// quieter the farther the flash — ends it.
+	if ws.Intensity != 0 && ws.EffectMix < 1 {
+		if ws.cycle < ws.flashAt {
+			ws.flashAt = 0
+			ws.flashT = 1e-5
+		}
+		ws.cycle -= dt
+		if ws.cycle <= 0 {
+			ws.thunder = append(ws.thunder, (1-ws.flashDist)*ws.Intensity*(1-ws.EffectMix)*0.9*ws.Outdoors)
+			ws.resetLightning()
+		}
+	} else if ws.Intensity == 0 {
+		ws.flashT, ws.cycle, ws.flashAt = 0, 0, 0
+	}
+}
+
+// getLightning is VIAtmosphere::GetLightning: the flash brightness this frame,
+// only while the sky is fully overcast. It ramps in over 0.2 s, flickers, and
+// is dimmed by the flash's distance.
+func (ws *WeatherSystem) getLightning(dt float32) float32 {
+	if ws.skyNow != 1 || ws.skyNext != 1 {
+		ws.flashT = 0
+		return 0
+	}
+	t := ws.flashT
+	if t == 0 {
+		return 0
+	}
+	ws.flashT = t + dt
+	var b float32
+	if ws.flashT < 0.2 {
+		b = ws.flashT/0.2 + ws.virand()*0.2
+	} else {
+		b = (ws.flashT-0.2)/(ws.flashDur-0.2) + ws.virand()*0.3
+		if ws.rng.Intn(16) < 2 {
+			b = ws.rand255()*0.2 + 0.8
+		}
+	}
+	if ws.flashT >= ws.flashDur {
+		ws.flashT = 0
+	}
+	c := min(max(0, b), 1)
+	return c * (1 - ws.flashDist) * 0.8
+}
+
+// retrace casts a particle's ray (ProcessWeather: from 5000 above to 5000
+// below) and drops it to a random height between the box top and the surface.
+func (ws *WeatherSystem) retrace(p *weatherParticle) {
+	if ws.Ground == nil {
+		return
+	}
+	y, water, ok := ws.Ground(p.x+ws.ref[0], p.z+ws.ref[2])
+	if !ok {
+		return
+	}
+	p.groundY = y
+	p.water = water
+	half := float32(weatherRange / 2)
+	p.y = y - ws.ref[1]
+	p.y = half + (p.y-half)*ws.rand255()
+}
+
+// processWeather is VIAtmosphere::ProcessWeather.
+func (ws *WeatherSystem) processWeather(dt float32, camera rl.Camera3D) {
+	if ws.Intensity == 0 {
+		return
+	}
+	fwd := rl.Vector3Normalize(rl.Vector3Subtract(camera.Target, camera.Position))
+	c := [3]float32{
+		camera.Position.X + fwd.X*weatherAhead,
+		camera.Position.Y + fwd.Y*weatherAhead,
+		camera.Position.Z + fwd.Z*weatherAhead,
+	}
+	d := [3]float32{c[0] - ws.ref[0], c[1] - ws.ref[1], c[2] - ws.ref[2]}
+	n := int(ws.Intensity * weatherParticles)
+	k := int(float32(n) * ws.EffectMix)
+	ws.ref = c
+	if weatherRange < d[0] || weatherRange < d[1] || weatherRange < d[2] {
+		d = [3]float32{}
+		for i := range ws.particles {
+			ws.retrace(&ws.particles[i])
+		}
+	}
+
+	j := int(ws.phase)
+	ws.phase += dt * 10
+	rate := dt * 60
+	if ws.phase > 64 {
+		ws.phase -= 64
+	}
+	half := float32(weatherRange / 2)
+
+	for i := 0; i < weatherParticles; i, j = i+1, j+29 {
 		p := &ws.particles[i]
-		p.age += dt
-
-		// Move particle
-		p.x += (p.vx + ws.windX*cfg.windMul) * dt
-		p.y += p.vy * dt
-		p.z += (p.vz + ws.windZ*cfg.windMul) * dt
-
-		// Snow wobble
-		if ws.Type == WeatherSnow {
-			p.x += float32(math.Sin(float64(p.age*2.0+p.z))) * 0.3 * dt
-			p.z += float32(math.Cos(float64(p.age*1.7+p.x))) * 0.3 * dt
+		sel := 0
+		if i < k {
+			sel = 1
 		}
+		w := ws.wobble[(j+i)&63]
+		p.x += w[0] * weatherWobble[sel][0] * rate
+		p.y += (w[1]*weatherWobble[sel][1] + weatherFall[sel]*ws.fallVar[i&63]) * rate
+		p.z += w[2] * weatherWobble[sel][2] * rate
 
-		// PS2: subtract camera movement (particles are camera-relative)
-		p.x -= camDX
-		p.y -= camDY
-		p.z -= camDZ
-
-		// PS2: wrap at range boundaries (particles never die)
-		wrapped := false
-		if p.y < -halfRange {
+		p.y -= d[1]
+		if p.y < -half {
 			p.y += weatherRange
-			wrapped = true
-		} else if p.y > halfRange {
+		} else if half <= p.y {
 			p.y -= weatherRange
-			wrapped = true
 		}
-		if p.x < -weatherRange {
-			p.x += weatherRange * 2
+		wrapped := false
+		p.x -= d[0]
+		p.z -= d[2]
+		if p.x < -half {
 			wrapped = true
-		} else if p.x > weatherRange {
-			p.x -= weatherRange * 2
+			p.x += weatherRange
+		} else if half <= p.x {
 			wrapped = true
+			p.x -= weatherRange
 		}
-		if p.z < -weatherRange {
-			p.z += weatherRange * 2
+		if p.z < -half {
 			wrapped = true
-		} else if p.z > weatherRange {
-			p.z -= weatherRange * 2
+			p.z += weatherRange
+		} else if half <= p.z {
 			wrapped = true
+			p.z -= weatherRange
+		}
+		if wrapped {
+			ws.retrace(p)
 		}
 
-		// Ground contact: spawn splash (rain/thunder/sleet only)
-		isRainType := ws.Type == WeatherRain || ws.Type == WeatherThunder || ws.Type == WeatherSleet
-		if isRainType && p.y < -halfRange+0.5 && !wrapped {
-			// Splash at ground contact point
-			if len(ws.splashes) < weatherMaxParticles {
-				ws.splashes = append(ws.splashes, weatherSplash{
-					x: camX + p.x, y: camY + p.y + halfRange, z: camZ + p.z,
-					brightness: 0.28 + ws.rng.Float32()*0.2, // PS2: 0.2825 + rand*0.2
-					frame:      0,
-				})
+		if p.y+ws.ref[1] < p.groundY {
+			if sel == 0 && i < n {
+				ws.addSplash(p.x+ws.ref[0], p.groundY+0.08, p.z+ws.ref[2])
 			}
-		}
-	}
-
-	// Trim excess particles if intensity dropped
-	if len(ws.particles) > activeCount {
-		ws.particles = ws.particles[:activeCount]
-	}
-
-	// --- Update splashes (PS2: 4-frame animation, RenderSplashes at 0x0041B420) ---
-	alive := 0
-	for i := range ws.splashes {
-		s := &ws.splashes[i]
-		s.age += dt
-		// PS2: frame advances each tick, 4 frames total (~0.13s per frame at 30fps)
-		s.frame = int(s.age / 0.13)
-		if s.frame < 4 {
-			ws.splashes[alive] = ws.splashes[i]
-			alive++
-		}
-	}
-	ws.splashes = ws.splashes[:alive]
-
-	// --- PS2 Lightning (GetLightning at 0x0041AA58) ---
-	ws.LightningBrightness = 0
-	if ws.Type == WeatherThunder && ws.Intensity > 0.5 {
-		ws.lightningTimer -= dt
-		if ws.lightningTimer <= 0 {
-			// New flash: PS2 ResetLightning (0x0041A6C8)
-			ws.lightningIntensity = 0.3 + ws.rng.Float32()*0.7
-			ws.lightningDuration = ws.lightningIntensity * (0.6 + ws.rng.Float32()*0.6)
-			ws.lightningProgress = 0
-			ws.lightningTimer = 3.0 + ws.rng.Float32()*8.0 // 3-11 seconds between flashes
-		}
-		if ws.lightningProgress < ws.lightningDuration*1.5 {
-			ws.lightningProgress += dt
-			// PS2: first 0.2s ramp up, then ramp down
-			var brightness float32
-			if ws.lightningProgress < 0.2 {
-				brightness = ws.lightningProgress / 0.2
-			} else {
-				brightness = 1.0 - (ws.lightningProgress-0.2)/(ws.lightningDuration-0.2)
+			if p.water {
+				p.x = ws.rand255()*weatherRange - half
+				p.z = ws.rand255()*weatherRange - half
 			}
-			if brightness < 0 {
-				brightness = 0
-			}
-			// PS2: random flicker
-			flicker := (ws.rng.Float32() - ws.rng.Float32()) * 0.3
-			brightness = brightness*ws.lightningIntensity + flicker
-			if brightness < 0 {
-				brightness = 0
-			}
-			if brightness > 1 {
-				brightness = 1
-			}
-			ws.LightningBrightness = brightness * 0.8 // PS2: * (1-intensity) * 0.8
+			p.y = max(p.groundY-ws.ref[1], half)
 		}
 	}
 }
 
-// weatherTexture returns the appropriate texture for the current weather type.
+// addSplash is VIAtmosphere::AddSplash: up to one per particle.
+func (ws *WeatherSystem) addSplash(x, y, z float32) {
+	if len(ws.splashes) >= weatherParticles {
+		return
+	}
+	ws.splashes = append(ws.splashes, weatherSplash{x: x, y: y, z: z, bright: ws.rand255()*0.2 + 0.282})
+}
+
 // IsRainSoundPlaying returns whether the rain loop is currently active.
 func (ws *WeatherSystem) IsRainSoundPlaying() bool {
 	return ws != nil && ws.rainSoundPlaying
@@ -416,165 +534,122 @@ func (ws *WeatherSystem) SetRainSoundPlaying(playing bool) {
 	}
 }
 
-// WantsRainLoop returns true if the weather system wants a rain ambient loop playing.
+// WantsRainLoop reports whether the rain voices should be playing. The PS2
+// starts them with any weather and holds them at a volume that is zero for
+// pure snow.
 func (ws *WeatherSystem) WantsRainLoop() bool {
-	if ws == nil {
-		return false
-	}
-	return ws.Intensity > 0.1 && (ws.Type == WeatherRain || ws.Type == WeatherThunder || ws.Type == WeatherSleet)
+	return ws.Intensity > 0 && ws.EffectMix < 1
 }
 
-// RainVolume returns the desired rain loop volume (0.0-1.0).
-// PS2: intensity * (1 - effectMix) * masterVolume * constant
+// RainVolume is ProcessTransitions' rain voice volume:
+// intensity * (1 - effect mix) * 0.5 * outdoors.
 func (ws *WeatherSystem) RainVolume() float32 {
-	return ws.Intensity * (1.0 - ws.EffectMix*0.5) * 0.4
+	return ws.Intensity * (1 - ws.EffectMix) * 0.5 * ws.Outdoors
 }
 
-// ThunderTriggered is set to true when a lightning flash starts (caller should clear after playing sound).
-func (ws *WeatherSystem) PopThunder() bool {
-	// Check if a new flash just started (progress near 0)
-	if ws.lightningProgress > 0 && ws.lightningProgress < 0.05 && ws.lightningIntensity > 0.3 {
-		return true
+// PopThunder returns the volume of a thunder clap due this frame, if any. The
+// PS2 plays it as two voices panned hard left and right, the second pitched
+// down (2496/4096).
+func (ws *WeatherSystem) PopThunder() (float32, bool) {
+	if len(ws.thunder) == 0 {
+		return 0, false
 	}
-	return false
+	v := ws.thunder[0]
+	ws.thunder = ws.thunder[1:]
+	return v, true
 }
 
-func (ws *WeatherSystem) weatherTexture() rl.Texture2D {
-	switch ws.Type {
-	case WeatherRain, WeatherSleet, WeatherThunder:
-		return ws.rainTex
-	case WeatherSnow:
-		return ws.snowTex
-	default:
-		return rl.Texture2D{}
-	}
-}
-
-// Render draws all weather particles as billboard quads.
-// PS2: RenderWeather (0x00418700) + RenderSplashes (0x0041B420).
+// Render draws the precipitation and the splashes — VIAtmosphere::
+// RenderWeather and RenderSplashes. Particles are camera-facing billboards in
+// the box around cam + dir*5: the first k = n*effectMix are snow, the rest
+// rain, alpha-blended white at 0.02..0.18 times the texture, with depth test
+// and no depth writes. Rain squashes vertically toward 0.2 of its height as
+// the camera pitches. Splashes are additive and step through the four
+// quadrants of splash.tga.
 func (ws *WeatherSystem) Render(camera rl.Camera3D) {
-	if ws.Type == WeatherClear || len(ws.particles) == 0 || ws.Indoor {
+	if ws.Intensity == 0 {
 		return
 	}
+	n := int(ws.Intensity * weatherParticles)
+	n = min(max(n, 0), weatherParticles)
+	k := int(float32(n) * ws.EffectMix)
 
-	cfg := getWeatherConfig(ws.Type)
-	camRight, camUp := billboardVectors(camera)
-	isRain := ws.Type == WeatherRain || ws.Type == WeatherSleet || ws.Type == WeatherThunder
-	if isRain {
-		camUp = rl.Vector3{X: 0, Y: 1, Z: 0}
-	}
+	fwd := rl.Vector3Normalize(rl.Vector3Subtract(camera.Target, camera.Position))
+	flat := rl.Vector3Normalize(rl.Vector3{X: fwd.X, Z: fwd.Z})
+	aspect := 1 - (fwd.X*flat.X + fwd.Y*flat.Y + fwd.Z*flat.Z)
+	right, up := billboardVectors(camera)
 
 	rl.DisableDepthMask()
-
-	// PS2: weather materials use additive blend mode 3
-	isSnow := ws.Type == WeatherSnow
-	if isSnow {
-		rl.BeginBlendMode(rl.BlendAdditive)
+	rl.BeginBlendMode(rl.BlendAlpha)
+	// The PS2 draws snow first, then rain, each with its own material; in a
+	// mix the squash constants are indexed by the LOOP, not the kind, so snow
+	// takes rain's height squash (RenderWeather's m_p98[i]).
+	if k > 0 && k < n {
+		ws.drawParticles(camera, fwd, right, up, 0, k, ws.snowTex, weatherSize[1], weatherSquashW[0], weatherSquashH[0], aspect)
+		ws.drawParticles(camera, fwd, right, up, k, n, ws.rainTex, weatherSize[0], weatherSquashW[1], weatherSquashH[1], aspect)
 	} else {
-		rl.BeginBlendMode(rl.BlendAlpha)
+		idx := 0
+		tex := ws.rainTex
+		if k > 0 {
+			idx = 1
+			tex = ws.snowTex
+		}
+		ws.drawParticles(camera, fwd, right, up, 0, n, tex, weatherSize[idx], weatherSquashW[idx], weatherSquashH[idx], aspect)
 	}
+	rl.EndBlendMode()
 
-	tex := ws.weatherTexture()
-	useTex := tex.ID > 0
-	if useTex {
-		rl.SetTexture(tex.ID)
-	}
-	rl.Begin(rl.Quads)
-
-	alpha := uint8(float32(cfg.color.A) * ws.Intensity)
-	clr := cfg.color
-
-	activeCount := int(ws.Intensity * weatherMaxParticles)
-	camX, camY, camZ := camera.Position.X, camera.Position.Y, camera.Position.Z
-
-	for i := 0; i < len(ws.particles) && i < activeCount; i++ {
-		p := &ws.particles[i]
-
-		// Fade-in for first 0.3s (prevents pop-in)
-		fade := float32(1.0)
-		if p.age < 0.3 {
-			fade = p.age / 0.3
-		}
-		a := uint8(float32(alpha) * fade)
-		if a == 0 {
-			continue
-		}
-
-		// World position = camera + relative offset
-		wx := camX + p.x
-		wy := camY + p.y
-		wz := camZ + p.z
-
-		size := p.size
-		var rx, ry, rz, ux, uy, uz float32
-		if isRain {
-			rx = camRight.X * size * 0.3
-			ry = camRight.Y * size * 0.3
-			rz = camRight.Z * size * 0.3
-			ux, uy, uz = 0, size*3.0, 0
-		} else {
-			rx = camRight.X * size
-			ry = camRight.Y * size
-			rz = camRight.Z * size
-			ux = camUp.X * size
-			uy = camUp.Y * size
-			uz = camUp.Z * size
-		}
-
-		rl.Color4ub(clr.R, clr.G, clr.B, a)
-		if useTex {
-			rl.TexCoord2f(0, 1)
-		}
-		rl.Vertex3f(wx-rx-ux, wy-ry-uy, wz-rz-uz)
-		if useTex {
-			rl.TexCoord2f(1, 1)
-		}
-		rl.Vertex3f(wx+rx-ux, wy+ry-uy, wz+rz-uz)
-		if useTex {
-			rl.TexCoord2f(1, 0)
-		}
-		rl.Vertex3f(wx+rx+ux, wy+ry+uy, wz+rz+uz)
-		if useTex {
-			rl.TexCoord2f(0, 0)
-		}
-		rl.Vertex3f(wx-rx+ux, wy-ry+uy, wz-rz+uz)
-	}
-
-	rl.End()
-	if useTex {
-		rl.SetTexture(0)
-	}
-
-	// --- Render splashes (PS2: RenderSplashes at 0x0041B420) ---
 	if len(ws.splashes) > 0 && ws.splashTex.ID > 0 {
+		rl.BeginBlendMode(rl.BlendAdditive)
 		rl.SetTexture(ws.splashTex.ID)
 		rl.Begin(rl.Quads)
-
-		splashSize := float32(0.08) // PS2: 0x3DA3D70A
-		for i := range ws.splashes {
-			s := &ws.splashes[i]
-			b := uint8(s.brightness * 255)
+		const s = 0.08
+		for _, sp := range ws.splashes {
+			// Frames (f+1)*4 of the billboard UV table: the quadrants in turn.
+			u0 := float32(sp.frame%2) * 0.5
+			v0 := float32(sp.frame/2) * 0.5
+			b := uint8(sp.bright * 255)
 			rl.Color4ub(b, b, b, b)
-
-			// PS2: 4-frame animated UV
-			u0 := float32(s.frame) * 0.25
-			u1 := u0 + 0.25
-
-			// Ground-facing billboard (Y-up)
-			sx, sy, sz := s.x, s.y+0.08, s.z // PS2: splashOffset = 0.08
-			rl.TexCoord2f(u0, 1)
-			rl.Vertex3f(sx-splashSize, sy, sz-splashSize)
-			rl.TexCoord2f(u1, 1)
-			rl.Vertex3f(sx+splashSize, sy, sz-splashSize)
-			rl.TexCoord2f(u1, 0)
-			rl.Vertex3f(sx+splashSize, sy, sz+splashSize)
-			rl.TexCoord2f(u0, 0)
-			rl.Vertex3f(sx-splashSize, sy, sz+splashSize)
+			billboardQuad(sp.x, sp.y, sp.z, right, up, s, s, u0, v0, u0+0.5, v0+0.5)
 		}
 		rl.End()
 		rl.SetTexture(0)
+		rl.EndBlendMode()
 	}
-
-	rl.EndBlendMode()
 	rl.EnableDepthMask()
+}
+
+func (ws *WeatherSystem) drawParticles(camera rl.Camera3D, fwd, right, up rl.Vector3, first, last int, tex rl.Texture2D, sz, squashW, squashH, aspect float32) {
+	if first >= last || tex.ID == 0 {
+		return
+	}
+	wide := sz - sz*squashW*aspect
+	high := sz - sz*squashH*aspect
+	rl.SetTexture(tex.ID)
+	rl.Begin(rl.Quads)
+	for i := first; i < last; i++ {
+		p := &ws.particles[i]
+		x, y, z := p.x+ws.ref[0], p.y+ws.ref[1], p.z+ws.ref[2]
+		// Within 1.5 units of the camera plane the PS2 draws it at size zero.
+		if (x-camera.Position.X)*fwd.X+(y-camera.Position.Y)*fwd.Y+(z-camera.Position.Z)*fwd.Z < 1.5 {
+			continue
+		}
+		rl.Color4ub(255, 255, 255, uint8(p.alpha*255))
+		billboardQuad(x, y, z, right, up, wide, high, 0, 0, 1, 1)
+	}
+	rl.End()
+	rl.SetTexture(0)
+}
+
+// billboardQuad emits one camera-facing quad of half-extents (w, h).
+func billboardQuad(x, y, z float32, right, up rl.Vector3, w, h, u0, v0, u1, v1 float32) {
+	rx, ry, rz := right.X*w, right.Y*w, right.Z*w
+	ux, uy, uz := up.X*h, up.Y*h, up.Z*h
+	rl.TexCoord2f(u0, v1)
+	rl.Vertex3f(x-rx-ux, y-ry-uy, z-rz-uz)
+	rl.TexCoord2f(u1, v1)
+	rl.Vertex3f(x+rx-ux, y+ry-uy, z+rz-uz)
+	rl.TexCoord2f(u1, v0)
+	rl.Vertex3f(x+rx+ux, y+ry+uy, z+rz+uz)
+	rl.TexCoord2f(u0, v0)
+	rl.Vertex3f(x-rx+ux, y-ry+uy, z-rz+uz)
 }
