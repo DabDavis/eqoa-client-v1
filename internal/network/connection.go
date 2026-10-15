@@ -1535,7 +1535,8 @@ func (c *Connection) SendInitialPacket(gameVersion byte, username string, sessio
 		w.WriteBytes(sessionToken)   // 32-byte session token
 	}
 	authData := authBuf[:w.Position()]
-	log.Printf("Authenticate payload (%d bytes): %X", len(authData), authData)
+	// Not the bytes: they are the account name and the password-derived token.
+	log.Printf("Authenticate payload (%d bytes, token %v)", len(authData), len(sessionToken) == 32)
 	c.QueueReliable(protocol.OpcodeAuthenticate, authData)
 
 	c.Flush()
@@ -1564,7 +1565,7 @@ func (c *Connection) SendGameAuth(gameVersion byte, username string, sessionToke
 		w.WriteBytes(sessionToken)   // 32-byte session token
 	}
 	authData := authBuf[:w.Position()]
-	log.Printf("Authenticate2 payload (%d bytes): %X", len(authData), authData)
+	log.Printf("Authenticate2 payload (%d bytes, token %v)", len(authData), len(sessionToken) == 32)
 	c.QueueReliable(protocol.OpcodeAuthenticate2, authData)
 
 	c.Flush()

@@ -102,8 +102,10 @@ func Login(host string, port int, username, password string) (uint32, []byte, er
 	accountID := binary.BigEndian.Uint32(response[80:84])
 	status := binary.BigEndian.Uint32(response[84:88])
 	log.Printf("Auth response detail: errorFlag=%d, accountID=%d, status=%d", errorFlag, accountID, status)
-	log.Printf("Auth response hex [8:12]=%X [80:88]=%X [96:112]=%X",
-		response[8:12], response[80:88], response[96:112])
+	// [96:112] is the session token, which is not logged: the log goes into
+	// every F3 report (cmd/client/report.go).
+	log.Printf("Auth response hex [8:12]=%X [80:88]=%X",
+		response[8:12], response[80:88])
 
 	result := binary.BigEndian.Uint16(response[84:86])
 
@@ -117,8 +119,8 @@ func Login(host string, port int, username, password string) (uint32, []byte, er
 		}
 	}
 
-	log.Printf("Auth response: accountID=%d, result=0x%04X, sessionToken=%q",
-		accountID, result, string(sessionTokenASCII[:tokenEnd]))
+	log.Printf("Auth response: accountID=%d, result=0x%04X, sessionToken=%d bytes",
+		accountID, result, tokenEnd)
 
 	// Result codes from server: 0x0000 = success, 0x0003 = success (Sandstorm), 0x0008 = success
 	if result != 0x0000 && result != 0x0003 && result != 0x0008 {
@@ -144,7 +146,9 @@ func Login(host string, port int, username, password string) (uint32, []byte, er
 	udpToken := make([]byte, 32)
 	aesBlock.Encrypt(udpToken[0:16], udpPlain[0:16])
 	aesBlock.Encrypt(udpToken[16:32], udpPlain[16:32])
-	log.Printf("Auth: using AES-256-ECB encrypted password as UDP token: %X", udpToken[:16])
+	// Not the token itself: the key is in this file, so the token IS the
+	// password to anybody who reads the log.
+	log.Printf("Auth: using AES-256-ECB encrypted password as UDP token (%d bytes)", len(udpToken))
 
 	return accountID, udpToken, nil
 }
