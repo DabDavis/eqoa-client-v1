@@ -6,3 +6,10 @@ scripts/.deploy-secrets
 # Local login config (holds the dev account password) and a one-off race build.
 client.json
 headless-race
+
+# Build outputs. Releases are built by CI (.github/workflows/release.yml) and
+# published as GitHub release assets, never committed.
+/client
+/headless
+/dist/
+*.db

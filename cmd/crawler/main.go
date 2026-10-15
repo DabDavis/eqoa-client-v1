@@ -62,6 +62,9 @@ type Crawler struct {
 	passes       int             // passes per column (>1 for dense areas)
 }
 
+// accountPass is the game account password, from $EQOA_PASSWORD.
+var accountPass string
+
 func main() {
 	serverIP := flag.String("server", "sandstorm", "Server: 'sandstorm' or IP")
 	charIdx := flag.Int("char", 3, "Character index (1-indexed)")
@@ -79,6 +82,10 @@ func main() {
 	passes := flag.Int("passes", 1, "Passes per column (>1 captures more than 28 entities in dense areas)")
 	flag.Parse()
 
+	if accountPass = os.Getenv("EQOA_PASSWORD"); accountPass == "" {
+		log.Fatal("set EQOA_PASSWORD to the account password")
+	}
+
 	switch strings.ToLower(*serverIP) {
 	case "sandstorm", "eqoa.live":
 		*serverIP = "5.161.217.188"
@@ -95,7 +102,7 @@ func main() {
 	initDB(db)
 
 	// Create engine and connect
-	engine := game.NewEngine(*serverIP, 10070, 9735, 7000, "dab", "REDACTED")
+	engine := game.NewEngine(*serverIP, 10070, 9735, 7000, "dab", accountPass)
 	engine.AutoConnect = true
 
 	stepsX := int((*maxX-*minX) / *stepSize) + 1
@@ -434,7 +441,7 @@ func (c *Crawler) gmTeleportTo(x, y, z float32) {
 	engine := game.NewEngine(
 		c.engine.State.ServerIP, c.engine.State.GamePort,
 		c.engine.State.AuthPort, c.engine.State.PatchPort,
-		c.engine.State.Username, "REDACTED")
+		c.engine.State.Username, accountPass)
 	engine.AutoConnect = true
 	engine.PosOverride = true
 	engine.PosOverrideX = x

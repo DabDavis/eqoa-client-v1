@@ -42,7 +42,7 @@ func main() {
 	authPort := flag.Int("auth-port", 9735, "Auth TCP port")
 	patchPort := flag.Int("patch-port", 7000, "Patch HTTP port")
 	username := flag.String("user", "dab", "Username")
-	password := flag.String("password", "REDACTED", "Password")
+	password := flag.String("password", os.Getenv("EQOA_PASSWORD"), "Password (default $EQOA_PASSWORD)")
 	autoConnect := flag.Bool("auto-connect", true, "Auto-connect to first game server")
 	autoSelect := flag.Int("auto-select", 0, "Auto-select character N (1-indexed, 0=disabled)")
 	assetsDir := flag.String("assets", "", "Assets directory for SPELLFX.CSF/ESF (optional)")

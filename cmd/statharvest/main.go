@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/eqoa/client/internal/game"
@@ -29,7 +30,13 @@ var combos = []combo{
 var rn = []string{"HUM","ELF","DELF","GNO","DWF","TRL","BAR","HLF","ERU","OGR"}
 var cn = []string{"WAR","RAN","PAL","SK","MNK","BRD","RGE","DRD","SHA","CL","MAG","NEC","ENC","WIZ","ALC"}
 
+// accountPass is the game account password, from $EQOA_PASSWORD.
+var accountPass string
+
 func main() {
+	if accountPass = os.Getenv("EQOA_PASSWORD"); accountPass == "" {
+		log.Fatal("set EQOA_PASSWORD to the account password")
+	}
 	db, _ := sql.Open("sqlite3", "/tmp/default_stats.db")
 	defer db.Close()
 	db.Exec(`CREATE TABLE IF NOT EXISTS ds (
@@ -76,7 +83,7 @@ type sr struct {
 
 func harvest(c combo) *sr {
 	// Phase 1: create char
-	e1 := game.NewEngine("5.161.217.188", 10070, 9735, 7000, "dab", "REDACTED")
+	e1 := game.NewEngine("5.161.217.188", 10070, 9735, 7000, "dab", accountPass)
 	e1.AutoConnect = true
 	t1 := time.NewTicker(100*time.Millisecond)
 	d1 := make(chan struct{})
@@ -94,7 +101,7 @@ func harvest(c combo) *sr {
 	time.Sleep(1*time.Second)
 
 	// Phase 2: reconnect and enter world
-	e2 := game.NewEngine("5.161.217.188", 10070, 9735, 7000, "dab", "REDACTED")
+	e2 := game.NewEngine("5.161.217.188", 10070, 9735, 7000, "dab", accountPass)
 	e2.AutoConnect = true
 	t2 := time.NewTicker(100*time.Millisecond)
 	d2 := make(chan struct{})
