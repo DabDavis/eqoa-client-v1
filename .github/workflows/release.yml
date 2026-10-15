@@ -39,7 +39,7 @@ jobs:
         working-directory: go-eqoa-client-v1
     steps:
       - name: Checkout the client
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: go-eqoa-client-v1
           # All history and tags: a stable release's changelog is every
@@ -52,19 +52,19 @@ jobs:
       # go.mod's replace directives name sibling directories, so the two
       # dependencies are checked out beside the client, as on the dev machine.
       - name: Checkout esf-tools
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ env.ESF_TOOLS_REPO }}
           ref: ${{ env.ESF_TOOLS_REF }}
           path: go-eqoa-esf-tools-v1
       - name: Checkout raylib-go
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ env.RAYLIB_GO_REPO }}
           ref: ${{ env.RAYLIB_GO_REF }}
           path: raylib-go
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go-eqoa-client-v1/go.mod
           cache-dependency-path: go-eqoa-client-v1/go.sum
