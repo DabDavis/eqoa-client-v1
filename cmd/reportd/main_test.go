@@ -549,3 +549,99 @@ func TestBoardSurvivesNoDirectory(t *testing.T) {
 	code, page, _ := getPage(s, "")
 	check(t, code == 200 && strings.Contains(page, "No reports to show."), "and its page says so")
 }
+
+// pdghostd's test_crash_reports, case for case, at this port's bounds.
+func TestCrashReports(t *testing.T) {
+	saved := crashMaxFiles
+	crashMaxFiles = 6
+	t.Cleanup(func() { crashMaxFiles = saved })
+	s := newServer(t.TempDir())
+
+	send := func(report, note, ip string) resp {
+		data, _ := json.Marshal(map[string]any{"report": report, "note": note,
+			"version": "abc1234", "platform": "windows/amd64", "channel": "dev"})
+		return do(s, "POST", "/crash", ip, data)
+	}
+	files := func() []string {
+		entries, _ := os.ReadDir(s.crashDir)
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		sort.Strings(names)
+		return names
+	}
+	read := func(id string) string {
+		data, _ := os.ReadFile(filepath.Join(s.crashDir, id+".txt"))
+		return string(data)
+	}
+	clear := func() {
+		for _, n := range files() {
+			os.Remove(filepath.Join(s.crashDir, n))
+		}
+	}
+
+	report := "EQOA client crash report\nversion: abc1234\n\npanic: runtime error: index out of range [5] with length 3\n"
+
+	r := send(report, "freeport, buying a sword", "10.7.0.1")
+	id, _ := r.js["id"].(string)
+	check(t, r.code == 200 && r.js["ok"] == true && reportIDRe.MatchString(id), "a report is taken -> 200")
+	check(t, len(files()) == 1 && files()[0] == id+".txt", "and written under the id it answered")
+	stored := read(id)
+	check(t, strings.Contains(stored, "from: 10.7.0.1\n") && strings.Contains(stored, "version: abc1234\n") &&
+		strings.Contains(stored, "note: freeport, buying a sword\n"),
+		"the server's own header names the address, the build and the note")
+	check(t, strings.Contains(stored, "index out of range"), "and the report itself is underneath it")
+	if info, err := os.Stat(filepath.Join(s.crashDir, id+".txt")); err == nil {
+		check(t, info.Mode().Perm() == 0o600, "readable by its owner only")
+	}
+
+	r = send(report+"\x1b[2J\x07 and a \x00 byte", "", "10.7.0.2")
+	stored = read(r.js["id"].(string))
+	check(t, r.code == 200 && !strings.ContainsAny(stored, "\x1b\x00\x07"), "control characters are taken out")
+	check(t, strings.Contains(stored, "and a  byte"), "and the text around them is kept")
+
+	r = send("too short", "", "10.7.0.3")
+	check(t, r.code == 400 && r.js["error"] == "empty report", "something too short to be a crash -> 400")
+	data, _ := json.Marshal(map[string]any{"report": 12345})
+	check(t, do(s, "POST", "/crash", "10.7.0.3", data).code == 400, "a report that is not a string -> 400")
+	check(t, do(s, "POST", "/crash", "10.7.0.3", []byte("not json")).code == 400, "a body that is not JSON -> 400")
+
+	r = send(strings.Repeat("x", crashMaxText+50000), strings.Repeat("n", 500), "10.7.0.4")
+	stored = read(r.js["id"].(string))
+	check(t, r.code == 200 && strings.Contains(stored, strings.Repeat("x", crashMaxText)) &&
+		!strings.Contains(stored, strings.Repeat("x", crashMaxText+1)), "an enormous report is cut to the cap")
+	check(t, strings.Contains(stored, "note: "+strings.Repeat("n", crashMaxNote)+"\n"), "and an enormous note to its own")
+
+	r = send(report, "two\nlines", "10.7.0.4")
+	stored = read(r.js["id"].(string))
+	check(t, strings.Contains(stored, "note: two lines\n"), "a note is one header line")
+
+	check(t, do(s, "GET", "/crash", "10.7.0.5", nil).code == 404, "there is no way to read one back out")
+	check(t, do(s, "GET", "/board/shot/"+id+".png", "10.7.0.5", nil).code == 404, "nor through the board")
+
+	seen := map[int]bool{}
+	for i := 0; i < 8; i++ {
+		seen[send(report, "", "10.7.0.9").code] = true
+	}
+	check(t, seen[507], "a full crash directory refuses rather than filling the disk")
+	check(t, len(files()) == crashMaxFiles, "and stops at the cap")
+	clear()
+
+	taken := 0
+	for i := 0; i < crashMax; i++ {
+		if send(report, "", "10.7.1.1").code == 200 {
+			taken++
+		}
+		clear()
+	}
+	check(t, taken == crashMax, "twelve reports in an hour from one address are taken")
+	r = send(report, "", "10.7.1.1")
+	check(t, r.code == 429 && strings.Contains(fmt.Sprint(r.js["error"]), "too many"),
+		"the thirteenth from one address in an hour -> 429")
+	check(t, send(report, "", "10.7.1.2").code == 200, "and another address is unaffected")
+
+	// The two limiters are apart: crashes do not spend an address's problem reports.
+	check(t, sendReport(s, testDump, "", nil, "10.7.1.1", nil).code == 200,
+		"an address out of crash reports can still file a problem report")
+}

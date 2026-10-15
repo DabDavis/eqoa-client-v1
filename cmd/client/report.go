@@ -82,6 +82,20 @@ const (
 	reportFieldName
 )
 
+// What the dialog is for. A crash report has no name and no picture, and is
+// sent to /crash, which nothing reads back (crash.go).
+const (
+	reportKindProblem     = iota // F3
+	reportKindCrashOffer         // what earlier runs left, offered on the login screen
+	reportKindCrashScreen        // the crash that just happened; the client exits after
+)
+
+const (
+	reportActSend = iota
+	reportActClose
+	reportActDelete
+)
+
 // reportCapture is one F3: the dump at once, and the picture once the
 // goroutine that encodes it closes ready. Nothing in it changes after that,
 // so the send goroutine and the dialog read it without a lock.
@@ -100,13 +114,17 @@ type reportResult struct {
 }
 
 type reportDialog struct {
-	open     bool
-	cap      *reportCapture
-	note     string
-	name     string // the kept name, as client.json has it
-	nameEdit string // the name field while it is being typed
-	field    int
-	padUsed  bool
+	open      bool
+	kind      int
+	cap       *reportCapture // a problem report's capture
+	crashes   []string       // a crash report's files, sent and deleted together
+	crashWhen time.Time      // when the (newest) crash happened
+	crashErr  string         // the crash screen's panic
+	note      string
+	name      string // the kept name, as client.json has it
+	nameEdit  string // the name field while it is being typed
+	field     int
+	padUsed   bool
 
 	// This frame's typed characters, taken at the top of the frame so that
 	// no text box drawn under the dialog sees them.
@@ -372,21 +390,21 @@ func (c *Client) reportInput() {
 		switch {
 		case lay.note.contains(mx, my):
 			c.reportSetField(reportFieldNote)
-		case lay.name.contains(mx, my):
+		case r.kind == reportKindProblem && lay.name.contains(mx, my):
 			c.reportSetField(reportFieldName)
-		case lay.send.contains(mx, my):
-			c.reportStartSend()
-			return
-		case lay.close.contains(mx, my):
-			c.reportClose()
-			return
+		}
+		for _, b := range lay.buttons {
+			if b.box.contains(mx, my) {
+				c.reportAction(b.action)
+				return
+			}
 		}
 	}
 
 	if !c.reportTyping() {
 		return
 	}
-	if rl.IsKeyPressed(rl.KeyTab) {
+	if r.kind == reportKindProblem && rl.IsKeyPressed(rl.KeyTab) {
 		if r.field == reportFieldNote {
 			c.reportSetField(reportFieldName)
 		} else {
@@ -403,6 +421,9 @@ func (c *Client) reportInput() {
 	}
 
 	text, limit := &r.note, reportMaxNote
+	if r.kind != reportKindProblem {
+		limit = crashMaxNote
+	}
 	if r.field == reportFieldName {
 		text, limit = &r.nameEdit, reportMaxName
 	}
@@ -420,11 +441,31 @@ func (c *Client) reportInput() {
 	}
 }
 
+func (c *Client) reportAction(action int) {
+	r := &c.report
+	switch action {
+	case reportActSend:
+		c.reportStartSend()
+	case reportActClose:
+		c.reportClose()
+	case reportActDelete:
+		// Not while a send is reading them.
+		if r.state != reportBusy {
+			deleteCrashReports(r.crashes)
+			r.crashes = nil
+			c.reportClose()
+		}
+	}
+}
+
 // reportStartSend puts the report on the wire from a goroutine; the result
 // comes back through resultCh to reportBeginFrame, on the main goroutine.
 func (c *Client) reportStartSend() {
 	r := &c.report
-	if r.state == reportBusy || r.state == reportSent || r.cap == nil {
+	if r.state == reportBusy || r.state == reportSent {
+		return
+	}
+	if (r.kind == reportKindProblem && r.cap == nil) || (r.kind != reportKindProblem && len(r.crashes) == 0) {
 		return
 	}
 	c.reportKeepName()
@@ -432,9 +473,17 @@ func (c *Client) reportStartSend() {
 	r.err = ""
 	ch := make(chan reportResult, 1)
 	r.resultCh = ch
-	cp, note, name, server := r.cap, strings.TrimSpace(r.note), r.name, r.server
+	kind, cp, files := r.kind, r.cap, append([]string(nil), r.crashes...)
+	note, name, server := strings.TrimSpace(r.note), r.name, r.server
 	go func() {
-		id, err := sendReport(server, cp, note, name)
+		var id string
+		var err error
+		if kind == reportKindProblem {
+			id, err = sendReport(server, cp, note, name)
+		} else {
+			err = sendCrashReports(server, files, note)
+			id = fmt.Sprintf("%d crash report(s)", len(files))
+		}
 		if err != nil {
 			log.Printf("report: not sent: %v", err)
 		} else {
@@ -448,10 +497,7 @@ func (c *Client) reportStartSend() {
 func sendReport(server string, cp *reportCapture, note, name string) (string, error) {
 	<-cp.ready
 
-	channel := UpdateChannel
-	if channel == "" {
-		channel = "local"
-	}
+	channel := buildChannel()
 	header := fmt.Sprintf("EQOA client problem report\nversion: %s\nchannel: %s\ntrace: eqoa-%s.txt\nname: %s\nnote: %s\n\n--- trace ---\n",
 		BuildVersion, channel, cp.stamp, orDash(name), orDash(strings.ReplaceAll(note, "\n", " ")))
 	body, err := json.Marshal(map[string]string{
@@ -519,35 +565,123 @@ func (r reportRect) contains(x, y int32) bool {
 	return x >= r.x && x < r.x+r.w && y >= r.y && y < r.y+r.h
 }
 
+type reportButton struct {
+	box    reportRect
+	label  string
+	action int
+}
+
 type reportLayoutBoxes struct {
-	panel, note, name, send, close reportRect
-	pad, textW                     int32
+	panel, note, name reportRect
+	buttons           []reportButton
+	intro             []string
+	pad, textW        int32
 }
 
 const (
-	reportFont      = int32(14)
-	reportSmallFont = int32(12)
-	reportLineH     = int32(17)
-	reportNoteLines = 6
+	reportFont       = int32(14)
+	reportSmallFont  = int32(12)
+	reportLineH      = int32(17)
+	reportNoteLines  = 6
+	reportCrashLines = 3
 )
 
+func (c *Client) reportTitle() string {
+	switch c.report.kind {
+	case reportKindCrashOffer:
+		return "Send a Crash Report?"
+	case reportKindCrashScreen:
+		return "The client crashed"
+	}
+	return "Report a Problem"
+}
+
+// reportIntro says what is in a report before it is offered: a player
+// deciding whether to send their log should be told that it is their log.
+func (c *Client) reportIntro() string {
+	r := &c.report
+	const holds = "the error and where in the code it happened, the build, the game's state, " +
+		"your settings and the last lines of the log"
+	switch r.kind {
+	case reportKindCrashOffer:
+		s := "The client crashed on " + r.crashWhen.Format("Mon 2 Jan at 15:04") + "."
+		if n := len(r.crashes); n > 1 {
+			s += fmt.Sprintf(" %d reports are waiting, and Send sends them all.", n)
+		}
+		return s + " A report holds " + holds + " - nothing else, and nothing unless you press Send."
+	case reportKindCrashScreen:
+		return trimTo(r.crashErr, 200) + "\n\nA report of this was saved. Sending it to Dab includes " + holds + "."
+	}
+	return "Captured the frame at " + r.cap.when.Format("15:04:05") + ": a screenshot and a dump of the game's state, " +
+		"your settings and the last lines of the log. Nothing is sent unless you press Send."
+}
+
+// reportButtons is the row of buttons, left to right, with Send's label
+// saying how the send is going.
+func (c *Client) reportButtons() []reportButton {
+	r := &c.report
+	send := [...]string{"Send", "Send to Dab", "Send report to Dab"}[r.kind]
+	switch r.state {
+	case reportBusy:
+		send = "Sending..."
+	case reportSent:
+		send = "Sent"
+	case reportFailed:
+		send = "Try again"
+	}
+	b := func(w int32, label string, action int) reportButton {
+		return reportButton{reportRect{w: w, h: 30}, label, action}
+	}
+	switch r.kind {
+	case reportKindCrashOffer:
+		return []reportButton{b(140, send, reportActSend), b(110, "Not now", reportActClose), b(100, "Delete", reportActDelete)}
+	case reportKindCrashScreen:
+		return []reportButton{b(180, send, reportActSend), b(100, "Close", reportActClose)}
+	}
+	return []reportButton{b(120, send, reportActSend), b(100, "Close", reportActClose)}
+}
+
 // reportLayout places the dialog in the middle of the screen, the same
-// boxes for drawing and for clicks.
+// boxes for drawing and for clicks. Its height follows what it has to say.
 func (c *Client) reportLayout() reportLayoutBoxes {
+	r := &c.report
 	sw, sh := int32(rl.GetScreenWidth()), int32(rl.GetScreenHeight())
 	pw := int32(560)
 	if pw > sw-32 {
 		pw = sw - 32
 	}
-	ph := int32(400)
 	l := reportLayoutBoxes{pad: 16}
-	l.panel = reportRect{(sw - pw) / 2, (sh - ph) / 2, pw, ph}
 	l.textW = pw - 2*l.pad
-	x, y := l.panel.x+l.pad, l.panel.y
-	l.note = reportRect{x, y + 128, l.textW, reportNoteLines*reportLineH + 10}
-	l.name = reportRect{x, l.note.y + l.note.h + 28, l.textW, 26}
-	l.send = reportRect{x, l.name.y + l.name.h + 22, 120, 30}
-	l.close = reportRect{x + 132, l.send.y, 100, 30}
+	for _, para := range strings.Split(c.reportIntro(), "\n") {
+		l.intro = append(l.intro, c.reportWrap(para, reportSmallFont, l.textW)...)
+	}
+
+	// Offsets from the panel's top-left first, then placed.
+	lines := int32(reportNoteLines)
+	if r.kind != reportKindProblem {
+		lines = reportCrashLines
+	}
+	note := reportRect{0, 40 + int32(len(l.intro))*15 + 34, l.textW, lines*reportLineH + 10}
+	y := note.y + note.h
+	var name reportRect
+	if r.kind == reportKindProblem {
+		name = reportRect{0, y + 28, l.textW, 26}
+		y = name.y + name.h
+	}
+	buttonY := y + 22
+	ph := buttonY + 30 + 12 + 3*15 + 4 // the buttons, then up to three lines of status
+
+	l.panel = reportRect{(sw - pw) / 2, max((sh-ph)/2, 0), pw, ph}
+	x, top := l.panel.x+l.pad, l.panel.y
+	l.note = reportRect{x, top + note.y, note.w, note.h}
+	if name.h > 0 {
+		l.name = reportRect{x, top + name.y, name.w, name.h}
+	}
+	for _, b := range c.reportButtons() {
+		b.box.x, b.box.y = x, top+buttonY
+		l.buttons = append(l.buttons, b)
+		x += b.box.w + 12
+	}
 	return l
 }
 
@@ -558,13 +692,9 @@ func (c *Client) drawReport() {
 	x := p.x + l.pad
 
 	drawPanel(p.x, p.y, p.w, p.h, colorPopupBg, colorBorder)
-	c.drawText("Report a Problem", x, p.y+12, 18, colorGoldTitle)
-
-	when := r.cap.when.Format("15:04:05")
-	intro := "Captured the frame at " + when + ": a screenshot and a dump of the game's state, " +
-		"your settings and the last lines of the log. Nothing is sent unless you press Send."
+	c.drawText(c.reportTitle(), x, p.y+12, 18, colorGoldTitle)
 	y := p.y + 40
-	for _, ln := range c.reportWrap(intro, reportSmallFont, l.textW) {
+	for _, ln := range l.intro {
 		c.drawText(ln, x, y, reportSmallFont, colorLightGray)
 		y += 15
 	}
@@ -573,9 +703,12 @@ func (c *Client) drawReport() {
 	blink := int(rl.GetTime()*2)%2 == 0
 
 	// The note.
-	label := "What went wrong?"
+	label, hint := "What went wrong?", "  (ENTER sends, ESC closes)"
+	if r.kind != reportKindProblem {
+		label, hint = "What were you doing? (optional)", "  (ENTER sends)"
+	}
 	if typing && r.field == reportFieldNote {
-		label += "  (ENTER sends, ESC closes)"
+		label += hint
 	}
 	c.drawText(label, x, l.note.y-20, reportFont, colorGold)
 	border := colorBtnBorder
@@ -588,8 +721,8 @@ func (c *Client) drawReport() {
 		note += "_"
 	}
 	lines := c.reportWrap(note, reportFont, l.note.w-12)
-	if len(lines) > reportNoteLines {
-		lines = lines[len(lines)-reportNoteLines:] // the end, where the typing is
+	if shown := int(l.note.h-10) / int(reportLineH); len(lines) > shown {
+		lines = lines[len(lines)-shown:] // the end, where the typing is
 	}
 	if r.note == "" && !(typing && r.field == reportFieldNote) {
 		lines = []string{"No note."}
@@ -599,45 +732,35 @@ func (c *Client) drawReport() {
 	}
 
 	// The name, and what it is for: a field called "Name" on a bug report
-	// reads like something the game needs rather than an offer.
-	label = "Your name, for the credits on the report board (optional, TAB)"
-	if typing && r.field == reportFieldName {
-		label = "Your name, kept for next time (ENTER: done)"
-	} else if r.padUsed && r.name == "" {
-		label = "Your name: optional, typed on a keyboard"
-	}
-	c.drawText(label, x, l.name.y-20, reportFont, colorGold)
-	border = colorBtnBorder
-	if typing && r.field == reportFieldName {
-		border = colorGoldBright
-	}
-	drawPanel(l.name.x, l.name.y, l.name.w, l.name.h, colorFieldBg, border)
-	name := r.name
-	if typing && r.field == reportFieldName {
-		name = r.nameEdit
-		if blink {
-			name += "_"
+	// reads like something the game needs rather than an offer. A crash
+	// report is not on the board, so it has none.
+	if r.kind == reportKindProblem {
+		label = "Your name, for the credits on the report board (optional, TAB)"
+		if typing && r.field == reportFieldName {
+			label = "Your name, kept for next time (ENTER: done)"
+		} else if r.padUsed && r.name == "" {
+			label = "Your name: optional, typed on a keyboard"
 		}
-	} else if name == "" {
-		name = "anonymous"
+		c.drawText(label, x, l.name.y-20, reportFont, colorGold)
+		border = colorBtnBorder
+		if typing && r.field == reportFieldName {
+			border = colorGoldBright
+		}
+		drawPanel(l.name.x, l.name.y, l.name.w, l.name.h, colorFieldBg, border)
+		name := r.name
+		if typing && r.field == reportFieldName {
+			name = r.nameEdit
+			if blink {
+				name += "_"
+			}
+		} else if name == "" {
+			name = "anonymous"
+		}
+		c.drawText(name, l.name.x+6, l.name.y+6, reportFont, colorWhiteFull)
 	}
-	c.drawText(name, l.name.x+6, l.name.y+6, reportFont, colorWhiteFull)
 
-	// The buttons.
-	sendLabel := "Send"
-	switch r.state {
-	case reportBusy:
-		sendLabel = "Sending..."
-	case reportSent:
-		sendLabel = "Sent"
-	case reportFailed:
-		sendLabel = "Try again"
-	}
 	mx, my := rl.GetMouseX(), rl.GetMouseY()
-	for _, b := range []struct {
-		box   reportRect
-		label string
-	}{{l.send, sendLabel}, {l.close, "Close"}} {
+	for _, b := range l.buttons {
 		bg := colorBtnBg
 		if b.box.contains(mx, my) {
 			bg = colorBtnHover
@@ -653,19 +776,32 @@ func (c *Client) drawReport() {
 	case reportBusy:
 		status = "Sending..."
 	case reportSent:
-		where := strings.TrimPrefix(strings.TrimPrefix(r.server, "https://"), "http://")
-		status = "Sent as " + r.id + ". Thank you! See all reports at " + where + "/board"
 		color = rl.Color{R: 120, G: 220, B: 120, A: 255}
+		if r.kind == reportKindProblem {
+			where := strings.TrimPrefix(strings.TrimPrefix(r.server, "https://"), "http://")
+			status = "Sent as " + r.id + ". Thank you! See all reports at " + where + "/board"
+		} else {
+			status = "Sent. Thank you - that is the whole of what Dab gets to see of a crash."
+		}
 	case reportFailed:
+		color = rl.Color{R: 255, G: 110, B: 110, A: 255}
 		status = "Not sent: " + r.err + "."
-		if saved := r.savedDir(); saved != "" {
+		if r.kind != reportKindProblem {
+			status += " The report is still saved, and the client offers it again next time it starts."
+		} else if r.savedDir() != "" {
 			status += " The files are still in traces/."
 		}
-		color = rl.Color{R: 255, G: 110, B: 110, A: 255}
 	default:
-		status = "TAB moves between the note and the name."
+		switch r.kind {
+		case reportKindCrashOffer:
+			status = "Not now keeps it for next time; Delete throws it away."
+		case reportKindCrashScreen:
+			status = "Close keeps the report, and the client offers it again next time it starts."
+		default:
+			status = "TAB moves between the note and the name."
+		}
 	}
-	y = l.send.y + l.send.h + 12
+	y = l.buttons[0].box.y + 30 + 12
 	for _, ln := range c.reportWrap(status, reportSmallFont, l.textW) {
 		c.drawText(ln, x, y, reportSmallFont, color)
 		y += 15
@@ -719,10 +855,7 @@ func (c *Client) reportDump(now time.Time) string {
 	var b strings.Builder
 	f := func(format string, a ...any) { fmt.Fprintf(&b, format+"\n", a...) }
 
-	channel := UpdateChannel
-	if channel == "" {
-		channel = "local"
-	}
+	channel := buildChannel()
 	f("eqoa client trace %s", now.Format("2006-01-02 15:04:05 -0700"))
 	f("build: %s (%s), %s %s/%s", BuildVersion, channel, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	if gmEnabled() {
@@ -896,16 +1029,20 @@ func trimTo(s string, n int) string {
 // the password-derived auth token no longer print it (internal/network); this
 // is the second line of defence, for whatever logs them next.
 func (c *Client) scrubReport(text string) string {
+	return scrubText(text, c.loginUser, c.loginPass)
+}
+
+func scrubText(text, user, pass string) string {
 	if home, err := os.UserHomeDir(); err == nil && len(home) > 1 {
 		text = strings.ReplaceAll(text, home, "~")
 	}
 	// Under four characters a password is as likely to be part of a word.
-	if len(c.loginPass) >= 4 {
-		text = strings.ReplaceAll(text, c.loginPass, "<password>")
+	if len(pass) >= 4 {
+		text = strings.ReplaceAll(text, pass, "<password>")
 	}
 	// Case-sensitive, so a character named after the account ("Dolph" for
 	// "dolph") keeps its name: the dump is no use without it.
-	if user := c.loginUser; user != "" {
+	if user != "" {
 		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(user) + `\b`)
 		text = re.ReplaceAllString(text, "<account>")
 	}

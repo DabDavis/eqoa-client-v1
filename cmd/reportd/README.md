@@ -1,10 +1,11 @@
-# eqoa-reportd — problem reports and the report board
+# eqoa-reportd — problem reports, crash reports and the report board
 
-The other end of the client's **F3 Report a Problem** dialog. `POST /report`
-stores what a player chose to send; `GET /board` is a public, read-only page of
-those reports and what became of each.
+The other end of the client's **F3 Report a Problem** dialog and of its **crash
+reports**. `POST /report` stores what a player chose to send; `GET /board` is a
+public, read-only page of those reports and what became of each; `POST /crash`
+stores a crash, which nothing serves back.
 
-It is a port of the problem-report route and report board in Dab's Mod's
+It is a port of the problem-report and crash routes and the report board in Dab's Mod's
 `pdghostd` (`tools/pdghostd/pdghostd.py` in the perfect-dark repo), with the same
 rules: no account, nothing sent unless the player pressed Send, every field
 bounded and stripped of control characters, a report on disk as files read over
@@ -63,6 +64,31 @@ reports in the directory (507), counted by the shape of a report's name so
 Control characters other than newline and tab are stripped, because a report is
 read in a terminal.
 
+## Crash reports
+
+`POST /crash` is pdghostd's `/crash`: `{report, note, version, platform, channel}`,
+written as one file in `~/eqoareports/crashes`, `<stamp>-<8 hex>.txt`, under a
+header of `received`, `from`, `version`, `platform`, `channel` and `note`. There is
+no account, and **no route reads one back**: they are files for reading over ssh.
+
+```sh
+ls -t ~/eqoareports/crashes | head
+scp 'sdg@10.8.0.1:~/eqoareports/crashes/*' <scratch>/crashes/
+```
+
+The client sends one from its crash screen (a panic in the game loop) or from
+the offer on the login screen the next time it starts (anything that took the
+process with it). See the client's `crash.go`. A report is the error, the
+stack (every goroutine, for a runtime fatal error), the client's state dump
+when it was still alive to write one, and the last 200 lines of its log.
+
+**Bounds:** 256 KiB of report, where pdghostd keeps 32 KiB. A Go stack, the state
+dump and 200 log lines run past 32 KiB, and the client keeps its own report under
+240 KiB. The rest are pdghostd's: a 2 MiB body, 200 characters of note on one
+header line, twelve an hour from one address (429), and 5000 in the directory (507).
+Control characters are stripped. The crash limiter is apart from the problem-report
+one.
+
 ## The board
 
 `GET /board` (<https://texturepacks.art/eqoa/reports/board>): the reports, newest
@@ -120,6 +146,9 @@ The unit carries pdghostd's walls (`ProtectHome=tmpfs` with only the binary and
 `~/eqoareports` bound in), so `~/eqoareports` must exist before it starts.
 
 ## Left out, against pdghostd
+
+Crash reports are kept by hand, as pdghostd's are: nothing archives or sweeps
+`crashes/`.
 
 - **Patch notes.** pdghostd's Fixed column can take its words and credits from
   the game's `patchnotes.txt` (`fixed 1.17 …`). The client has no such file; a

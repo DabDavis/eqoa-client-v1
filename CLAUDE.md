@@ -81,7 +81,9 @@ cmd/client/                          # Raylib 3D client (~23k lines)
   entitysound.go                     # Animation-triggered positional audio
   screenshot.go                      # PrintScreen/F9 capture
   report.go                          # F3 Report a Problem: frame + state dump → cmd/reportd
-  logring.go                         # Last 200 log lines in memory, for F3 reports
+  crash.go                           # Crash reports: recovered panics + the runtime's crash output
+  logring.go                         # Log ring (200 lines) + client.log / client.prev.log
+  crashtest_dev.go                   # Dev-only EQOA_CRASH_TEST=main|goroutine
   updater.go                         # Auto-updater (manifest, SHA-256, self-replace)
   gridrunner_stub.go                 # Dev-only GM grid runner stub
   pprof_dev.go                       # Dev-only pprof on :6060
@@ -90,7 +92,7 @@ cmd/headless/main.go                # Headless REPL client (Sandstorm testing)
 cmd/crawler/                         # NPC/entity grid crawler (SQLite sightings)
 cmd/statharvest/main.go             # Base stat harvester (all race/class combos)
 cmd/presence/main.go                # HTTP heartbeat server (online player list)
-cmd/reportd/                         # F3 problem reports + public board (runs on the VPS)
+cmd/reportd/                         # F3 problem reports, crash reports, public board (runs on the VPS)
 cmd/dumpbgm/main.go                 # Zone BGM placement extractor
 
 internal/game/
@@ -545,6 +547,37 @@ overrides). **Close** sends nothing. **Shift+F3** is the bone debug toggle, whic
   password. **Never log a credential**: the log ring ships with every report.
   A log line in a per-frame path also empties the ring within seconds
   (`effectvol: active=…` already logs once a second).
+
+### Crash reports
+
+These are Dab's Mod's crash reports (`port/src/crashreport.c`), in two halves.
+
+1. **A panic on the main goroutine.** That is the game loop, where nearly everything
+   runs. `crashRecover` catches it: it is deferred in `runClient` *after* the window
+   cleanup, so it runs first. It writes `crashes/crash-<run>.txt` at once, holding the
+   panic, the stack, the state dump and the log ring. Then a crash screen offers
+   **Send report to Dab / Close**, with a note, and the client exits with code 2.
+2. **Anything that kills the process outright.** That is a panic on another goroutine
+   (the terrain loader, the network), a fatal runtime error, or a fault in C under
+   raylib. `debug.SetCrashOutput` points the runtime's own report at
+   `crashes/run-<run>.out`. The next launch's `collectCrashes` turns it into a
+   `crash-<run>.txt`, taking the log tail from `client.prev.log`, whose first line
+   names its run. A `.out` with nothing past its header is a run that was killed
+   and is deleted.
+
+- **The next launch offers what is waiting**, once, on the login screen:
+  **Send to Dab / Not now / Delete**. A report that is sent is deleted, and one that
+  is not stays. Reports go to `/crash` on `cmd/reportd`. They land in
+  `~/eqoareports/crashes` on the VPS, and no route serves them back.
+- **`main` calls `crashCleanExit` itself, not with `defer`.** A deferred call also runs
+  during a panic, and it would remove this run's crash output before the runtime wrote
+  to it. Any other clean exit (`os.Exit`) must call `crashCleanExit` first, as offline
+  `--shot` does.
+- **The log now also goes to `client.log`** beside the binary, and the last run's log is
+  kept as `client.prev.log`. The file stops at 64 MB; the ring keeps going.
+- **Check it with a dev build:** `EQOA_CRASH_TEST=main` (the crash screen) or
+  `=goroutine` (the next-launch offer) crashes 10 s into the world. Release builds have
+  no such switch. `crash_test.go` crashes a child of the test binary for real.
 
 ## Gamepad Support
 

@@ -361,6 +361,7 @@ func (c *Client) offlineShotTick() {
 	o.shotIdx++
 	if o.shotIdx >= len(o.hours) {
 		rl.CloseWindow()
+		crashCleanExit()
 		os.Exit(0)
 	}
 	c.engine.State.SetGameHour(o.hours[o.shotIdx])

@@ -1,9 +1,10 @@
 // Command eqoa-reportd is the other end of the client's F3 "Report a Problem"
-// dialog: POST /report stores what a player chose to send, and GET /board is
-// a public, read-only page of those reports and what became of each.
+// dialog and of its crash reports: POST /report stores what a player chose to
+// send, GET /board is a public, read-only page of those reports and what
+// became of each, and POST /crash stores a crash, which nothing serves back.
 //
-// It is a port of the problem-report route and the report board in Dab's Mod's
-// pdghostd (tools/pdghostd/pdghostd.py in the perfect-dark repo), which has
+// It is a port of the problem-report and crash routes and the report board in
+// Dab's Mod's pdghostd (tools/pdghostd/pdghostd.py in the perfect-dark repo), which has
 // been taking F3 reports from testers since 2026-09, and it keeps that
 // daemon's rules: no account, nothing sent unless the player pressed Send,
 // every field bounded and stripped of control characters, a report on disk as
@@ -59,6 +60,19 @@ var (
 	// Counted by the shape of a report's name, so status.txt is not one.
 	reportMaxFiles = 10000
 
+	// Crash reports: a stack trace, the client's state and a log tail. The
+	// text cap is pdghostd's 32 KiB raised to 256 KiB, because a Go stack
+	// with every goroutine, the state dump and 200 log lines run past 32 KiB
+	// where Dab's Mod's C stack and shorter log lines do not; the client keeps
+	// its own under 240 KiB. The rest are pdghostd's: 200 characters of note,
+	// twelve an hour from an address, 5000 in the directory.
+	crashMaxBody  int64 = 2 * 1024 * 1024
+	crashMaxText        = 256 * 1024
+	crashMaxNote        = 200
+	crashWindow         = time.Hour
+	crashMax            = 12
+	crashMaxFiles       = 5000
+
 	// Keys live in a rate table until something clears them, and one key is
 	// one address. Past this many the expired ones are swept.
 	rateTableMax = 4096
@@ -77,8 +91,10 @@ var (
 type server struct {
 	reportDir string // <dir>/reports: <id>.txt, <id>.png and status.txt
 	thumbDir  string // <dir>/reportthumbs, kept apart so a listing of reports is only reports
+	crashDir  string // <dir>/crashes: <id>.txt, read over ssh and by nothing here
 
 	reports rateTable // address -> reports sent
+	crashes rateTable // address -> crash reports sent
 	shots   rateTable // address -> full-size board pictures fetched
 
 	board boardCache
@@ -91,6 +107,7 @@ func newServer(dir string) *server {
 	return &server{
 		reportDir:   filepath.Join(dir, "reports"),
 		thumbDir:    filepath.Join(dir, "reportthumbs"),
+		crashDir:    filepath.Join(dir, "crashes"),
 		thumbFailed: map[string]bool{},
 	}
 }
@@ -98,7 +115,7 @@ func newServer(dir string) *server {
 func main() {
 	home, _ := os.UserHomeDir()
 	listen := flag.String("listen", "127.0.0.1:9091", "address to serve on; only nginx should reach it")
-	dir := flag.String("dir", filepath.Join(home, "eqoareports"), "data directory (reports/, reportthumbs/)")
+	dir := flag.String("dir", filepath.Join(home, "eqoareports"), "data directory (reports/, reportthumbs/, crashes/)")
 	flag.Parse()
 
 	s := newServer(*dir)
@@ -142,6 +159,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		if path == "/report" {
 			s.postReport(w, r)
+			return
+		}
+		if path == "/crash" {
+			s.postCrash(w, r)
 			return
 		}
 	}
@@ -311,7 +332,11 @@ func reportShot(v any) ([]byte, bool) {
 // the directory cannot be read. By the shape of the name, not the extension:
 // status.txt lives in the same directory and is not a report.
 func (s *server) reportCount() int {
-	entries, err := os.ReadDir(s.reportDir)
+	return countReports(s.reportDir)
+}
+
+func countReports(dir string) int {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return -1
 	}
@@ -461,4 +486,87 @@ func writeNew(path string, data []byte) error {
 		return err
 	}
 	return f.Close()
+}
+
+// postCrash is pdghostd's /crash: one file per report, named for the second
+// it arrived plus eight random hex digits, under a header of what the server
+// knows and the report does not - when, and who from. No account: a crash
+// belongs to whoever had it, and the client offers one before anybody signs
+// in. There is no route that reads one back.
+func (s *server) postCrash(w http.ResponseWriter, r *http.Request) {
+	req := readJSON(w, r, crashMaxBody)
+	if req == nil {
+		sendError(w, http.StatusBadRequest, "bad body")
+		return
+	}
+
+	report, ok1 := textField(req, "report", crashMaxText)
+	note, ok2 := textField(req, "note", crashMaxNote)
+	version, ok3 := textField(req, "version", fieldMax)
+	platform, ok4 := textField(req, "platform", fieldMax)
+	channel, ok5 := textField(req, "channel", fieldMax)
+	if !(ok1 && ok2 && ok3 && ok4 && ok5) {
+		sendError(w, http.StatusBadRequest, "bad body")
+		return
+	}
+
+	// A report is a stack trace and a log tail. Something shorter than a
+	// single line of one is a probe rather than a crash.
+	if utf8.RuneCountInString(strings.TrimSpace(report)) < 32 {
+		sendError(w, http.StatusBadRequest, "empty report")
+		return
+	}
+
+	ip := clientIP(r)
+	if !s.crashes.ok(ip, crashWindow, crashMax) {
+		sendError(w, http.StatusTooManyRequests, "too many reports from here, try again later")
+		return
+	}
+
+	if err := os.MkdirAll(s.crashDir, 0o700); err != nil {
+		log.Printf("crash report not written: %v", err)
+		sendError(w, http.StatusInternalServerError, "no crash directory")
+		return
+	}
+	count := countReports(s.crashDir)
+	if count < 0 {
+		sendError(w, http.StatusInternalServerError, "no crash directory")
+		return
+	}
+	if count >= crashMaxFiles {
+		sendError(w, http.StatusInsufficientStorage, "no room for more reports")
+		return
+	}
+
+	var rnd [4]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		sendError(w, http.StatusInternalServerError, "could not store the report")
+		return
+	}
+	now := time.Now().UTC()
+	base := now.Format("20060102-150405") + "-" + hex.EncodeToString(rnd[:])
+
+	var head strings.Builder
+	head.WriteString("received: " + now.Format("2006-01-02 15:04:05") + "\n")
+	head.WriteString("from: " + ip + "\n")
+	head.WriteString("version: " + headerLine(version) + "\n")
+	head.WriteString("platform: " + headerLine(platform) + "\n")
+	head.WriteString("channel: " + headerLine(channel) + "\n")
+	head.WriteString("note: " + headerLine(note) + "\n\n")
+	head.WriteString(report)
+	if !strings.HasSuffix(report, "\n") {
+		head.WriteString("\n")
+	}
+
+	if err := writeNew(filepath.Join(s.crashDir, base+".txt"), []byte(head.String())); err != nil {
+		log.Printf("crash report not written: %v", err)
+		sendError(w, http.StatusInternalServerError, "could not store the report")
+		return
+	}
+
+	log.Printf("crash report %s (%s, %s, %d bytes)", base, headerLine(version), headerLine(platform), len(report))
+	sendJSON(w, http.StatusOK, struct {
+		OK bool   `json:"ok"`
+		ID string `json:"id"`
+	}{true, base})
 }

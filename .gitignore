@@ -13,3 +13,10 @@ headless-race
 /headless
 /dist/
 *.db
+
+# What a run writes beside the binary: its log and the last run's, crash
+# reports waiting to be sent, and F3 traces.
+client.log
+client.prev.log
+/crashes/
+/traces/

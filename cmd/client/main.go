@@ -353,8 +353,9 @@ type Client struct {
 	// --offline mode (offline.go); nil in a normal session.
 	offline *offlineConfig
 
-	// F3 Report a Problem (report.go)
-	report reportDialog
+	// F3 Report a Problem (report.go), and crash reports (crash.go)
+	report       reportDialog
+	crashOffered bool // what earlier runs left has been offered this launch
 
 	// GM teleport auto-reconnect (Sandstorm workaround: disconnect → reconnect → override pos)
 	gmReconnect          bool    // true = skip login, auto-login + auto-select character
@@ -410,9 +411,19 @@ const (
 )
 
 func main() {
-	// Before anything logs: the ring is what an F3 report carries (logring.go).
-	installLogRing()
+	dir := clientDir()
+	// Before anything logs: the ring and client.log are what a report
+	// carries (logring.go), and the crash output is set before anything can
+	// crash (crash.go).
+	installLogRing(dir)
+	installCrashCapture(dir)
+	runClient()
+	// Not deferred: a deferred call would also run during a panic and take
+	// this run's crash output away before the runtime wrote to it.
+	crashCleanExit()
+}
 
+func runClient() {
 	// Reduce GC frequency — live heap has many pointers causing high GC CPU.
 	// GOGC=200: trigger at 2x live heap instead of default 1x.
 	debug.SetGCPercent(200)
@@ -580,6 +591,9 @@ func main() {
 		}
 		rl.CloseWindow()
 	}()
+	// Registered after the cleanup above so that it runs first, while the
+	// window is still open to say what happened (crash.go).
+	defer client.crashRecover()
 
 	// Load saved config
 	client.serverIP = defaultServerIP
@@ -674,6 +688,7 @@ func main() {
 			// Login screen with landscape background
 			for !rl.WindowShouldClose() && !client.loginWantsExit && client.engine == nil {
 				client.pollLoginResult()
+				client.crashOfferOnce()
 				client.reportBeginFrame()
 				if !client.reportOpen() {
 					client.handleLoginInput()
@@ -1130,6 +1145,7 @@ func main() {
 			// Screenshot after EndDrawing — framebuffer fully composited
 			client.checkScreenshot()
 			client.offlineShotTick()
+			client.crashTestTick()
 		}
 
 		// Revert to windowed 640x480 for login/charselect/title screens.
