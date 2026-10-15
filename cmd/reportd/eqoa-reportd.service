@@ -1,0 +1,29 @@
+[Unit]
+Description=EQOA client problem reports (the F3 dialog's server and report board)
+After=network.target
+
+[Service]
+Type=simple
+User=sdg
+WorkingDirectory=/home/sdg
+ExecStart=/home/sdg/eqoa-reportd -dir /home/sdg/eqoareports
+Restart=on-failure
+RestartSec=5
+
+# The process sees an empty home apart from its data directory and its own
+# binary, a read-only system, no devices and no way to gain anything it did
+# not start with - pdghostd's walls. If the binary moves,
+# BindReadOnlyPaths= has to move with it.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/sdg/eqoareports
+BindReadOnlyPaths=/home/sdg/eqoa-reportd
+ReadWritePaths=/home/sdg/eqoareports
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

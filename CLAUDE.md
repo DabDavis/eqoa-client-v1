@@ -80,6 +80,8 @@ cmd/client/                          # Raylib 3D client (~23k lines)
   gamepad.go                         # PS2 DualShock 2 button mapping
   entitysound.go                     # Animation-triggered positional audio
   screenshot.go                      # PrintScreen/F9 capture
+  report.go                          # F3 Report a Problem: frame + state dump → cmd/reportd
+  logring.go                         # Last 200 log lines in memory, for F3 reports
   updater.go                         # Auto-updater (manifest, SHA-256, self-replace)
   gridrunner_stub.go                 # Dev-only GM grid runner stub
   pprof_dev.go                       # Dev-only pprof on :6060
@@ -88,6 +90,7 @@ cmd/headless/main.go                # Headless REPL client (Sandstorm testing)
 cmd/crawler/                         # NPC/entity grid crawler (SQLite sightings)
 cmd/statharvest/main.go             # Base stat harvester (all race/class combos)
 cmd/presence/main.go                # HTTP heartbeat server (online player list)
+cmd/reportd/                         # F3 problem reports + public board (runs on the VPS)
 cmd/dumpbgm/main.go                 # Zone BGM placement extractor
 
 internal/game/
@@ -509,6 +512,40 @@ xvfb-run -a ./client --offline --iso "$ISO" [--char NAME] [--pos X,Y,Z] [--facin
 
 `--shot` captures once the world has streamed in, one file per `--hour`. Repeating an hour (`--hour 12,12,12`) takes a sequence `--shot-frames` apart. `--spell` plays an effect from the player at the first NPC. Under Xvfb the client runs at about 5 fps, and physics runs during the loading screen.
 
+## Problem Reports (F3)
+
+The F3 key from Dab's Mod (`~/perfect-dark`, `port/src/tracereport.c`), ported.
+**F3** writes `traces/eqoa-<stamp>.txt` + `.png` beside the binary: the frame, and a
+dump of the client's state (session, player, target, the 40 nearest entities, UI,
+settings, runtime, and the last 200 log lines from `logring.go`, the only copy a
+player has). A dialog then takes a note and an optional credit name (kept as
+`report_name` in `client.json`). **Send** POSTs it to
+`https://texturepacks.art/eqoa/reports/report` (`report_server` in `client.json`
+overrides). **Close** sends nothing. **Shift+F3** is the bone debug toggle, which used to be F3.
+
+- **Reading them:** `ssh sdg@10.8.0.1 'ls -t ~/eqoareports/reports | head'`, then
+  `scp` the `<id>.*` pair. The public board is <https://texturepacks.art/eqoa/reports/board>.
+  Statuses go in `~/eqoareports/reports/status.txt`, one line a report.
+  `cmd/reportd/README.md` has the format, the bounds and the deploy steps.
+- **The server** is `cmd/reportd`, a stdlib Go port of pdghostd's `/report` and board.
+  It runs as `eqoa-reportd.service` on `127.0.0.1:9091` behind nginx's
+  `location ^~ /eqoa/reports/`, which needs no password and allows an 8m body.
+  It is deployed by hand, not by CI.
+- **The game does not pause.** While the dialog is open it takes the keyboard the way
+  chat and the menu do: `handleInWorldInput` returns early, and the login and
+  char-select handlers are skipped. `reportBeginFrame` takes the frame's typed
+  characters before any draw-time text box can, and moves the mouse off-screen
+  (`SetMouseOffset`) until `reportFrame`, because widgets read clicks while drawing.
+- **The picture is taken just before `EndDrawing`, after `rl.DrawRenderBatchActive()`.**
+  raylib holds every 2D draw until `EndDrawing`, so without the flush the picture is the
+  3D world with no HUD.
+- **Nothing in a report may identify the player or hand over the account.** The
+  home directory, the account name and the password are scrubbed. The auth log lines
+  no longer print the token: with the AES key in the public source, that token *is* the
+  password. **Never log a credential**: the log ring ships with every report.
+  A log line in a per-frame path also empties the ring within seconds
+  (`effectvol: active=…` already logs once a second).
+
 ## Gamepad Support
 
 `cmd/client/gamepad.go`: PS2 DualShock 2 mapping → Raylib gamepad. Left stick = movement, right stick = camera orbit/zoom/swim, D-pad = targeting, cross/circle/square/triangle = actions. Auto-shows spell bar on first gamepad frame.
@@ -580,6 +617,7 @@ Byte 0 = update counter, bytes 1-4 = ObjectID (0 = removed). NameColor byte 142:
 | `cmd/crawler/` | NPC/entity grid crawler — crawls Tunaria in 2000×2000 cells, stores sightings in SQLite |
 | `cmd/statharvest/` | Base stat harvester — iterates all race/class/humType combos from Sandstorm → SQLite |
 | `cmd/presence/` | HTTP heartbeat server — tracks online players (90s prune, JSON response) |
+| `cmd/reportd/` | F3 problem reports + public board (pdghostd port); `eqoa-reportd` on the VPS, see its README |
 | `cmd/dumpbgm/` | Zone BGM placement extractor — bounding boxes per audio file path |
 
 ## PS2 RE References

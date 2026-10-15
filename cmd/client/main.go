@@ -353,6 +353,9 @@ type Client struct {
 	// --offline mode (offline.go); nil in a normal session.
 	offline *offlineConfig
 
+	// F3 Report a Problem (report.go)
+	report reportDialog
+
 	// GM teleport auto-reconnect (Sandstorm workaround: disconnect → reconnect → override pos)
 	gmReconnect          bool    // true = skip login, auto-login + auto-select character
 	gmReconnectChar      int     // saved character index to auto-select
@@ -407,6 +410,9 @@ const (
 )
 
 func main() {
+	// Before anything logs: the ring is what an F3 report carries (logring.go).
+	installLogRing()
+
 	// Reduce GC frequency — live heap has many pointers causing high GC CPU.
 	// GOGC=200: trigger at 2x live heap instead of default 1x.
 	debug.SetGCPercent(200)
@@ -668,7 +674,10 @@ func main() {
 			// Login screen with landscape background
 			for !rl.WindowShouldClose() && !client.loginWantsExit && client.engine == nil {
 				client.pollLoginResult()
-				client.handleLoginInput()
+				client.reportBeginFrame()
+				if !client.reportOpen() {
+					client.handleLoginInput()
+				}
 				client.audioSys.UpdateBGM()
 				client.audioSys.UpdateAmbient()
 
@@ -681,6 +690,7 @@ func main() {
 				}
 				client.drawLoginScreen()
 				client.checkScreenshot()
+				client.reportFrame()
 			rl.EndDrawing()
 			}
 		}
@@ -847,6 +857,7 @@ func main() {
 		charSaveLoaded := false
 		for !rl.WindowShouldClose() && client.engine != nil {
 			engine.Tick()
+			client.reportBeginFrame()
 
 			// Sync screen/render dimensions each frame (handles resize, HiDPI).
 			screenWidth = int32(rl.GetScreenWidth())
@@ -1047,7 +1058,7 @@ func main() {
 					engine.PosOverrideX = client.gmReconnectX
 					engine.PosOverrideY = client.gmReconnectY
 					engine.PosOverrideZ = client.gmReconnectZ
-				} else {
+				} else if !client.reportOpen() {
 					client.handleCharSelectInput()
 				}
 			case game.PhaseInWorld:
@@ -1114,6 +1125,7 @@ func main() {
 			if client.showFPS {
 				client.drawFPSCounter()
 			}
+			client.reportFrame()
 			rl.EndDrawing()
 			// Screenshot after EndDrawing — framebuffer fully composited
 			client.checkScreenshot()

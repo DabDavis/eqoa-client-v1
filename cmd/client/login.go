@@ -36,6 +36,10 @@ type loginConfig struct {
 	ServerIP     string  `json:"server_ip,omitempty"`
 	AssetsDir    string  `json:"assets_dir,omitempty"`
 	ISOPath      string  `json:"iso_path,omitempty"`
+	// The F3 report's credit name, and a report server other than the
+	// default (report.go).
+	ReportName   string `json:"report_name,omitempty"`
+	ReportServer string `json:"report_server,omitempty"`
 }
 
 func configPath() string {

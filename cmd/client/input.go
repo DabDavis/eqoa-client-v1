@@ -25,8 +25,15 @@ func (c *Client) handleInWorldInput() {
 		c.flyVelX, c.flyVelY, c.flyVelZ = 0, 0, 0
 	}
 
-	// F3: toggle bone debug visualization
-	if rl.IsKeyPressed(rl.KeyF3) && c.modelMgr != nil {
+	// The F3 report dialog holds the keyboard, as the menu and chat do: no
+	// movement, camera or hotkeys under it (report.go).
+	if c.reportOpen() {
+		return
+	}
+
+	// Shift+F3: toggle bone debug visualization. F3 alone is Report a Problem.
+	shift := rl.IsKeyDown(rl.KeyLeftShift) || rl.IsKeyDown(rl.KeyRightShift)
+	if shift && rl.IsKeyPressed(rl.KeyF3) && c.modelMgr != nil {
 		c.modelMgr.ShowBoneDebug = !c.modelMgr.ShowBoneDebug
 		log.Printf("Bone debug: %v", c.modelMgr.ShowBoneDebug)
 	}
