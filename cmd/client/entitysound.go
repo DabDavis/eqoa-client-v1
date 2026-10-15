@@ -1,6 +1,6 @@
 package main
 
-import ()
+import "math/rand"
 
 // entitySoundState tracks per-entity sound playback for keyframe triggers
 // and continuous ambient sounds.
@@ -10,6 +10,11 @@ type entitySoundState struct {
 	// Continuous/ambient sound (PS2 0x2940 ContSound)
 	contSoundActive bool  // true if continuous sound is playing for this entity
 	contSoundID     int32 // DictID of the active continuous sound
+
+	// The trigger sound playing (VICSprite m_cur[sel].m_flags): the next
+	// trigger stops it. The PS2 keeps one per body half; only the upper
+	// half's triggers trip here (models.AnimState.SoundTripped).
+	voice int32
 }
 
 // entitySoundCleanupCounter tracks frames for periodic cleanup.
@@ -40,7 +45,7 @@ func (c *Client) updateEntitySounds(dt float32) {
 	}
 	c.processEntitySound(p.ObjectID, playerModelID, playerSoundAnim,
 		p.X, p.Y, p.Z)
-	c.processContSound(p.ObjectID, playerModelID, p.X, p.Y, p.Z)
+	c.processContSound(p.ObjectID, playerModelID, p.X, p.Y, p.Z, p.Dead)
 
 	// Visible entity sounds — use cached anim bytes (avoid double-resolution).
 	for _, ent := range c.visibleEnts {
@@ -51,7 +56,7 @@ func (c *Client) updateEntitySounds(dt float32) {
 		}
 		c.processEntitySound(ent.ObjectID, int32(ent.ModelID), entSoundAnim,
 			ent.X, ent.Y, ent.Z)
-		c.processContSound(ent.ObjectID, int32(ent.ModelID), ent.X, ent.Y, ent.Z)
+		c.processContSound(ent.ObjectID, int32(ent.ModelID), ent.X, ent.Y, ent.Z, ent.Dead)
 	}
 
 	// Periodic cleanup of stale entity sound state (~every 5s)
@@ -88,6 +93,11 @@ func (c *Client) processEntitySound(objectID uint32, modelID int32, animByte byt
 		return
 	}
 
+	// VICSprite::Process (vicsprite.cpp:1645): a tripped trigger on a slot
+	// with that sound stops the one already playing, then plays at
+	// CalcVolumeAndPan's volume (silent past 50 units) × the slot's volume,
+	// pitched 4096 + ((rand & 0x1FFF) − 4096)·pitchVar, with volume, pan and
+	// pitch set once. It played at 80 units, at one pitch, over the last.
 	pos := [3]float32{x, y, z}
 	for ch := 0; ch < 2; ch++ {
 		if !as.SoundTripped[ch] {
@@ -100,13 +110,27 @@ func (c *Client) processEntitySound(objectID uint32, modelID int32, animByte byt
 			continue
 		}
 
-		c.audioSys.Play(dictID, 0, pos, slotSound.Volume[ch], 80)
+		state := c.getEntitySoundState(objectID)
+		if state.voice != 0 {
+			c.audioSys.StopVoice(state.voice)
+			state.voice = 0
+		}
+		vol, pan := c.audioSys.CalcVolumeAndPan(pos)
+		vol *= slotSound.Volume[ch]
+		if vol > 0 {
+			pitch := float32(rand.Int31()&0x1FFF) - 4096
+			pitch = pitch*slotSound.PitchRange[ch] + 4096
+			state.voice = c.audioSys.PlayVoice(dictID, vol, pan, int(pitch))
+		}
 	}
 }
 
-// processContSound starts/updates continuous ambient sounds (PS2 0x2940 ContSound).
-// These loop indefinitely while the entity is visible (campfire crackle, growl, etc).
-func (c *Client) processContSound(objectID uint32, modelID int32, x, y, z float32) {
+// processContSound keeps a model's continuous sound (PS2 0x2940 ContSound,
+// VICSprite m_snd) going — the end of VICSprite::Process: while it is in
+// earshot (50 units, CalcVolumeAndPan) and the entity is alive it plays,
+// re-aimed every frame; otherwise it stops, and starts over on return. It
+// used to play to 80 units and never stop, the dead included.
+func (c *Client) processContSound(objectID uint32, modelID int32, x, y, z float32, dead bool) {
 	model, ok := c.modelMgr.GetCachedModel(modelID)
 	if !ok || model == nil || model.ContSoundID == 0 {
 		return
@@ -114,20 +138,30 @@ func (c *Client) processContSound(objectID uint32, modelID int32, x, y, z float3
 
 	state := c.getEntitySoundState(objectID)
 	pos := [3]float32{x, y, z}
+	// Use negative objectID as loop ID to avoid collision with spell event IDs
+	loopID := -int32(objectID)
 
+	vol, _ := c.audioSys.CalcVolumeAndPan(pos)
+	if vol*model.ContSoundVol <= 0 || dead {
+		if state.contSoundActive {
+			c.audioSys.StopLoop(loopID)
+			state.contSoundActive = false
+		}
+		return
+	}
 	if !state.contSoundActive {
-		// Use negative objectID as loop ID to avoid collision with spell event IDs
-		loopID := -int32(objectID)
-		if c.audioSys.PlayLoop(model.ContSoundID, loopID, pos, model.ContSoundVol, 80) {
+		if c.audioSys.PlayLoop(model.ContSoundID, loopID, pos, model.ContSoundVol, contSoundRange) {
 			state.contSoundActive = true
 			state.contSoundID = model.ContSoundID
 		}
 	} else {
-		// Update position for distance attenuation
-		loopID := -int32(objectID)
 		c.audioSys.UpdateLoopPosition(loopID, pos)
 	}
 }
+
+// contSoundRange is CalcVolumeAndPan's falloff, 1 − distance·0.02: PlayLoop's
+// linear attenuation to this distance is the same curve.
+const contSoundRange = 50
 
 // getEntitySoundState returns or creates the sound state for an entity.
 func (c *Client) getEntitySoundState(objectID uint32) *entitySoundState {
@@ -160,6 +194,7 @@ func (c *Client) cleanupEntitySounds() {
 				loopID := -int32(id)
 				c.audioSys.StopLoop(loopID)
 			}
+			c.audioSys.StopVoice(state.voice)
 			delete(c.entitySounds, id)
 		}
 	}

@@ -71,40 +71,144 @@ const (
 func deriveLocomotion(ent *game.Entity) byte {
 	// Use velocity to determine movement state.
 	speed := float32(math.Sqrt(float64(ent.VelX*ent.VelX + ent.VelZ*ent.VelZ)))
-	if speed < 0.5 {
+	// UpdateLocomotion's thresholds (viwalkcontrol.cpp, InitParms): faster
+	// than m_speedThreshold (0.5) walks, faster than a tenth of the way from
+	// walk (3.0) to run (8.8333) — 3.5833 — runs.
+	if !(locoSpeedThreshold < speed) {
 		return 0 // idle
 	}
-	// PS2 InitParms: walkSpeed=4.417, runSpeed=8.833. Threshold ~6.5 separates.
-	if speed < 6.5 {
+	if !(locoRunThreshold < speed) {
 		return animWalk // CPlayList slot 1
 	}
 	return animRun // CPlayList slot 3
 }
 
-// weaponAttackAnims maps VICSpriteAttackType → [Pri(s=0), Pri(s=1), Alt(s=0), Alt(s=1)].
-// Verified against PS2 SetAttackAction (0x00421820) and SetAttackAltAction (0x00421960)
-// jump tables at 0x004EA8B0 and 0x004EA8E0.
-// s=0 is right hand (primary weapon), s=1 is left hand (secondary/offhand).
-// Keys match ParsedItem.AttackType from MemoryDump / eqoa.db items table.
-// Slot semantics verified visually via animviewer (HumanM, 2026-07-21):
-//   22/23=unarmed off/main   24/25=slash off/main   26=2H slash
-//   27/28=poke off/main   29=2H poke   31=bow   33=crossbow   36=throw
-//   37-39=cast   40/41=slash-quad 3rd/4th (off/main)   42=2H smash
-// Rosetta stone: type 1 {25,24,41,40} = slash quad (off,main,off3rd,main4th) — correct.
-var weaponAttackAnims = map[int][4]byte{
-	0:  {23, 22, 25, 24}, // safety fallback → unarmed then slash
-	1:  {25, 24, 41, 40}, // 1H Slash (sword) — VERIFIED (Rosetta stone)
-	2:  {26, 26, 42, 42}, // 2H Slash (greatsword): pri 2H-slash, alt 2H-smash
-	3:  {28, 27, 25, 24}, // 1H Blunt (mace) → poke primary [CONFIRM in-game: poke vs slash]
-	4:  {42, 42, 29, 29}, // 2H Blunt (maul): pri 2H-smash, alt 2H-poke
-	5:  {23, 22, 43, 43}, // Hand-to-Hand (fist) → unarmed, kick alt (was poke/slash) [monk 50-53 = future variety]
-	6:  {29, 29, 26, 26}, // 2H Pierce (spear): pri 2H-poke, alt 2H-slash
-	7:  {31, 31, 31, 31}, // Bow — shoot
-	8:  {36, 36, 36, 36}, // Throwing → throw (was 35/32 = non-existent slots → idle fallback!)
-	9:  {33, 33, 33, 33}, // Crossbow — shoot
-	10: {37, 37, 38, 38}, // Spell/Wand → cast spell1/2 (was 36 = potion-throw, wrong)
-	11: {28, 27, 41, 40}, // Dagger (pierce) → poke primary [CONFIRM in-game: poke vs slash]
+// VIWalkControl::InitParms' m_speedThreshold, and UpdateLocomotion's run
+// threshold m_walkSpeed + (m_runSpeed - m_walkSpeed) * 0.1.
+const (
+	locoSpeedThreshold = float32(0.5)
+	locoRunThreshold   = float32(3.0) + (float32(8.833330)-float32(3.0))*0.1
+)
+
+// attackActionAnim is VICSprite::SetAttackAction (alt false) and
+// SetAttackAltAction (alt true), vicsprite.cpp: the CPlayList slot a swing
+// with attach slot `slot` (0 the primary hand, 1 the secondary) plays, given
+// each slot's VICSpriteAttackType (m_items[slot].m_attackType: 11 when the
+// slot holds nothing — the constructor's and DetachItem's value). A
+// two-handed weapon in slot 0 (2, 4, 6, and 9 for the alt) decides for both
+// slots. It returns -1 where the PS2 returns -1 and plays nothing: a slot
+// outside 0..1 or a type with no case (0 among them).
+//
+// A slot the model lacks is filled by ApplyDefaultEntries (SetDefaultEntries):
+// throwing's 35/32 play 23/22 on every player body, which has neither.
+func attackActionAnim(types [2]int, slot int, alt bool) int {
+	if slot < 0 || slot >= 2 {
+		return -1
+	}
+	hand := func(main, off int) int {
+		if slot == 0 {
+			return main
+		}
+		return off
+	}
+	if !alt {
+		switch types[0] {
+		case 2:
+			return 26
+		case 4:
+			return 42
+		case 6:
+			return 29
+		}
+		switch types[slot] {
+		case 11:
+			return hand(23, 22)
+		case 1:
+			return hand(25, 24)
+		case 3:
+			return hand(41, 40)
+		case 5:
+			return hand(28, 27)
+		case 7:
+			return 31
+		case 9:
+			return 33
+		case 8:
+			return hand(35, 32)
+		case 10:
+			return 36
+		}
+		return -1
+	}
+	switch types[0] {
+	case 2:
+		return 42
+	case 4:
+		return 29
+	case 6:
+		return 26
+	case 9:
+		return 33
+	}
+	switch types[slot] {
+	case 1:
+		return hand(41, 40)
+	case 3:
+		return hand(28, 27)
+	case 5, 11:
+		return hand(25, 24)
+	case 7:
+		return 31
+	case 8:
+		return hand(35, 32)
+	case 10:
+		return 36
+	}
+	return -1
 }
+
+// playAttackAnim is NewPlayAttack's dispatch (Fields[0]): 0 and 1 are
+// SetAttackAction on slot 0 and 1, 2 and 3 SetAttackAltAction on slot 0 and 1.
+func playAttackAnim(types [2]int, attackPair int) int {
+	if attackPair < 0 || attackPair > 3 {
+		return -1
+	}
+	return attackActionAnim(types, attackPair&1, attackPair >= 2)
+}
+
+// itemAttackType is the attack type AttachItem stores for an equipped item's
+// AttackType, and 11 for an empty slot (DetachItem). A zero from the state
+// channel is read as "no item": it carries no way to tell the two apart.
+func itemAttackType(t int) int {
+	if t <= 0 {
+		return 11
+	}
+	return t
+}
+
+// weaponAttackAnims is attackActionAnim with the same type in both hands,
+// in the order [Pri(s=0), Pri(s=1), Alt(s=0), Alt(s=1)], for the callers that
+// still take a single weapon type (the character-select preview). A type for
+// which SetAttackAction plays nothing has no row.
+var weaponAttackAnims = func() map[int][4]byte {
+	m := make(map[int][4]byte)
+	for t := 1; t <= 11; t++ {
+		var row [4]byte
+		ok := true
+		for i := 0; i < 4; i++ {
+			a := playAttackAnim([2]int{t, t}, i)
+			if a < 0 {
+				ok = false
+				break
+			}
+			row[i] = byte(a)
+		}
+		if ok {
+			m[t] = row
+		}
+	}
+	return m
+}()
 
 // combatAnimSet defines the animation bytes for a model type's combat actions.
 type combatAnimSet struct {
@@ -390,7 +494,7 @@ type combatState struct {
 // PS2 func_00CBDEF8 resolves class/level/weapon → attack type for spell FX.
 func (cs *combatState) resolveCombat(am *AnimationManager, ctrl *models.SpriteAnimController, now time.Time,
 	attackCount int, hitTime time.Time, attackAnims []byte,
-	cas combatAnimSet, modelID int32, showBattleStance bool, serverDrivenCombat bool,
+	cas combatAnimSet, modelID int32, serverDrivenCombat bool,
 	dbgLabel string,
 ) {
 	// Auto-detect combat end: no activity for 5+ seconds.
@@ -460,29 +564,15 @@ func (cs *combatState) resolveCombat(am *AnimationManager, ctrl *models.SpriteAn
 		log.Printf("ANIM [%s]: HIT SKIP (action=%d)", dbgLabel, ctrl.ActionAnimID())
 	}
 
-	// Combat anim still playing.
-	if cs.combatAnim != 0 && now.Before(cs.combatAnimEnd) && !ctrl.IsActionFinished() {
-		return
-	}
-
-	// Battle stance — only when idle (not moving).
-	baseLoco := ctrl.LocoAnimID()
-	isMoving := baseLoco == animWalk || baseLoco == animRun || baseLoco == animSwim || baseLoco == animStrafe
-	if cs.inCombat && showBattleStance && !isMoving {
+	// Nothing more. The PS2 neither clears an action nor asks for the battle
+	// stance: a once-play runs to its end and the next SetLocomotion replaces
+	// it, and SetAnimation itself turns an idle request into 17 within 5 s of
+	// the last attack. (This used to ClearAction every frame once an
+	// animation's guessed duration ran out — cutting anything over 2 s at
+	// 800 ms — and to force 17 for as long as the combat flag lasted.)
+	if cs.combatAnim != 0 && (!now.Before(cs.combatAnimEnd) || ctrl.IsActionFinished()) {
 		cs.combatAnim = 0
-		ctrl.ClearAction()
-		ctrl.SetLocomotion(int(cas.battleStance))
-		return
 	}
-	if cs.inCombat && showBattleStance && isMoving {
-		cs.combatAnim = 0
-		ctrl.ClearAction()
-		return
-	}
-
-	// No combat — clear action.
-	cs.combatAnim = 0
-	ctrl.ClearAction()
 }
 
 // ConsumePendingHitFX returns the number of pending hit FX and resets the counter.
@@ -567,7 +657,6 @@ type animParams struct {
 	isPC               bool // true = use class for swing count
 	weaponAttackType   int  // >=0: use weaponAttackAnims[type]. <0: derive from equipment
 	parsedItems        []game.ParsedItem // player inventory (for dual-wield detection)
-	showBattleStance   bool
 	serverDrivenCombat bool
 	castBarEnd         time.Time
 	castingSelf        bool
@@ -674,7 +763,7 @@ func (am *AnimationManager) resolveAnim(ctrl *models.SpriteAnimController, now t
 	// Combat animation routing — mutates controller state.
 	p.cs.resolveCombat(am, ctrl, now,
 		p.attackCount, p.hitTime, attackAnims,
-		cas, p.modelID, p.showBattleStance, p.serverDrivenCombat, p.dbgLabel,
+		cas, p.modelID, p.serverDrivenCombat, p.dbgLabel,
 	)
 }
 
@@ -703,7 +792,9 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 	if am.playerController == nil {
 		am.playerController = models.NewSpriteAnimController(isHumanoid)
 	}
+	am.playerController = am.bindController(am.playerController, modelID)
 	ctrl := am.playerController
+	am.finishLowerLayer(ctrl, modelID)
 	// Wire controller to AnimState for feedback (play-once completion, blend state).
 	if am.modelMgr != nil {
 		am.modelMgr.SetEntityController(p.ObjectID, ctrl)
@@ -768,7 +859,6 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		isPC:               true,
 		weaponAttackType:   am.GetWeaponAttackType(gs),
 		parsedItems:        gs.ParsedItems,
-		showBattleStance:   am.InCombat,
 		serverDrivenCombat: true,
 		castBarEnd:         castBarEnd,
 		castingSelf:        gs.CastSelfTarget,
@@ -878,8 +968,10 @@ func (am *AnimationManager) ResolveEntityAnim(ent *game.Entity, now time.Time) (
 	if ctrl == nil {
 		isHumanoid := am.modelMgr != nil && am.modelMgr.ModelIsHumanoid(int32(ent.ModelID))
 		ctrl = models.NewSpriteAnimController(isHumanoid)
-		am.entityControllers[ent.ObjectID] = ctrl
 	}
+	ctrl = am.bindController(ctrl, int32(ent.ModelID))
+	am.entityControllers[ent.ObjectID] = ctrl
+	am.finishLowerLayer(ctrl, int32(ent.ModelID))
 	// Wire controller to AnimState for feedback (play-once completion, blend state).
 	if am.modelMgr != nil {
 		am.modelMgr.SetEntityController(ent.ObjectID, ctrl)
@@ -917,7 +1009,6 @@ func (am *AnimationManager) ResolveEntityAnim(ent *game.Entity, now time.Time) (
 		level:              ent.Level,
 		isPC:               ent.IsPlayer,
 		weaponAttackType:   entityAttackType(ent),
-		showBattleStance:   true,
 		serverDrivenCombat: false,
 		castBarEnd:         ent.CastAnimEnd,
 		castingSelf:        false,
@@ -981,6 +1072,97 @@ func getWeaponAttackTypeFromItems(items []game.ParsedItem) int {
 		}
 	}
 	return 11
+}
+
+// attackTypes returns m_items[0..1].m_attackType for an actor: the attack
+// type of what it holds in the primary and secondary hand, 11 for an empty
+// hand. The local player's come from its equipped items (EquipLocation 14
+// and 15), falling back to its state channel; anyone else's from the state
+// channel's bytes 91 and 92.
+func attackTypes(gs *game.GameState, actorObjID uint32) [2]int {
+	types := [2]int{11, 11}
+	if gs == nil {
+		return types
+	}
+	var ent *game.Entity
+	if actorObjID == gs.PlayerObjectID {
+		ent = &gs.Player
+		found := [2]bool{}
+		for _, item := range gs.ParsedItems {
+			if item.EquipLocation < 0 || item.Location != -1 {
+				continue
+			}
+			switch item.EquipLocation {
+			case 14:
+				types[0], found[0] = itemAttackType(int(item.AttackType)), true
+			case 15:
+				types[1], found[1] = itemAttackType(int(item.AttackType)), true
+			}
+		}
+		if found[0] || found[1] {
+			return types
+		}
+	} else {
+		ent = gs.Entities[actorObjID]
+	}
+	if ent != nil {
+		types[0] = itemAttackType(int(ent.PrimaryAttackType))
+		types[1] = itemAttackType(int(ent.SecondaryAttackType))
+	}
+	return types
+}
+
+// AttackActionAnim is the CPlayList slot NewPlayAttack's Fields[0]
+// (attackPair 0..3) plays on an actor — SetAttackAction or
+// SetAttackAltAction on the actor's own per-hand attack types — or -1 where
+// the PS2 plays nothing. A creature holds nothing, so it swings 23/22 and its
+// alt 25/24, which SetDefaultEntries fills from 23/22 on the many creatures
+// that lack them.
+func (am *AnimationManager) AttackActionAnim(gs *game.GameState, actorObjID uint32, attackPair int) int {
+	return playAttackAnim(attackTypes(gs, actorObjID), attackPair)
+}
+
+// bindController fits ctrl to its model once the model has loaded: the
+// skeleton type (two layers for a humanoid, one otherwise) and the play
+// list's per-slot sync, after SetDefaultEntries has filled the slots the ESF
+// left empty. A controller made before its model loaded was made as a
+// one-layer creature and is replaced; so is one whose entity changed model
+// across the humanoid line.
+func (am *AnimationManager) bindController(ctrl *models.SpriteAnimController, modelID int32) *models.SpriteAnimController {
+	if am.modelMgr == nil || ctrl.BoundTo(modelID) {
+		return ctrl
+	}
+	model, ok := am.modelMgr.GetCachedModel(modelID)
+	if !ok || model == nil {
+		return ctrl
+	}
+	if ctrl.IsHumanoid() != model.IsHumanoid {
+		ctrl = models.NewSpriteAnimController(model.IsHumanoid)
+	}
+	models.ApplyDefaultEntries(model)
+	ctrl.BindModel(modelID, model.PLSlotPlayOnce)
+	return ctrl
+}
+
+// finishLowerLayer ends a once-play the lower layer holds by itself (one the
+// upper layer has left) when its length has run out. applySkeletal only
+// reports the upper layer's play ending (MarkActionFinished), so without this
+// a landing or a kick left on the legs by the next swing would hold them —
+// walking is below both on the lower layer — forever.
+func (am *AnimationManager) finishLowerLayer(ctrl *models.SpriteAnimController, modelID int32) {
+	if am.modelMgr == nil || !ctrl.IsHumanoid() {
+		return
+	}
+	slot, playing, age := ctrl.LowerLayer()
+	if !playing {
+		return
+	}
+	if upper, _ := ctrl.Resolve(); upper == slot {
+		return // the upper layer's end is reported for both
+	}
+	if d := am.modelMgr.AnimDuration(modelID, byte(slot)); d > 0 && age >= d {
+		ctrl.MarkLowerFinished()
+	}
 }
 
 // GetWeaponAttackType returns the AttackType of the equipped weapon.

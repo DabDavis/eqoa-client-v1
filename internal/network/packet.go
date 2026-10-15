@@ -5,8 +5,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/eqoa/client/internal/protocol"
 	"github.com/DabDavis/eqoa-esf-tools/pkg/buffer"
+	"github.com/eqoa/client/internal/protocol"
 )
 
 // packetBufPool reuses 1400-byte buffers for BuildPacket to avoid per-call
@@ -28,7 +28,10 @@ type ReceivedPacket struct {
 }
 
 // BuildPacket constructs an outgoing UDP packet from the client's perspective.
-func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
+// It writes messages in order while they fit the packet and returns how many
+// it wrote; the caller keeps the rest queued (connection_append refuses a
+// message that does not fit, and the flush stops there).
+func BuildPacket(conn *Connection, messages []*protocol.Message) ([]byte, int) {
 	buf := packetBufPool.Get().([]byte)
 	writer := buffer.NewWriter(buf)
 
@@ -118,15 +121,16 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 	// NOTE: conn.mu is already held by Flush — do NOT re-lock (Go mutexes aren't reentrant).
 	var guaranteedAckMask uint64
 	if bodyFlags&protocol.BodyFlagGuaranteedAck != 0 {
-		guaranteedAckMask = GuaranteedAckMask(conn.reliableOOO, conn.recvReliable)
+		guaranteedAckMask = GuaranteedAckMask(conn.delayed, conn.recvReliable)
 		if guaranteedAckMask != 0 {
 			bodyFlags |= protocol.BodyFlagGuaranteedAckMask // 0x08
 		}
 	}
 
-	// State channel ACKs: PS2 iterates all 248 channels, sends those with
-	// dirty counter > 0, decrements counter per flush. We iterate only
-	// channels with dirty count > 0 (functionally equivalent).
+	// State channel ACKs: PS2 connection_flush iterates all 248 channels and
+	// writes (channel, rx) for each whose m_ucRxFlag is set, decrementing it.
+	// Every channel goes in -- at most 745 bytes, which the 1,400-byte packet
+	// holds; there is no cap.
 	var hasStateAcks bool
 	var stateAcks []protocol.StateAck
 
@@ -136,22 +140,15 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 	// Go approximation: handshakeComplete prevents premature ACKs before connection bootstrap;
 	// per-channel stateAckDirtyCount provides the per-flush gating (equivalent to bit 2).
 	// NOTE: conn.mu is already held by Flush — do NOT re-lock.
-	const maxStateAcksPerPacket = 40 // Cap at 40 ACKs (120 bytes) to stay within MTU
 	if conn.handshakeComplete {
 		for ch := byte(0); ch < 0xF8; ch++ {
-			if len(stateAcks) >= maxStateAcksPerPacket {
-				break // remaining dirty channels will be sent next flush
-			}
-			if conn.stateAckDirtyCount[ch] > 0 {
-				seq, ok := conn.stateAckMap[ch]
-				if ok {
-					if !hasStateAcks {
-						stateAcks = make([]protocol.StateAck, 0, 29)
-						hasStateAcks = true
-					}
-					stateAcks = append(stateAcks, protocol.StateAck{Channel: ch, Ack: seq})
-					conn.stateAckDirtyCount[ch]-- // PS2: decrement per flush
+			if conn.stateRxFlag[ch] > 0 {
+				if !hasStateAcks {
+					stateAcks = make([]protocol.StateAck, 0, 29)
+					hasStateAcks = true
 				}
+				stateAcks = append(stateAcks, protocol.StateAck{Channel: ch, Ack: conn.stateRx[ch]})
+				conn.stateRxFlag[ch]-- // PS2: decrement per flush
 			}
 		}
 
@@ -238,9 +235,15 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 		writer.WriteByte(0xF8) // Terminator
 	}
 
-	// Write messages
+	// Write messages, in order, while each fits (connection_append_message /
+	// connection_append_state). A state message also needs the body so far to
+	// be at most 300 bytes.
+	written := 0
 	for _, msg := range messages {
-		writeMessage(writer, msg)
+		if !writeMessage(writer, msg, writer.Position()-bodyStartPos) {
+			break
+		}
+		written++
 	}
 
 	// === Body ends here - patch segment header with actual body size ===
@@ -256,9 +259,12 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 	}
 	buf[i] = byte(val)
 
-	// Append CRC — AppendCRC returns a new slice, so we can return buf to the pool.
+	// Append CRC into a copy. AppendCRC appends IN PLACE when there is room,
+	// and the pooled buffer always has room: the packet returned used to BE
+	// the pooled buffer, handed back to the pool before the caller had sent
+	// it, so the next BuildPacket could overwrite it.
 	data := writer.Bytes()
-	result := protocol.AppendCRC(data)
+	result := protocol.AppendCRC(append(make([]byte, 0, len(data)+4), data...))
 	packetBufPool.Put(buf)
 
 	// Debug: hex dump initial login packets (sendArrival <= 5) and first 10 post-promotion packets
@@ -266,23 +272,48 @@ func BuildPacket(conn *Connection, messages []*protocol.Message) []byte {
 		log.Printf("OUTGOING HEX arrival=%d (%d bytes): %X", conn.sendArrival-1, len(result), result)
 	}
 
-	return result
+	return result, written
 }
 
-// writeMessage writes a single message into the packet buffer.
-func writeMessage(writer *buffer.Writer, msg *protocol.Message) {
-	// Write message type
-	writer.WriteByte(byte(msg.Type))
+// sizeFieldLen is the bytes buffer_append_size takes: one, or 0xFF + a word.
+func sizeFieldLen(size int) int {
+	if size < 255 {
+		return 1
+	}
+	return 3
+}
 
+// writeMessage writes a single message into the packet buffer, or nothing
+// and false when it does not fit what is left. bodySoFar is the segment
+// body already written.
+func writeMessage(writer *buffer.Writer, msg *protocol.Message, bodySoFar int) bool {
 	// Handle state channel messages (0x00-0xF7)
 	if msg.Type.IsStateChannel() && !msg.Type.IsReliable() {
+		if bodySoFar > 300 {
+			return false
+		}
 		rleData := protocol.RunLengthEncode(msg.Data())
+		if 1+sizeFieldLen(msg.Size())+3+len(rleData) > writer.Remaining() {
+			return false
+		}
+		writer.WriteByte(byte(msg.Type))
 		writer.WriteSize(msg.Size()) // Original (decoded) data size
 		writer.WriteUint16(msg.Sequence)
 		writer.WriteByte(msg.XORByte)
 		writer.WriteBytes(rleData)
-		return
+		return true
 	}
+
+	cost := 1 + sizeFieldLen(msg.Size()) + msg.Size()
+	if msg.Type.IsReliable() {
+		cost += 2
+	}
+	if cost > writer.Remaining() {
+		return false
+	}
+
+	// Write message type
+	writer.WriteByte(byte(msg.Type))
 
 	// Write size (data includes opcode for reliable messages)
 	writer.WriteSize(msg.Size())
@@ -294,6 +325,7 @@ func writeMessage(writer *buffer.Writer, msg *protocol.Message) {
 
 	// Write message data
 	writer.WriteBytes(msg.Data())
+	return true
 }
 
 // ParsePacket parses an incoming UDP packet from the server.
@@ -370,7 +402,7 @@ func ParsePacket(data []byte, conn *Connection) (*ReceivedPacket, error) {
 // rx+1 written zigzag, so the server, decoding the PS2's way, took each held
 // S as S+2. Verified on PS2 captures: after a burst lost 11..18, the PS2
 // acked rx=10 with bits 7..13 — 19..25, the second burst, exactly.
-func GuaranteedAckMask(held map[uint16]bool, rx uint16) uint64 {
+func GuaranteedAckMask[V any](held map[uint16]V, rx uint16) uint64 {
 	var mask uint64
 	for seq := range held {
 		bit := int(int16(seq-rx)) - 2

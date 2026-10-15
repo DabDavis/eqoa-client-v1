@@ -1,14 +1,19 @@
 package game
 
-// Port of VILightning from PS2 SUPPORT module.
-// Renders a jagged lightning bolt between two 3D points with charge decay,
-// branching, and per-frame jitter regeneration.
+// The PS2's spell lightning, VILightning (decomp/src/vilightning.cpp): a bolt
+// of 17 points between two ends, bent by three harmonics of interpolated
+// noise — 4 segments of 0.57, 8 of 0.15, and a per-point 0.08, cross-fading
+// to fresh noise at 0.64, 10.24 and 44 cycles a second — and up to three
+// branches from the main bolt's points 3, 6 and 9 to the same end. A strike
+// lasts 70..350 ms (a quarter of that with no branches) and then re-rolls
+// its branch count. Every 30 ms the bolts are copied into a three-frame ring,
+// and the older frames are drawn at 2/3 and 1/3 brightness. Each bolt is four
+// ribbons 0.08 wide, two vertical and two across, both windings, additive,
+// at colour · charge. The charge falls at 5 a second; the spell holds it at
+// 1 for the event's duration.
 //
-// PS2 VILightning is 8832 (0x2280) bytes:
-//   +0x18C0  maxBranchCount (int)
-//   +0x18C8  charge (float)
-// The bolt is rendered as a chain of line segments with random perpendicular
-// offsets.
+// The material is lightning.tga, which no file on this disc carries, so the
+// ribbons are drawn untextured.
 
 import (
 	"math"
@@ -17,203 +22,263 @@ import (
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
 
-const (
-	lightningSegments     = 16   // PS2: 17 control points, step=1/16
-	lightningJitterScale  = 2.0  // max perpendicular displacement per segment
-	lightningChargeDecay  = 5.0  // PS2: deltaMs*5*0.001 = 5.0 charge/sec
-	lightningRegenMin     = 0.070 // PS2: min 70ms
-	lightningRegenRange   = 0.280 // PS2: rand()%351 capped 70, range [70, 350] ms
-)
+type lvec [3]float32
 
-// LightningBolt represents a single lightning bolt between two points.
-// Port of VILightning from PS2 SUPPORT module (0x2280 bytes).
-type LightningBolt struct {
-	Source    [3]float32 // bolt start position
-	Target    [3]float32 // bolt end position
-	Color  [3]float32 // RGB (0-1)
-	Charge float32    // current charge (1.0 = bright, decays to 0)
-
-	// Pre-generated bolt shape (offsets perpendicular to bolt axis)
-	mainOffsets [][2]float32 // [segment][perpAxis1, perpAxis2]
-
-	// Perpendicular basis vectors for the bolt
-	perp1 [3]float32 // perpendicular axis 1
-	perp2 [3]float32 // perpendicular axis 2
-
-	regenTimer float32 // time since last shape regeneration
-	alive      bool
+func (a lvec) add(b lvec) lvec      { return lvec{a[0] + b[0], a[1] + b[1], a[2] + b[2]} }
+func (a lvec) sub(b lvec) lvec      { return lvec{a[0] - b[0], a[1] - b[1], a[2] - b[2]} }
+func (a lvec) scale(k float32) lvec { return lvec{a[0] * k, a[1] * k, a[2] * k} }
+func (a lvec) mul(m [3]lvec) lvec {
+	return m[0].scale(a[0]).add(m[1].scale(a[1])).add(m[2].scale(a[2]))
+}
+func lcross(a, b lvec) lvec {
+	return lvec{a[1]*b[2] - a[2]*b[1], -a[0]*b[2] + a[2]*b[0], a[0]*b[1] - a[1]*b[0]}
+}
+func (a lvec) normalized() lvec {
+	l := float32(math.Sqrt(float64(a[0]*a[0] + a[1]*a[1] + a[2]*a[2])))
+	if l == 0 {
+		return a
+	}
+	return a.scale(1 / l)
 }
 
-// NewLightningBolt creates a lightning bolt with the given parameters.
-func NewLightningBolt(sx, sy, sz, tx, ty, tz float32, color [3]float32) *LightningBolt {
-	lb := &LightningBolt{
-		Source: [3]float32{sx, sy, sz},
-		Target: [3]float32{tx, ty, tz},
-		Color:  color,
-		Charge: 1.0,
-		alive:  true,
+// boltHarmonic is VIBoltHarmonic: 17 samples cross-fading to 17 new ones.
+type boltHarmonic struct {
+	phase, rate, amplitude float32
+	samples                [2][17]lvec
+}
+
+func (h *boltHarmonic) create(amplitude, rate float32, rng *rand.Rand) {
+	h.phase, h.rate, h.amplitude = 0, rate, amplitude
+	h.generate(0, rng)
+	h.generate(1, rng)
+}
+
+// generate is GenerateSamples: x and y within ±amplitude, z 0.
+func (h *boltHarmonic) generate(which int, rng *rand.Rand) {
+	for i := range h.samples[which] {
+		h.samples[which][i] = lvec{
+			float32(rng.Intn(256)-127) / 128 * h.amplitude,
+			float32(rng.Intn(256)-127) / 128 * h.amplitude,
+			0,
+		}
 	}
-	lb.computeBasis()
-	lb.regenerate()
+}
+
+// sample is Sample: old + (new − old)·(1 − t), t = sin(phase·π + π/2)/2 + 1/2.
+func (h *boltHarmonic) sample(i int) lvec {
+	t := float32(math.Sin(float64(h.phase)*math.Pi+math.Pi/2))*0.5 + 0.5
+	return h.samples[0][i].add(h.samples[1][i].sub(h.samples[0][i]).scale(1 - t))
+}
+
+func (h *boltHarmonic) update(dtMs int, rng *rand.Rand) {
+	if 1 <= h.phase {
+		h.phase = 0
+		h.samples[0] = h.samples[1]
+		h.generate(1, rng)
+		return
+	}
+	h.phase = min(1, h.phase+float32(dtMs)*0.001*h.rate)
+}
+
+// bolt is VIBolt.
+type bolt struct {
+	harmonics [3]boltHarmonic
+	points    [17]lvec
+}
+
+func (b *bolt) reset(rng *rand.Rand) {
+	b.harmonics[0].create(0.57, 0.64, rng)
+	b.harmonics[1].create(0.15, 10.24, rng)
+	b.harmonics[2].create(0.08, 44.0, rng)
+}
+
+// update is VIBolt::Update: the straight line, then four segments bent by
+// harmonic 0 (the last end held), eight by harmonic 1, and every inner point
+// moved by harmonic 2 — each offset turned into the bolt's frame.
+func (b *bolt) update(dtMs int, a, e lvec, m [3]lvec, rng *rand.Rand) {
+	for i := range b.harmonics {
+		b.harmonics[i].update(dtMs, rng)
+	}
+	d := e.sub(a)
+	for i := range b.points {
+		b.points[i] = a.add(d.scale(float32(i) * 0.0625))
+	}
+	bend := func(n, span int, h *boltHarmonic, last bool) {
+		for i := 0; i < n; i++ {
+			start, end := i*span, i*span+span
+			t := h.sample(i).mul(m)
+			d := b.points[end]
+			if last || i < n-1 {
+				d = d.add(t)
+			}
+			d = d.sub(b.points[start])
+			for j := start; j <= end; j++ {
+				b.points[j] = b.points[start].add(d.scale(float32(j-start) / float32(end-start)))
+			}
+		}
+	}
+	bend(4, 4, &b.harmonics[0], false)
+	bend(8, 2, &b.harmonics[1], true)
+	for i := 1; i < 16; i++ {
+		b.points[i] = b.points[i].add(b.harmonics[2].sample(i).mul(m))
+	}
+}
+
+// LightningBolt is VILightning.
+type LightningBolt struct {
+	Source, Target [3]float32
+	Color          [3]float32
+	Charge         float32
+
+	lastCharge  float32
+	matrix      [3]lvec // right, up, along
+	strikeMs    int
+	boltCount   int
+	maxBranches int
+	bolts       [4]bolt
+	ring        [3]struct {
+		count  int
+		points [4][17]lvec
+	}
+	ringHead, ringCount, ringMs int
+	rng                         *rand.Rand
+}
+
+// NewLightningBolt makes a bolt from (sx,sy,sz) to (tx,ty,tz) at charge 1.
+func NewLightningBolt(sx, sy, sz, tx, ty, tz float32, color [3]float32) *LightningBolt {
+	lb := &LightningBolt{Color: color, Charge: 1, ringHead: -1, rng: rand.New(rand.NewSource(rand.Int63()))}
+	for i := range lb.bolts {
+		lb.bolts[i].reset(lb.rng)
+	}
+	lb.SetEndpoints(sx, sy, sz, tx, ty, tz)
 	return lb
 }
 
-// computeBasis builds two perpendicular vectors to the bolt axis.
-func (lb *LightningBolt) computeBasis() {
-	dx := lb.Target[0] - lb.Source[0]
-	dy := lb.Target[1] - lb.Source[1]
-	dz := lb.Target[2] - lb.Source[2]
-	length := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
-	if length < 0.001 {
-		lb.perp1 = [3]float32{1, 0, 0}
-		lb.perp2 = [3]float32{0, 1, 0}
-		return
-	}
-	// Normalize bolt direction
-	ax := dx / length
-	ay := dy / length
-	az := dz / length
-
-	// Find a vector not parallel to axis
-	var up [3]float32
-	if math.Abs(float64(ay)) < 0.9 {
-		up = [3]float32{0, 1, 0}
-	} else {
-		up = [3]float32{1, 0, 0}
-	}
-
-	// Cross product: perp1 = axis × up
-	lb.perp1[0] = ay*up[2] - az*up[1]
-	lb.perp1[1] = az*up[0] - ax*up[2]
-	lb.perp1[2] = ax*up[1] - ay*up[0]
-	p1len := float32(math.Sqrt(float64(lb.perp1[0]*lb.perp1[0] + lb.perp1[1]*lb.perp1[1] + lb.perp1[2]*lb.perp1[2])))
-	if p1len > 0.001 {
-		lb.perp1[0] /= p1len
-		lb.perp1[1] /= p1len
-		lb.perp1[2] /= p1len
-	}
-
-	// Cross product: perp2 = axis × perp1
-	lb.perp2[0] = ay*lb.perp1[2] - az*lb.perp1[1]
-	lb.perp2[1] = az*lb.perp1[0] - ax*lb.perp1[2]
-	lb.perp2[2] = ax*lb.perp1[1] - ay*lb.perp1[0]
-}
-
-// regenerate creates new random bolt shape (jitter offsets).
-func (lb *LightningBolt) regenerate() {
-	n := lightningSegments
-	lb.mainOffsets = make([][2]float32, n+1)
-	// Endpoints have no jitter
-	lb.mainOffsets[0] = [2]float32{0, 0}
-	lb.mainOffsets[n] = [2]float32{0, 0}
-	for i := 1; i < n; i++ {
-		// Jitter scales with distance from endpoints (midpoint gets most)
-		t := float32(i) / float32(n)
-		envelope := 4.0 * t * (1.0 - t) // peaks at 1.0 at midpoint
-		lb.mainOffsets[i] = [2]float32{
-			(rand.Float32()*2 - 1) * lightningJitterScale * envelope,
-			(rand.Float32()*2 - 1) * lightningJitterScale * envelope,
-		}
-	}
-
-}
-
-// SetEndpoints updates the bolt source and target positions.
+// SetEndpoints is SetLocation: the ends and the bolt's frame — right across
+// it and level, up perpendicular to both, and along it.
 func (lb *LightningBolt) SetEndpoints(sx, sy, sz, tx, ty, tz float32) {
 	lb.Source = [3]float32{sx, sy, sz}
 	lb.Target = [3]float32{tx, ty, tz}
-	lb.computeBasis()
+	d := lvec(lb.Target).sub(lvec(lb.Source))
+	right := lcross(lvec{0, 1, 0}, d)
+	up := lcross(d, right)
+	lb.matrix = [3]lvec{right.normalized(), up.normalized(), d.normalized()}
 }
 
-// Flash sets charge to 1.0 (called when PS2 timer expires for final bright flash).
+// SetMaxBranchCount is VILightning::SetMaxBranchCount (the event's m_p10),
+// at most 3.
+func (lb *LightningBolt) SetMaxBranchCount(n int) {
+	lb.maxBranches = min(n, 3)
+}
+
+// Flash is SetCharge(1), which the spell does every frame of its duration.
 func (lb *LightningBolt) Flash() {
-	lb.Charge = 1.0
+	lb.Charge = 1
 }
 
-// Update advances the bolt simulation by dt seconds.
-// PS2 VILightning::Update(deltaMs) decays charge and periodically regenerates bolt shape.
+// Update is VILightning::Update, with dt in seconds (the PS2 hands it whole
+// milliseconds).
 func (lb *LightningBolt) Update(dt float32) {
-	if !lb.alive {
-		return
-	}
-
-	// Decay charge over time
-	lb.Charge -= lightningChargeDecay * dt
-	if lb.Charge <= 0 {
-		lb.Charge = 0
-		lb.alive = false
-		return
-	}
-
-	// Periodically regenerate bolt shape (jitter)
-	// PS2 VILightning::Update (0x0044F0C8): timer = rand()%351, clamped min 70.
-	// Range [70, 350] ms = [0.070, 0.350] seconds.
-	lb.regenTimer += dt
-	regenThreshold := lightningRegenMin + rand.Float32()*lightningRegenRange
-	if lb.regenTimer >= regenThreshold {
-		lb.regenTimer = 0
-		lb.regenerate()
-	}
-}
-
-// Alive returns whether the bolt still has charge remaining.
-func (lb *LightningBolt) Alive() bool {
-	return lb.alive && lb.Charge > 0
-}
-
-// Render draws the lightning bolt using immediate-mode lines.
-func (lb *LightningBolt) Render() {
-	if !lb.alive || lb.Charge <= 0 {
-		return
-	}
-
-	// Compute alpha from charge
-	alpha := lb.Charge
-	if alpha > 1 {
-		alpha = 1
-	}
-
-	// Main bolt color
-	mainColor := rl.Color{
-		R: uint8(lb.Color[0] * 255 * alpha),
-		G: uint8(lb.Color[1] * 255 * alpha),
-		B: uint8(lb.Color[2] * 255 * alpha),
-		A: uint8(255 * alpha),
-	}
-
-	// Glow (brighter core)
-	coreColor := rl.Color{
-		R: uint8(math.Min(float64(lb.Color[0]*255*alpha+80*alpha), 255)),
-		G: uint8(math.Min(float64(lb.Color[1]*255*alpha+80*alpha), 255)),
-		B: uint8(math.Min(float64(lb.Color[2]*255*alpha+80*alpha), 255)),
-		A: uint8(200 * alpha),
-	}
-
-	n := lightningSegments
-	// Draw main bolt
-	lb.drawChain(lb.Source, lb.Target, lb.mainOffsets, n, mainColor)
-	// Draw core (slightly offset for glow effect)
-	lb.drawChain(lb.Source, lb.Target, lb.mainOffsets, n, coreColor)
-}
-
-// drawChain draws a segmented line with perpendicular offsets.
-func (lb *LightningBolt) drawChain(src, tgt [3]float32, offsets [][2]float32, segs int, color rl.Color) {
-	prev := rl.Vector3{X: src[0], Y: src[1], Z: src[2]}
-	for i := 1; i <= segs; i++ {
-		t := float32(i) / float32(segs)
-		// Linear interpolation along bolt axis
-		px := src[0] + (tgt[0]-src[0])*t
-		py := src[1] + (tgt[1]-src[1])*t
-		pz := src[2] + (tgt[2]-src[2])*t
-		// Add perpendicular offset
-		if i < len(offsets) {
-			px += lb.perp1[0]*offsets[i][0] + lb.perp2[0]*offsets[i][1]
-			py += lb.perp1[1]*offsets[i][0] + lb.perp2[1]*offsets[i][1]
-			pz += lb.perp1[2]*offsets[i][0] + lb.perp2[2]*offsets[i][1]
+	ms := int(dt * 1000)
+	lb.strikeMs -= ms
+	lb.ringMs = max(lb.ringMs-ms, 0)
+	if lb.strikeMs <= 0 {
+		for i := 1; i < 4; i++ {
+			if i < lb.boltCount {
+				lb.bolts[i].reset(lb.rng)
+			}
 		}
-		pt := rl.Vector3{X: px, Y: py, Z: pz}
-		rl.DrawLine3D(prev, pt, color)
-		prev = pt
+		lb.strikeMs = max(lb.rng.Intn(351), 70)
+		lb.boltCount = lb.rng.Intn(lb.maxBranches+1) + 1
+		if lb.boltCount == 1 {
+			lb.strikeMs >>= 2
+		}
+	}
+	for i := 0; i < lb.boltCount; i++ {
+		if i == 0 {
+			lb.bolts[0].update(ms, lvec(lb.Source), lvec(lb.Target), lb.matrix, lb.rng)
+		} else {
+			lb.bolts[i].update(ms, lb.bolts[0].points[i*3], lvec(lb.Target), lb.matrix, lb.rng)
+		}
+	}
+	lb.lastCharge = lb.Charge
+	lb.Charge = max(0, lb.Charge-float32(ms*5)*0.001)
+}
+
+// Alive returns whether the bolt still has charge.
+func (lb *LightningBolt) Alive() bool {
+	return lb.Charge > 0 || lb.lastCharge > 0
+}
+
+// Render is VILightning::Render: the ring, then every frame in it.
+func (lb *LightningBolt) Render() {
+	if lb.ringMs == 0 {
+		lb.ringHead = (lb.ringHead + 1) % 3
+		lb.ringMs = 30
+		lb.ringCount = min(3, lb.ringCount+1)
+	}
+	r := &lb.ring[lb.ringHead]
+	r.count = lb.boltCount
+	for i := 0; i < lb.boltCount; i++ {
+		r.points[i] = lb.bolts[i].points
+	}
+
+	const glOne, glSrcAlpha, glAdd = 1, 0x0302, 0x8006
+	rl.DrawRenderBatchActive()
+	rl.DisableDepthMask()
+	rl.SetBlendFactors(glSrcAlpha, glOne, glAdd)
+	rl.BeginBlendMode(rl.BlendCustom)
+	rl.Begin(rl.Triangles)
+	for i := 0; i < lb.ringCount; i++ {
+		f := &lb.ring[(lb.ringHead-i+3)%3]
+		for j := 0; j < f.count; j++ {
+			lb.renderBolt(&f.points[j], 3-i)
+		}
+	}
+	rl.End()
+	rl.EndBlendMode()
+	rl.EnableDepthMask()
+}
+
+// renderBolt is RenderBoltVertices: four ribbons — offsets ±0.04 up, then
+// ±0.04 along the bolt's right — each two strips of points 0..8 and 8..16,
+// pinched at the ends, at colour · n/3 · the charge.
+func (lb *LightningBolt) renderBolt(pts *[17]lvec, n int) {
+	k := float32(n) / 3 * lb.lastCharge
+	c := func(v float32) uint8 { return uint8(min(max(v*k, 0), 1) * 255) }
+	rl.Color4ub(c(lb.Color[0]), c(lb.Color[1]), c(lb.Color[2]), 255)
+
+	side := lvec{0.04, 0, 0}.mul(lb.matrix)
+	for _, off := range [4]lvec{{0, 0.04, 0}, {0, -0.04, 0}, side, side.scale(-1)} {
+		var strip []lvec
+		strip = append(strip, pts[0], pts[0])
+		for j := 1; j < 9; j++ {
+			strip = append(strip, pts[j].sub(off), pts[j].add(off))
+		}
+		lightningStrip(strip)
+		strip = append(strip[:0], pts[8].sub(off), pts[8].add(off))
+		for j := 9; j < 17; j++ {
+			if j == 16 {
+				strip = append(strip, pts[16], pts[16])
+			} else {
+				strip = append(strip, pts[j].sub(off), pts[j].add(off))
+			}
+		}
+		lightningStrip(strip)
+	}
+}
+
+// lightningStrip emits a triangle strip as triangles, alternating winding
+// as a strip does.
+func lightningStrip(v []lvec) {
+	for i := 0; i+2 < len(v); i++ {
+		a, b, c := v[i], v[i+1], v[i+2]
+		if i%2 == 1 {
+			a, b = b, a
+		}
+		rl.Vertex3f(a[0], a[1], a[2])
+		rl.Vertex3f(b[0], b[1], b[2])
+		rl.Vertex3f(c[0], c[1], c[2])
 	}
 }
 

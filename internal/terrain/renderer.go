@@ -229,6 +229,10 @@ type Renderer struct {
 	// SkyColor is this frame's sky colour — VIScene::SetupTimeOfDaySky's,
 	// which is also the fog colour out of liquid — for the sky dome.
 	SkyColor [3]float32
+	// Ambient, Sun and SunDir are this frame's lights as SetupTimeOfDayLights
+	// leaves them (after the overcast and a flash): the raster's ambient, its
+	// sun colour and the direction the sunlight travels (m_b).
+	Ambient, Sun, SunDir [3]float32
 
 	// Player radial light (lantern) — the PS2's one point light.
 	playerLightOn     bool
@@ -351,6 +355,7 @@ func (r *Renderer) SetLightingUniforms(camX, camY, camZ, gameHour float32) {
 	}
 	fogEnd = min(900, fogEnd)
 
+	r.Ambient, r.Sun, r.SunDir = ambientColor, sunColor, sunDir
 	rl.SetShaderValue(r.litShader, r.locSunColor, sunColor[:], rl.ShaderUniformVec3)
 	rl.SetShaderValue(r.litShader, r.locAmbient, ambientColor[:], rl.ShaderUniformVec3)
 	rl.SetShaderValue(r.litShader, r.locFogColor, fogColor[:], rl.ShaderUniformVec3)

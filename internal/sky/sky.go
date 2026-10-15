@@ -1,85 +1,157 @@
 package sky
 
+// Sky — a port of the sky half of the PS2's VIAtmosphere
+// (decomp/src/viatmosphere.cpp), as SetResources finds it in SKY.ESF:
+//
+//   - RenderSky draws the "sky" dome at the camera, UNROTATED, with its own
+//     material: layer 0 the sky texture scrolling at 0.009 a second, layer 1
+//     the same texture tiled ×3, alpha-blended at 64 and scrolling at 0.05
+//     (VIMaterial::Process). Every layer's colour is the sky colour
+//     VIScene::SetupTimeOfDaySky computes. "EQOA_Skydome_360" is drawn only
+//     on the Plane of Sky (SetPlaneOfSky), never alongside it.
+//   - Then the Sun (8 units), the Corona (24, scaled by m_skyScale) and the
+//     Moon (4), 35 units out on a circle in the XY plane, turning 15° an hour
+//     (VIAtmosphere::Update), all additive (their materials are blend 1), and
+//     only while the sun's alpha is not zero: an overcast sky hides them.
+//   - RenderStars: 128 fixed stars out of the module's noise table, twinkling
+//     by a 32-step table, scaled by the night factor m_p61C; a shooting star
+//     every 10–25 s; and, while a flash lasts, the 14 lightning patches.
+//   - During a weather transition ProcessTransitions rebuilds the dome
+//     material: a third layer cross-fades the new sky texture in (Sunny, the
+//     dome's own, or DarkClouds) while the cloud layer fades out, and then the
+//     cloud layer comes back on the new texture.
+
 import (
 	"log"
 	"math"
+	"math/rand"
 	"runtime"
 	"unsafe"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 
-	"github.com/eqoa/client/internal/mathutil"
 	"github.com/DabDavis/eqoa-esf-tools/pkg/esf"
 )
 
-// spriteData holds parsed ESF sprite data before GPU upload.
-type spriteData struct {
-	strips   []stripData
-	surfaces map[int]*esf.Surface // material index → Layer 0 texture
-	overlay  map[int]*esf.Surface // material index → Layer 1 texture (cloud detail)
-	uvScale  map[int]float32      // material index → Layer 1 UV scale factor
+// The sky textures VIAtmosphere::SetResources keeps as m_skyTex[0..2]:
+// PS2EQSky_Sunny, the dome's own layer-0 texture, PS2EQSky_DarkClouds.
+const (
+	SkyTexSunny   = 0
+	SkyTexDefault = 1
+	SkyTexDark    = 2
+)
+
+// Atmosphere is what the sky reads from VIAtmosphere and VIScene each frame.
+type Atmosphere struct {
+	// SkyColor is VIScene::SetupTimeOfDaySky's colour (0..1): the hour's sun
+	// colour blended toward the overcast grey and tinted by the terrain
+	// profiles. SetSkyColor gives it to every layer of the dome. Zero means
+	// "not supplied" and leaves the texture as authored.
+	SkyColor [3]float32
+	// NightFactor is m_p61C: 1 at midnight, 0 from 6:00 to 18:00, faded with
+	// the overcast. Stars show while it is above zero.
+	NightFactor float32
+	// SkyScale is m_skyScale, the corona's scale.
+	SkyScale float32
+	// SunAlpha is the alpha ProcessTransitions gives the sun's and moon's
+	// materials, CoronaAlpha the corona's. Zero hides all three (m_overcast).
+	SunAlpha, CoronaAlpha uint8
+	// Transition is m_p608 as ProcessTransitions saw it this frame — 1 on
+	// the frame a transition completes — and NextSky m_p5F8 (SkyTex*).
+	Transition float32
+	NextSky    int
+	// Flash is GetLightning's m_pF48 and Patches the 14 lightning patches
+	// (RecomputeLightningPatches): a direction ×100 and a half-size.
+	Flash   float32
+	Patches [14][4]float32
 }
 
-// stripData holds one triangle strip from a PrimBuffer VertexList.
-type stripData struct {
-	vertices []esf.Vertex
-	matIdx   int
+// DefaultAtmosphere is a clear sky at the given hour, for when no weather
+// system drives the sky.
+func DefaultAtmosphere(hour float32) Atmosphere {
+	n := float32(0)
+	switch {
+	case hour < 6:
+		n = 1 - hour/6
+	case hour > 18:
+		n = (hour - 18) / 6
+	}
+	return Atmosphere{NightFactor: n, SkyScale: 1, SunAlpha: 255, CoronaAlpha: 255, NextSky: SkyTexDefault}
 }
 
-// meshGroup holds a GPU mesh and its material.
-type meshGroup struct {
-	Mesh     rl.Mesh
-	Material rl.Material
-	HasAlpha bool
-	Overlay  bool // true = Layer 1 overlay (cloud detail, rendered with additive blend)
+// skyLayer is one VIMaterial layer of a dome.
+type skyLayer struct {
+	surf   *esf.Surface
+	blend  int32      // VIAlphaBlendMode
+	alpha  float32    // the layer colour's alpha, 0..255
+	uvMul  [2]float32 // UVTransform's scale
+	rate   [2]float32 // m_uvRate, per second
+	offset [2]float32 // m_uvOffset (VIMaterial::Process)
 }
 
-// Sky loads and renders the sky dome from SKY.ESF.
+// dome is one sky SimpleSprite: its triangles and its material's layers.
+type dome struct {
+	verts  []esf.Vertex
+	layers []skyLayer
+	mesh   rl.Mesh
+	built  bool
+}
+
+// celestial is the Sun, the Corona or the Moon: a quad in the XZ plane.
+type celestial struct {
+	verts []esf.Vertex
+	surf  *esf.Surface
+	blend int32
+	color [4]byte
+	mesh  rl.Mesh
+	ok    bool
+}
+
+// star is one of RenderStars' 128: a position 100 out (Init's RotateHPR of
+// (0, 100, 0)), a half-size, and a twinkle phase (m_pE20).
+type star struct {
+	pos   rl.Vector3
+	size  float32
+	phase int
+}
+
+// Sky loads and renders the PS2 sky from SKY.ESF.
 type Sky struct {
-	sprites  []spriteData
-	groups   []meshGroup
-	built    bool
-	whiteTex rl.Texture2D
-	texCache map[int32]rl.Texture2D
-	scale    float32
+	domes      [2]*dome // m_p4E4: "sky", "EQOA_Skydome_360"
+	planeOfSky bool     // m_p618
+	skyTex     [3]*esf.Surface
+	sun        celestial
+	corona     celestial
+	moon       celestial
+	starSurf   *esf.Surface
+	patchSurf  *esf.Surface
 
-	// Time-of-day modulation
-	rotAngle    float32  // slow dome rotation for cloud drift (radians)
-	baseTint    rl.Color // tint for base dome meshes
-	overlayTint rl.Color // tint for cloud overlay
+	stars   [128]star
+	twinkle [32]float32 // m_pEA0
+	starT   float32     // m_pF24
+	shootIn float32     // m_pF28: seconds to the next shooting star
+	shootT  float32     // m_pF2C: 0 none, else its progress
+	shootA  rl.Vector3  // m_pF30
+	shootB  rl.Vector3  // m_pF3C
+	rng     *rand.Rand
 
-	// Celestial billboard textures (sun = Corona, moon, star)
-	sunTex  rl.Texture2D
-	moonTex rl.Texture2D
-	starTex rl.Texture2D
-	sunSurf  *esf.Surface // deferred GPU upload
-	moonSurf *esf.Surface
-	starSurf *esf.Surface
-	hasSun  bool
-	hasMoon bool
-	hasStar bool
-
-	// Procedural star field — pre-built GPU mesh (tiny quads on unit sphere)
-	starPositions []rl.Vector3 // unit sphere positions (~200 points, upper hemisphere)
-	starMesh      rl.Mesh      // single GPU mesh for all stars
-	starMat       rl.Material  // white unlit material
-	starBuilt     bool
-
-	// Celestial positions (computed in Update)
-	sunDir    rl.Vector3 // unit direction from center
-	moonDir   rl.Vector3
-	sunAlpha  uint8 // 0 at night, 255 during day
-	moonAlpha uint8 // 255 at night, 0 during day
-	starAlpha uint8 // 255 at night, fades at dawn/dusk
-
-	// Weather-driven overcast (PS2 VIAtmosphere offset +0x61C).
-	// Set by SetOvercast(). 0.0 = clear, 1.0 = fully overcast.
-	// Darkens sky, reduces sun/moon/star alpha, boosts cloud overlay.
-	overcastInterp float32
+	atm    Atmosphere
+	atmSet bool
+	hour   float32
+	dt     float32
+	lastT  float32 // the transition value last applied to the dome material
+	texGPU map[*esf.Surface]rl.Texture2D
+	white  rl.Texture2D
+	shader rl.Shader
+	locUV  int32
+	locOff int32
+	locCol int32
+	mat    rl.Material // the dome's, on the sky shader
+	celMat rl.Material // the sun, corona and moon's, on the default shader
+	built  bool
 }
 
-// NewSky opens SKY.ESF and loads all SimpleSprite geometry and textures.
-// Returns nil if the file can't be loaded.
+// NewSky opens SKY.ESF. Returns nil if it cannot be loaded.
 func NewSky(esfPath string) *Sky {
 	file, err := esf.Open(esfPath)
 	if err != nil {
@@ -89,583 +161,540 @@ func NewSky(esfPath string) *Sky {
 	return NewSkyFromFile(file)
 }
 
-// NewSkyFromFile creates a Sky from a pre-opened ObjFile.
+// NewSkyFromFile finds what VIAtmosphere::SetResources finds, by name.
 func NewSkyFromFile(file *esf.ObjFile) *Sky {
 	if err := file.BuildDictionary(); err != nil {
 		log.Printf("sky: BuildDictionary: %v", err)
 		return nil
 	}
-
-	root, err := file.Root()
-	if err != nil {
-		log.Printf("sky: Root: %v", err)
-		return nil
-	}
-
-	spriteInfos := root.ChildrenOfType(esf.TypeSimpleSprite)
-	if len(spriteInfos) == 0 {
-		log.Printf("sky: no SimpleSprites found")
-		return nil
-	}
-
-	s := &Sky{
-		scale:    1.0, // the PS2 draws the dome (~339 units) unscaled at the camera (RenderSky)
-		texCache: make(map[int32]rl.Texture2D),
-	}
-
-	for _, info := range spriteInfos {
-		obj, err := file.GetObject(info)
+	find := func(name string) any {
+		o, err := file.FindObject(esf.HashResourceID(name))
 		if err != nil {
+			return nil
+		}
+		return o
+	}
+	s := &Sky{texGPU: map[*esf.Surface]rl.Texture2D{}, rng: rand.New(rand.NewSource(1))}
+
+	for i, name := range []string{"sky", "EQOA_Skydome_360"} {
+		sp, _ := find(name).(*esf.SimpleSprite)
+		if sp == nil {
 			continue
 		}
-		sprite, ok := obj.(*esf.SimpleSprite)
-		if !ok {
-			continue
-		}
+		s.domes[i] = loadDome(file, sp)
+	}
+	if s.domes[0] == nil {
+		log.Printf("sky: no \"sky\" sprite")
+		return nil
+	}
+	// SetResources: m_skyTex[1] is the dome's own layer-0 texture.
+	if len(s.domes[0].layers) > 0 {
+		s.skyTex[SkyTexDefault] = s.domes[0].layers[0].surf
+	}
+	s.skyTex[SkyTexSunny], _ = find("PS2EQSky_Sunny.tga").(*esf.Surface)
+	s.skyTex[SkyTexDark], _ = find("PS2EQSky_DarkClouds.tga").(*esf.Surface)
+	s.starSurf, _ = find("star.tga").(*esf.Surface)
+	s.patchSurf, _ = find("lightning_patch.tga").(*esf.Surface)
 
-		pb, err := sprite.GetPrimBuffer(file)
-		if err != nil || pb == nil {
-			continue
-		}
-
-		// PS2 RenderSky: dome sprites have 400+ verts, billboards ≤16.
-		// Capture billboard sprite textures for sun/moon rendering.
-		totalVerts := 0
-		for _, vl := range pb.VertexLists {
-			totalVerts += len(vl.Vertices)
-		}
-		if totalVerts < 50 {
-			// Billboard sprite — extract texture for sun/moon.
-			mp := pb.MatPal
-			if mp == nil {
-				mp, _ = sprite.GetMatPal(file)
-			}
-			surf := resolveSurface(mp, 0) // Layer 0 texture
-			if surf != nil && surf.Image != nil {
-				if !s.hasSun && s.sunSurf == nil {
-					s.sunSurf = surf
-					log.Printf("sky: captured sun billboard dictID=0x%08x (%d verts)",
-						info.DictID, totalVerts)
-				} else if !s.hasMoon && s.moonSurf == nil {
-					s.moonSurf = surf
-					log.Printf("sky: captured moon billboard dictID=0x%08x (%d verts)",
-						info.DictID, totalVerts)
-				} else if !s.hasStar && s.starSurf == nil {
-					s.starSurf = surf
-					log.Printf("sky: captured star billboard dictID=0x%08x (%d verts)",
-						info.DictID, totalVerts)
-				} else {
-					log.Printf("sky: skipping extra billboard sprite dictID=0x%08x (%d verts)",
-						info.DictID, totalVerts)
-				}
-			}
-			continue
-		}
-
-		mp := pb.MatPal
-		if mp == nil {
-			mp, _ = sprite.GetMatPal(file)
-		}
-
-		sd := spriteData{
-			surfaces: make(map[int]*esf.Surface),
-			overlay:  make(map[int]*esf.Surface),
-			uvScale:  make(map[int]float32),
-		}
-
-		for _, vl := range pb.VertexLists {
-			if len(vl.Vertices) < 3 {
-				continue
-			}
-			sd.strips = append(sd.strips, stripData{
-				vertices: vl.Vertices,
-				matIdx:   vl.Material,
-			})
-
-			// Resolve Layer 0 texture.
-			if _, seen := sd.surfaces[vl.Material]; !seen {
-				sd.surfaces[vl.Material] = resolveSurface(mp, vl.Material)
-			}
-
-			// PS2 dome material: Layer 1 = cloud detail overlay with 3x UV tiling.
-			// Resolve Layer 1 texture and UV scale if present.
-			if _, seen := sd.overlay[vl.Material]; !seen {
-				if surf, scale := resolveOverlay(mp, vl.Material); surf != nil {
-					sd.overlay[vl.Material] = surf
-					sd.uvScale[vl.Material] = scale
-				}
-			}
-		}
-
-		if len(sd.strips) > 0 {
-			s.sprites = append(s.sprites, sd)
-			log.Printf("sky: loaded dome sprite dictID=0x%08x with %d strips, %d verts",
-				info.DictID, len(sd.strips), totalVerts)
+	for _, c := range []struct {
+		name string
+		dst  *celestial
+	}{{"Sun", &s.sun}, {"Corona", &s.corona}, {"Moon", &s.moon}} {
+		if sp, _ := find(c.name).(*esf.SimpleSprite); sp != nil {
+			*c.dst = loadCelestial(file, sp)
 		}
 	}
 
-	log.Printf("sky: loaded %d sprites", len(s.sprites))
+	s.initStars()
+	s.atm = DefaultAtmosphere(10)
+	log.Printf("sky: dome %d tris (%d layers), sun=%v corona=%v moon=%v, plane-of-sky dome=%v",
+		len(s.domes[0].verts)/3, len(s.domes[0].layers), s.sun.ok, s.corona.ok, s.moon.ok, s.domes[1] != nil)
 	return s
 }
 
-// build uploads meshes to GPU. Called on first Draw after rl.InitWindow.
+// loadDome reads a dome's triangles and its first material's layers.
+func loadDome(file *esf.ObjFile, sp *esf.SimpleSprite) *dome {
+	pb, err := sp.GetPrimBuffer(file)
+	if err != nil || pb == nil {
+		return nil
+	}
+	mp := pb.MatPal
+	if mp == nil {
+		mp, _ = sp.GetMatPal(file)
+	}
+	d := &dome{}
+	for _, vl := range pb.VertexLists {
+		d.verts = append(d.verts, destripVertices(vl.Vertices)...)
+	}
+	if mp != nil && len(mp.Materials) > 0 {
+		for _, l := range mp.Materials[0].Layers {
+			d.layers = append(d.layers, skyLayer{
+				surf:  l.Surface,
+				blend: l.BlendMode,
+				alpha: float32(l.Color[3]),
+				uvMul: [2]float32{nonZero(l.UVTransform[0]), nonZero(l.UVTransform[4])},
+				rate:  [2]float32{l.URate, l.VRate},
+			})
+		}
+	}
+	return d
+}
+
+func nonZero(f float32) float32 {
+	if f == 0 {
+		return 1
+	}
+	return f
+}
+
+// loadCelestial reads one of the sun sprites: its quad and its material's
+// first layer.
+func loadCelestial(file *esf.ObjFile, sp *esf.SimpleSprite) celestial {
+	pb, err := sp.GetPrimBuffer(file)
+	if err != nil || pb == nil {
+		return celestial{}
+	}
+	mp := pb.MatPal
+	if mp == nil {
+		mp, _ = sp.GetMatPal(file)
+	}
+	var c celestial
+	for _, vl := range pb.VertexLists {
+		c.verts = append(c.verts, destripVertices(vl.Vertices)...)
+	}
+	if mp != nil && len(mp.Materials) > 0 && len(mp.Materials[0].Layers) > 0 {
+		l := mp.Materials[0].Layers[0]
+		c.surf, c.blend, c.color = l.Surface, l.BlendMode, l.Color
+	}
+	c.ok = len(c.verts) > 0 && c.surf != nil
+	return c
+}
+
+// rotateHPRRow1 is row 1 of VIMatrix44::RotateHPR (row vectors): the image
+// of (0, 1, 0), which is where Init and RecomputeLightningPatches put a point
+// 100 out.
+func rotateHPRRow1(h, p, r float64) rl.Vector3 {
+	sh, ch := math.Sincos(h)
+	sp, cp := math.Sincos(p)
+	sr, cr := math.Sincos(r)
+	return rl.Vector3{
+		X: float32(-sr*ch + cr*sp*sh),
+		Y: float32(cr * cp),
+		Z: float32(sr*sh + cr*sp*ch),
+	}
+}
+
+// initStars is the star half of VIAtmosphere::Init. The positions come out
+// of the module's noise table; the sizes and phases out of rand(), whose
+// state at Init is not known, so a seeded generator stands in.
+func (s *Sky) initStars() {
+	for i := range s.stars {
+		h := float64(128-int(starNoise[i*3+0])) / 128 * math.Pi * 2.3
+		p := float64(128-int(starNoise[i*3+1])) / 128 * 0.49 * math.Pi
+		r := float64(128-int(starNoise[i*3+2])) / 128 * 0.49 * math.Pi
+		d := rotateHPRRow1(h, p, r)
+		s.stars[i] = star{
+			pos:   rl.Vector3{X: d.X * 100, Y: d.Y * 100, Z: d.Z * 100},
+			size:  float32(s.rng.Intn(256))/255*0.5 + 0.3,
+			phase: s.rng.Intn(32),
+		}
+	}
+	for i := range s.twinkle {
+		s.twinkle[i] = (float32(math.Sin(float64(i)/16*math.Pi))*0.5+0.5)*0.4 + 0.5
+	}
+}
+
+// SetPlaneOfSky is VIAtmosphere::SetPlaneOfSky: the 360° dome instead of the
+// sky, with no sun, moon or stars.
+func (s *Sky) SetPlaneOfSky(on bool) {
+	if s == nil || s.domes[1] == nil {
+		return
+	}
+	s.planeOfSky = on
+}
+
+// SetOvercast is kept for callers that do not supply an Atmosphere; the
+// overcast reaches the sky through SetAtmosphere's colour and alphas.
+func (s *Sky) SetOvercast(interp float32) {}
+
+// SetAtmosphere supplies this frame's VIAtmosphere and sky colour state.
+func (s *Sky) SetAtmosphere(a Atmosphere) {
+	if s == nil {
+		return
+	}
+	s.atm = a
+	s.atmSet = true
+}
+
+// Update advances the material scroll, the weather's dome cross-fade, the
+// twinkle and the shooting star. gameHour = 0..24.
+func (s *Sky) Update(dt, gameHour float32) {
+	if s == nil {
+		return
+	}
+	s.hour = gameHour
+	s.dt = dt
+	if !s.atmSet {
+		s.atm = DefaultAtmosphere(gameHour)
+	}
+	d := s.activeDome()
+	s.applyTransition(d)
+	// VIMaterial::Process: offset += rate·dt, wrapped back into (-1, 1).
+	for i := range d.layers {
+		l := &d.layers[i]
+		for k := 0; k < 2; k++ {
+			l.offset[k] += l.rate[k] * dt
+			if l.offset[k] > 1 || l.offset[k] < -1 {
+				l.offset[k] -= float32(int(l.offset[k]))
+			}
+		}
+	}
+}
+
+func (s *Sky) activeDome() *dome {
+	if s.planeOfSky {
+		return s.domes[1]
+	}
+	return s.domes[0]
+}
+
+// applyTransition is the dome-material half of ProcessTransitions. While a
+// transition runs, the first half grows the material to three layers — the
+// old base (now blend 3), a copy of it carrying the new texture fading in to
+// 255, and the old cloud layer fading out from 64 — and the second half
+// shrinks it back to two, the new base and the cloud layer on the new
+// texture, fading in to 64. On the frame it completes, both layers take the
+// new texture at 255 and 64.
+func (s *Sky) applyTransition(d *dome) {
+	t := s.atm.Transition
+	if t == 0 || len(d.layers) < 2 {
+		s.lastT = t
+		return
+	}
+	next := s.skyTex[min(max(s.atm.NextSky, 0), 2)]
+	if next == nil {
+		next = s.skyTex[SkyTexDefault]
+	}
+	switch {
+	case t < 0.5:
+		d.layers[0].blend = 3
+		if len(d.layers) != 3 {
+			clouds := d.layers[1]
+			base := d.layers[0]
+			base.surf = next
+			d.layers = []skyLayer{d.layers[0], base, clouds}
+		}
+		d.layers[1].alpha = float32(int(t * 2 * 255))
+		d.layers[2].alpha = float32(int((0.5 - t) * 2 * 64))
+	case t < 1:
+		if len(d.layers) != 2 {
+			d.layers = []skyLayer{d.layers[1], d.layers[2]}
+			d.layers[1].surf = next
+		}
+		d.layers[1].alpha = float32(int((t - 0.5) * 2 * 64))
+	}
+	if t == 1 {
+		if len(d.layers) == 3 {
+			d.layers = []skyLayer{d.layers[1], d.layers[2]}
+		}
+		d.layers[0].surf = next
+		d.layers[1].surf = next
+		d.layers[0].alpha = 255
+		d.layers[1].alpha = 64
+	}
+	s.lastT = t
+}
+
+// build uploads to the GPU; called on the first Draw.
 func (s *Sky) build() {
 	if s.built {
 		return
 	}
 	s.built = true
+	img := rl.GenImageColor(4, 4, rl.White)
+	s.white = rl.LoadTextureFromImage(img)
+	rl.UnloadImage(img)
 
-	// White fallback texture.
-	whiteImg := rl.GenImageColor(4, 4, rl.White)
-	s.whiteTex = rl.LoadTextureFromImage(whiteImg)
-	rl.UnloadImage(whiteImg)
+	s.shader = rl.LoadShaderFromMemory(skyVS, skyFS)
+	s.locUV = rl.GetShaderLocation(s.shader, "uvScale")
+	s.locOff = rl.GetShaderLocation(s.shader, "uvOffset")
+	s.locCol = rl.GetShaderLocation(s.shader, "layerColor")
+	s.mat = rl.LoadMaterialDefault()
+	s.mat.Shader = s.shader
+	s.celMat = rl.LoadMaterialDefault()
 
-	// Upload all textures (Layer 0 + Layer 1 overlays).
-	for _, sd := range s.sprites {
-		for _, surf := range sd.surfaces {
-			s.uploadSurface(surf)
-		}
-		for _, surf := range sd.overlay {
-			s.uploadSurface(surf)
-		}
-	}
-
-	// Build GPU meshes — one per strip (keeps material assignment simple).
-	// Pass 1: Layer 0 (base sky texture).
-	// Pass 2: Layer 1 overlay (cloud detail, 3x UV tiled, additive blend).
-	for _, sd := range s.sprites {
-		for _, strip := range sd.strips {
-			tris := destripVertices(strip.vertices)
-			if len(tris) == 0 {
-				continue
-			}
-
-			// Layer 0: base mesh
-			s.buildMeshGroup(&sd, strip.matIdx, tris, 1.0, false)
-
-			// Layer 1: overlay mesh (if this material has a second layer)
-			if overlaySurf := sd.overlay[strip.matIdx]; overlaySurf != nil {
-				uvMul := sd.uvScale[strip.matIdx]
-				if uvMul == 0 {
-					uvMul = 1.0
-				}
-				s.buildOverlayGroup(overlaySurf, tris, uvMul)
-			}
+	for _, d := range s.domes {
+		if d != nil && len(d.verts) > 0 {
+			d.mesh = uploadMesh(d.verts)
+			d.built = true
 		}
 	}
-
-	// Upload celestial billboard textures directly (bypass cache to avoid DictID collisions).
-	if s.sunSurf != nil && s.sunSurf.Image != nil {
-		s.sunTex = s.uploadSurfaceDirect(s.sunSurf, "sun")
-		s.hasSun = s.sunTex.ID > 0
-	}
-	if s.moonSurf != nil && s.moonSurf.Image != nil {
-		s.moonTex = s.uploadSurfaceDirect(s.moonSurf, "moon")
-		s.hasMoon = s.moonTex.ID > 0
-	}
-	if s.starSurf != nil && s.starSurf.Image != nil {
-		s.starTex = s.uploadSurfaceDirect(s.starSurf, "star")
-		s.hasStar = s.starTex.ID > 0
-	}
-
-	// Generate procedural star field and upload as a single GPU mesh.
-	s.generateStars()
-	s.buildStarMesh()
-
-	log.Printf("sky: built %d GPU meshes, %d textures, sun=%v moon=%v stars=%d",
-		len(s.groups), len(s.texCache), s.hasSun, s.hasMoon, len(s.starPositions))
-}
-
-// generateStars creates ~200 random points on the upper hemisphere using
-// a golden spiral distribution for even coverage.
-func (s *Sky) generateStars() {
-	const numPoints = 200
-	goldenRatio := (1.0 + math.Sqrt(5.0)) / 2.0
-	s.starPositions = make([]rl.Vector3, 0, numPoints)
-	for i := 0; i < numPoints; i++ {
-		theta := 2.0 * math.Pi * float64(i) / goldenRatio
-		phi := math.Acos(1.0 - 2.0*float64(i+1)/float64(numPoints+1))
-		y := float32(math.Cos(phi))
-		if y < 0.05 {
-			continue // skip below horizon
-		}
-		s.starPositions = append(s.starPositions, rl.Vector3{
-			X: float32(math.Sin(phi) * math.Cos(theta)),
-			Y: y,
-			Z: float32(math.Sin(phi) * math.Sin(theta)),
-		})
-	}
-}
-
-// SetOvercast sets the weather-driven overcast blend factor.
-// PS2 VIAtmosphere offset +0x61C (GetOvercastInterp at 0x00418D48).
-// 0.0 = clear sky, 1.0 = fully overcast (dark clouds, no sun/stars).
-func (s *Sky) SetOvercast(interp float32) {
-	if s == nil {
-		return
-	}
-	if interp < 0 {
-		interp = 0
-	}
-	if interp > 1 {
-		interp = 1
-	}
-	s.overcastInterp = interp
-}
-
-// Update computes time-based dome rotation and time-of-day tints.
-// dt is unused (kept for interface stability). gameHour = 0.0-24.0.
-// PS2 VIAtmosphere::Update uses timeOfDay * π/12 for sun angle and a
-// time-based offset for cloud drift — both are absolute, not accumulated.
-func (s *Sky) Update(dt, gameHour float32) {
-	if s == nil {
-		return
-	}
-	// PS2: cloudAngle = timeOfDay * π/12 + π (180° offset from sun position).
-	// One full rotation per 24 game hours = one per 45-minute real cycle.
-	s.rotAngle = gameHour * (math.Pi / 12.0)
-	s.baseTint = computeSkyTint(gameHour)
-	s.overlayTint = computeOverlayTint(gameHour)
-
-	// Sun position: rises east (6h), zenith south (12h), sets west (18h).
-	// PS2 VIAtmosphere uses timeOfDay * π/12 for sun angle.
-	sunAngle := float64(gameHour) * (math.Pi / 12.0)
-	s.sunDir = rl.Vector3{
-		X: float32(math.Sin(sunAngle)),  // east→west across sky
-		Y: float32(-math.Cos(sunAngle)), // 0h=nadir(-1), 6h=horizon(0), 12h=zenith(+1)
-		Z: 0.3,                          // slight offset so not directly overhead
-	}
-	// Normalize.
-	mag := float32(math.Sqrt(float64(s.sunDir.X*s.sunDir.X + s.sunDir.Y*s.sunDir.Y + s.sunDir.Z*s.sunDir.Z)))
-	s.sunDir.X /= mag
-	s.sunDir.Y /= mag
-	s.sunDir.Z /= mag
-
-	// Moon: opposite side of sky from sun.
-	s.moonDir = rl.Vector3{X: -s.sunDir.X, Y: -s.sunDir.Y, Z: -s.sunDir.Z}
-
-	// Visibility alphas.
-	s.sunAlpha = celestialAlpha(s.sunDir.Y)
-	s.moonAlpha = celestialAlpha(s.moonDir.Y)
-	s.starAlpha = starAlpha(gameHour)
-
-	// PS2 ProcessTransitions: overcast reduces sun/moon/star visibility
-	// and darkens the sky dome tint.
-	if s.overcastInterp > 0 {
-		oc := s.overcastInterp
-
-		// PS2: sun alpha = 255 - overcastAlpha*2 (sprite 1 in palette animation)
-		sunReduce := uint8(float32(s.sunAlpha) * oc)
-		if sunReduce > s.sunAlpha {
-			s.sunAlpha = 0
-		} else {
-			s.sunAlpha -= sunReduce
-		}
-
-		// Moon dims with overcast too
-		moonReduce := uint8(float32(s.moonAlpha) * oc * 0.8)
-		if moonReduce > s.moonAlpha {
-			s.moonAlpha = 0
-		} else {
-			s.moonAlpha -= moonReduce
-		}
-
-		// PS2: stars invisible when overcastInterp <= 0 (RenderStars early exit)
-		s.starAlpha = uint8(float32(s.starAlpha) * (1.0 - oc))
-
-		// Darken base tint toward storm grey
-		stormR, stormG, stormB := byte(60), byte(65), byte(80)
-		s.baseTint.R = lerpByte(s.baseTint.R, stormR, oc)
-		s.baseTint.G = lerpByte(s.baseTint.G, stormG, oc)
-		s.baseTint.B = lerpByte(s.baseTint.B, stormB, oc)
-
-		// Boost cloud overlay opacity during overcast
-		boostA := uint8(float32(255-s.overlayTint.A) * oc * 0.6)
-		if int(s.overlayTint.A)+int(boostA) > 255 {
-			s.overlayTint.A = 255
-		} else {
-			s.overlayTint.A += boostA
+	for _, c := range []*celestial{&s.sun, &s.corona, &s.moon} {
+		if c.ok {
+			c.mesh = uploadMesh(c.verts)
 		}
 	}
 }
 
-// computeSkyTint returns the base dome color modulation for a game hour.
-// Uses the PS2 24-keyframe sun color table (from VIScene+0x1FF4) to drive
-// the sky dome tint, linearly interpolated between adjacent hour keyframes.
-func computeSkyTint(h float32) rl.Color {
-	if h < 0 {
-		h = 0
+// texture uploads a surface once.
+func (s *Sky) texture(surf *esf.Surface) rl.Texture2D {
+	if surf == nil || surf.Image == nil {
+		return s.white
 	}
-	if h >= 24 {
-		h -= 24
+	if t, ok := s.texGPU[surf]; ok {
+		return t
 	}
-
-	idx := int(h)
-	if idx >= 24 {
-		idx = 23
-	}
-	next := (idx + 1) % 24
-	t := h - float32(idx)
-
-	a := &ps2SkyTable[idx]
-	b := &ps2SkyTable[next]
-
-	lerp := func(v0, v1 byte, f float32) byte {
-		return byte(float32(v0) + float32(int(v1)-int(v0))*f)
-	}
-
-	return rl.Color{
-		R: lerp(a.r, b.r, t),
-		G: lerp(a.g, b.g, t),
-		B: lerp(a.b, b.b, t),
-		A: 255,
-	}
+	img := rl.NewImageFromImage(surf.Image)
+	t := rl.LoadTextureFromImage(img)
+	rl.UnloadImage(img)
+	rl.GenTextureMipmaps(&t)
+	rl.SetTextureFilter(t, rl.FilterTrilinear)
+	rl.SetTextureWrap(t, rl.WrapRepeat)
+	s.texGPU[surf] = t
+	return t
 }
 
-// ps2SkyEntry holds PS2 sky dome tint colors per hour.
-type ps2SkyEntry struct{ r, g, b byte }
-
-// ps2SkyTable maps hour→sky dome color. Derived from PS2 sun color table:
-// night=deep indigo, dawn/dusk=golden orange, day=warm white with slight blue.
-// Values are the PS2 sun diffuse colors scaled for sky dome modulation.
-var ps2SkyTable = [24]ps2SkyEntry{
-	{30, 30, 60},    // 0: Midnight
-	{30, 25, 65},    // 1: Night
-	{30, 25, 70},    // 2: Night
-	{35, 25, 75},    // 3: Night
-	{45, 35, 70},    // 4: Pre-dawn purple
-	{70, 50, 80},    // 5: Lavender dawn
-	{200, 150, 90},  // 6: Golden sunrise
-	{220, 190, 150}, // 7: Warm morning
-	{200, 215, 235}, // 8: Warm white morning
-	{190, 210, 240}, // 9: Day
-	{185, 210, 245}, // 10: Day
-	{180, 210, 245}, // 11: Midday
-	{180, 210, 245}, // 12: Noon
-	{180, 210, 245}, // 13: Afternoon
-	{185, 210, 245}, // 14: Afternoon
-	{190, 210, 240}, // 15: Afternoon
-	{200, 215, 235}, // 16: Late afternoon
-	{220, 180, 130}, // 17: Warm orange dusk
-	{200, 150, 100}, // 18: Warm orange sunset
-	{120, 100, 70},  // 19: Golden-green dusk
-	{55, 40, 70},    // 20: Purple twilight
-	{40, 35, 65},    // 21: Deep purple
-	{35, 30, 65},    // 22: Dark blue-violet
-	{30, 28, 62},    // 23: Night
-}
-
-// computeOverlayTint returns the cloud overlay tint. Kept dim since clouds use
-// additive blend — high values wash out the sky to white.
-func computeOverlayTint(h float32) rl.Color {
-	var brightness byte
-	switch {
-	case h < 5:
-		brightness = 15
-	case h < 7:
-		t := (h - 5) / 2
-		brightness = lerpByte(15, 30, t)
-	case h < 17:
-		brightness = 30
-	case h < 19:
-		t := (h - 17) / 2
-		brightness = lerpByte(30, 15, t)
+// beginBlend sets the GS ALPHA a VIMaterial blend mode selects
+// (VIMaterial::ConstructPass): 0 opaque (Cs), 1 Cs·As + Cd, 2 Cd − Cs·As,
+// 3 the alpha blend, 4 Cd·As.
+func beginBlend(mode int32) {
+	const (
+		glZero, glOne              = 0, 1
+		glSrcAlpha, glOneMinusSrcA = 0x0302, 0x0303
+		glAdd, glRevSub            = 0x8006, 0x800B
+	)
+	switch mode {
+	case 1:
+		rl.SetBlendFactors(glSrcAlpha, glOne, glAdd)
+	case 2:
+		rl.SetBlendFactors(glSrcAlpha, glOne, glRevSub)
+	case 3:
+		rl.SetBlendFactors(glSrcAlpha, glOneMinusSrcA, glAdd)
+	case 4:
+		rl.SetBlendFactors(glZero, glSrcAlpha, glAdd)
 	default:
-		brightness = 15
+		rl.SetBlendFactors(glOne, glZero, glAdd)
 	}
-	return rl.Color{R: brightness, G: brightness, B: brightness, A: 255}
+	rl.BeginBlendMode(rl.BlendCustom)
 }
 
-// lerpByte linearly interpolates between two byte values. t is clamped to [0,1].
-func lerpByte(a, b byte, t float32) byte {
-	if t <= 0 {
-		return a
-	}
-	if t >= 1 {
-		return b
-	}
-	v := float32(a) + (float32(b)-float32(a))*t
-	if v < 0 {
-		return 0
-	}
-	if v > 255 {
-		return 255
-	}
-	return byte(v)
-}
-
-// celestialAlpha returns billboard alpha based on elevation above horizon.
-// Fades in/out near horizon (Y ∈ [-0.1, 0.1]).
-func celestialAlpha(elevY float32) uint8 {
-	if elevY < -0.1 {
-		return 0
-	}
-	if elevY > 0.1 {
-		return 255
-	}
-	t := (elevY + 0.1) / 0.2 // 0..1
-	return uint8(t * 255)
-}
-
-// starAlpha returns star visibility for a game hour.
-// Full at night (20-4), fade out 4-6, fade in 18-20, zero during day.
-func starAlpha(h float32) uint8 {
-	switch {
-	case h < 4:
-		return 255
-	case h < 6:
-		return lerpByte(255, 0, (h-4)/2)
-	case h < 18:
-		return 0
-	case h < 20:
-		return lerpByte(0, 255, (h-18)/2)
-	default:
-		return 255
-	}
-}
-
-// Draw renders the sky dome centered on the camera position.
-// Must be called between BeginMode3D/EndMode3D, BEFORE terrain.
+// Draw renders RenderSky and RenderStars around the camera. Call between
+// BeginMode3D/EndMode3D, before the terrain: nothing here tests or writes
+// depth, so everything drawn after covers it.
 func (s *Sky) Draw(camera rl.Camera3D) {
-	if s == nil || len(s.sprites) == 0 {
+	if s == nil {
 		return
 	}
 	s.build()
+	cam := camera.Position
 
-	camX := camera.Position.X
-	camY := camera.Position.Y
-	camZ := camera.Position.Z
-
-	if len(s.groups) == 0 && !s.hasSun && !s.hasMoon && len(s.starPositions) == 0 {
-		return
-	}
-
-	// Disable depth writes so sky never occludes terrain/models.
+	rl.DrawRenderBatchActive()
 	rl.DisableDepthMask()
-
-	// C-convention Y-rotation matrix for cloud drift (avoids MatrixRotateY bug).
-	cosR := float32(math.Cos(float64(s.rotAngle)))
-	sinR := float32(math.Sin(float64(s.rotAngle)))
-	rotY := rl.Matrix{
-		M0: cosR, M4: 0, M8: sinR, M12: 0,
-		M1: 0, M5: 1, M9: 0, M13: 0,
-		M2: -sinR, M6: 0, M10: cosR, M14: 0,
-		M3: 0, M7: 0, M11: 0, M15: 1,
-	}
-
-	// Transform: rotate × scale × translate to camera position.
-	transform := rl.MatrixMultiply(
-		rl.MatrixMultiply(rotY, rl.MatrixScale(s.scale, s.scale, s.scale)),
-		rl.MatrixTranslate(camX, camY, camZ),
-	)
-
-	// PS2 sky meshes have inconsistent winding — disable backface culling.
+	rl.DisableDepthTest()
 	rl.DisableBackfaceCulling()
 
-	// Pass 1: Base dome meshes (Layer 0) with alpha blending + time-of-day tint.
-	rl.BeginBlendMode(rl.BlendAlpha)
-	for i := range s.groups {
-		if !s.groups[i].Overlay {
-			maps := (*[32]rl.MaterialMap)(unsafe.Pointer(s.groups[i].Material.Maps))
-			origColor := maps[rl.MapDiffuse].Color
-			maps[rl.MapDiffuse].Color = s.baseTint
-			rl.DrawMesh(s.groups[i].Mesh, s.groups[i].Material, transform)
-			maps[rl.MapDiffuse].Color = origColor
+	// The dome: the camera's view with its translation zeroed, i.e. centred
+	// on the camera and not rotated.
+	d := s.activeDome()
+	if d != nil && d.built {
+		col := s.atm.SkyColor
+		if col == ([3]float32{}) {
+			col = [3]float32{1, 1, 1}
+		}
+		at := rl.MatrixTranslate(cam.X, cam.Y, cam.Z)
+		for _, l := range d.layers {
+			setMap(s.mat, s.texture(l.surf), rl.White)
+			uv := l.uvMul
+			off := l.offset
+			c := [4]float32{clamp01(col[0]), clamp01(col[1]), clamp01(col[2]), l.alpha / 255}
+			rl.SetShaderValue(s.shader, s.locUV, uv[:], rl.ShaderUniformVec2)
+			rl.SetShaderValue(s.shader, s.locOff, off[:], rl.ShaderUniformVec2)
+			rl.SetShaderValue(s.shader, s.locCol, c[:], rl.ShaderUniformVec4)
+			beginBlend(l.blend)
+			rl.DrawMesh(d.mesh, s.mat, at)
+			rl.EndBlendMode()
 		}
 	}
-	rl.EndBlendMode()
 
-	// Pass 2: Cloud overlay meshes (Layer 1) — additive blend on blue sky.
-	rl.BeginBlendMode(rl.BlendAdditive)
-	for i := range s.groups {
-		if s.groups[i].Overlay {
-			maps := (*[32]rl.MaterialMap)(unsafe.Pointer(s.groups[i].Material.Maps))
-			origColor := maps[rl.MapDiffuse].Color
-			maps[rl.MapDiffuse].Color = s.overlayTint
-			rl.DrawMesh(s.groups[i].Mesh, s.groups[i].Material, transform)
-			maps[rl.MapDiffuse].Color = origColor
+	if !s.planeOfSky {
+		if s.atm.SunAlpha != 0 {
+			s.drawCelestials(cam)
 		}
+		s.drawStars(camera)
 	}
-	rl.EndBlendMode()
-
-	// Pass 3: Stars + celestials on top of everything (additive glow).
-	s.drawStars(camX, camY, camZ)
-	s.drawCelestials(camera, camX, camY, camZ)
 
 	rl.EnableBackfaceCulling()
-
-	// Re-enable depth writes for terrain/models.
+	rl.EnableDepthTest()
 	rl.EnableDepthMask()
 }
 
-// buildStarMesh creates a single GPU mesh with all stars as tiny camera-facing quads
-// on a unit sphere. Drawn with a single DrawMesh call + transform matrix.
-func (s *Sky) buildStarMesh() {
-	if s.starBuilt || len(s.starPositions) == 0 {
-		return
-	}
-	s.starBuilt = true
+func clamp01(f float32) float32 { return min(max(f, 0), 1) }
 
-	n := len(s.starPositions)
-	// Each star = 2 triangles = 6 vertices (a tiny quad).
-	vertCount := n * 6
-	positions := make([]float32, vertCount*3)
-	uvs := make([]float32, vertCount*2)
-	colors := make([]uint8, vertCount*4)
+// drawCelestials draws the Sun on m_skyRot, the Corona on m_coronaRot
+// (m_skyRot after a scale by m_skyScale) and the Moon on m_moonRot
+// (VIAtmosphere::Update): a roll of hour·15° about z, and 35 units out along
+// (sin w, -cos w, 0) — below the horizon at midnight, overhead at noon, at +X
+// at 6:00, where the terrain's sun comes from.
+func (s *Sky) drawCelestials(cam rl.Vector3) {
+	w := float64(s.hour) * 0.2617993
+	sw, cw := math.Sincos(w)
+	sun := rowRoll(sw, cw, 1, float32(sw)*35, float32(-cw)*35, cam)
+	corona := rowRoll(sw, cw, s.atm.SkyScale, float32(sw)*35, float32(-cw)*35, cam)
+	// m_moonRot: the roll plus pi, at minus the sun's translation.
+	moon := rowRoll(-sw, -cw, 1, float32(-sw)*35, float32(cw)*35, cam)
 
-	// Star size on unit sphere (will be scaled by transform).
-	const sz = 0.0015
-
-	// UV coords for a quad: 4 corners mapped to full texture
-	quadUV := [4][2]float32{{0, 0}, {1, 0}, {1, 1}, {0, 1}}
-
-	for i, sp := range s.starPositions {
-		// Build a tiny quad centered on sp, oriented to face outward from origin.
-		// tangent1 = normalize(cross(sp, up))  tangent2 = normalize(cross(sp, tangent1))
-		var t1x, t1y, t1z float32
-		if sp.Y > 0.99 || sp.Y < -0.99 {
-			t1x, t1y, t1z = 0, -sp.Z, sp.Y
-		} else {
-			t1x, t1y, t1z = sp.Z, 0, -sp.X
-		}
-		mag := float32(math.Sqrt(float64(t1x*t1x + t1y*t1y + t1z*t1z)))
-		if mag < 1e-6 {
+	for _, c := range []struct {
+		cel   *celestial
+		m     rl.Matrix
+		alpha uint8
+	}{
+		{&s.sun, sun, s.atm.SunAlpha},
+		{&s.corona, corona, s.atm.CoronaAlpha},
+		{&s.moon, moon, s.atm.SunAlpha},
+	} {
+		if !c.cel.ok || c.alpha == 0 {
 			continue
 		}
-		t1x /= mag; t1y /= mag; t1z /= mag
-		t2x := sp.Y*t1z - sp.Z*t1y
-		t2y := sp.Z*t1x - sp.X*t1z
-		t2z := sp.X*t1y - sp.Y*t1x
+		setMap(s.celMat, s.texture(c.cel.surf), rl.Color{R: c.cel.color[0], G: c.cel.color[1], B: c.cel.color[2], A: c.alpha})
+		beginBlend(c.cel.blend)
+		rl.DrawMesh(c.cel.mesh, s.celMat, c.m)
+		rl.EndBlendMode()
+	}
+}
 
-		cx, cy, cz := sp.X, sp.Y, sp.Z
-		p := [4][3]float32{
-			{cx - t1x*sz - t2x*sz, cy - t1y*sz - t2y*sz, cz - t1z*sz - t2z*sz},
-			{cx + t1x*sz - t2x*sz, cy + t1y*sz - t2y*sz, cz + t1z*sz - t2z*sz},
-			{cx + t1x*sz + t2x*sz, cy + t1y*sz + t2y*sz, cz + t1z*sz + t2z*sz},
-			{cx - t1x*sz + t2x*sz, cy - t1y*sz + t2y*sz, cz - t1z*sz + t2z*sz},
+// rowRoll is the raylib (column-vector) form of a PS2 row-vector matrix
+// Scale(k) × RotateHPR(0, 0, w) with translation (tx, ty, 0), moved to the
+// camera: x' = k(x·cos w − y·sin w), y' = k(x·sin w + y·cos w), z' = k·z.
+func rowRoll(sw, cw float64, k, tx, ty float32, cam rl.Vector3) rl.Matrix {
+	s, c := float32(sw)*k, float32(cw)*k
+	return rl.Matrix{
+		M0: c, M4: -s, M8: 0, M12: cam.X + tx,
+		M1: s, M5: c, M9: 0, M13: cam.Y + ty,
+		M2: 0, M6: 0, M10: k, M14: cam.Z,
+		M15: 1,
+	}
+}
+
+// drawStars is VIAtmosphere::RenderStars.
+func (s *Sky) drawStars(camera rl.Camera3D) {
+	cam := camera.Position
+	right, up := billboardVectors(camera)
+	dt := s.dt
+
+	if night := s.atm.NightFactor; night > 0 && s.starSurf != nil {
+		tex := s.texture(s.starSurf)
+		beginBlend(1)
+		rl.SetTexture(tex.ID)
+		rl.Begin(rl.Quads)
+
+		// The shooting star: every 10..25 s, a 0.5 billboard falling from the
+		// top of the sky to the horizon over five seconds.
+		if s.shootIn <= 0 {
+			if s.shootT == 0 {
+				a := float64(s.rand255()) * math.Pi * 3.9
+				s.shootA = rl.Vector3{X: float32(math.Sin(a)) * 100, Y: 100, Z: float32(math.Cos(a)) * 100}
+				a = float64(s.rand255()) * math.Pi * 3.9
+				s.shootB = rl.Vector3{X: float32(math.Sin(a)) * 100, Y: 0, Z: float32(math.Cos(a)) * 100}
+				s.shootT = 1e-5
+			}
+			if s.shootT > 0 {
+				s.shootT += dt * 0.2
+				b := (s.rng.Float32()-s.rng.Float32())*0.3 + 0.7
+				if s.shootT < 0.2 {
+					b *= s.shootT * 5
+				} else {
+					b *= 1 - (s.shootT-0.2)*1.25
+				}
+				b = clamp01(b)
+				p := rl.Vector3Lerp(s.shootA, s.shootB, s.shootT)
+				starQuad(cam, p, right, up, 0.5, b)
+				if s.shootT >= 1 {
+					s.shootT = 0
+					s.shootIn = float32(s.rng.Intn(16) + 10)
+				}
+			}
+		} else {
+			s.shootIn -= dt
 		}
 
-		// Two triangles: 0-1-2, 0-2-3
-		base := i * 6
-		for vi, idx := range [6]int{0, 1, 2, 0, 2, 3} {
-			off3 := (base + vi) * 3
-			off2 := (base + vi) * 2
-			off4 := (base + vi) * 4
-			positions[off3+0] = p[idx][0]
-			positions[off3+1] = p[idx][1]
-			positions[off3+2] = p[idx][2]
-			uvs[off2+0] = quadUV[idx][0]
-			uvs[off2+1] = quadUV[idx][1]
-			colors[off4+0] = 255
-			colors[off4+1] = 255
-			colors[off4+2] = 240
-			colors[off4+3] = 255
+		idx := int(int8(int(s.starT)))
+		s.starT += dt * 15
+		if s.starT > 32 {
+			s.starT -= 32
 		}
+		for _, st := range s.stars {
+			b := s.twinkle[(idx+st.phase)&31] * night
+			starQuad(cam, st.pos, right, up, st.size, b)
+		}
+		rl.End()
+		rl.SetTexture(0)
+		rl.EndBlendMode()
 	}
 
+	// The lightning patches, while a flash lasts: min(flash·0.45, 0.15).
+	if s.atm.Flash > 0 && s.patchSurf != nil {
+		b := min(s.atm.Flash*0.45, 0.15)
+		beginBlend(1)
+		rl.SetTexture(s.texture(s.patchSurf).ID)
+		rl.Begin(rl.Quads)
+		for _, p := range s.atm.Patches {
+			starQuad(cam, rl.Vector3{X: p[0], Y: p[1], Z: p[2]}, right, up, p[3], b)
+		}
+		rl.End()
+		rl.SetTexture(0)
+		rl.EndBlendMode()
+	}
+}
+
+func (s *Sky) rand255() float32 { return float32(s.rng.Intn(256)) / 255 }
+
+// starQuad emits one camera-facing billboard of half-size h at cam + p,
+// coloured (b, b, b, 1).
+func starQuad(cam, p, right, up rl.Vector3, h, b float32) {
+	x, y, z := cam.X+p.X, cam.Y+p.Y, cam.Z+p.Z
+	rx, ry, rz := right.X*h, right.Y*h, right.Z*h
+	ux, uy, uz := up.X*h, up.Y*h, up.Z*h
+	c := uint8(clamp01(b) * 255)
+	rl.Color4ub(c, c, c, 255)
+	rl.TexCoord2f(0, 1)
+	rl.Vertex3f(x-rx-ux, y-ry-uy, z-rz-uz)
+	rl.TexCoord2f(1, 1)
+	rl.Vertex3f(x+rx-ux, y+ry-uy, z+rz-uz)
+	rl.TexCoord2f(1, 0)
+	rl.Vertex3f(x+rx+ux, y+ry+uy, z+rz+uz)
+	rl.TexCoord2f(0, 0)
+	rl.Vertex3f(x-rx+ux, y-ry+uy, z-rz+uz)
+}
+
+// billboardVectors returns the camera's right and up.
+func billboardVectors(cam rl.Camera3D) (right, up rl.Vector3) {
+	fwd := rl.Vector3Normalize(rl.Vector3Subtract(cam.Target, cam.Position))
+	right = rl.Vector3Normalize(rl.Vector3CrossProduct(fwd, cam.Up))
+	up = rl.Vector3CrossProduct(right, fwd)
+	return right, up
+}
+
+// setMap sets a material's diffuse texture and colour.
+func setMap(mat rl.Material, tex rl.Texture2D, col rl.Color) {
+	maps := (*[32]rl.MaterialMap)(unsafe.Pointer(mat.Maps))
+	maps[rl.MapDiffuse].Texture = tex
+	maps[rl.MapDiffuse].Color = col
+}
+
+// uploadMesh uploads a triangle list with its texcoords and colours.
+func uploadMesh(tris []esf.Vertex) rl.Mesh {
+	n := len(tris)
+	positions := make([]float32, n*3)
+	uvs := make([]float32, n*2)
+	colors := make([]uint8, n*4)
+	for i, v := range tris {
+		positions[i*3+0], positions[i*3+1], positions[i*3+2] = v.X, v.Y, v.Z
+		uvs[i*2+0], uvs[i*2+1] = v.U, v.V
+		colors[i*4+0], colors[i*4+1], colors[i*4+2], colors[i*4+3] = 255, 255, 255, 255
+	}
 	mesh := rl.Mesh{
-		VertexCount:   int32(vertCount),
-		TriangleCount: int32(vertCount / 3),
+		VertexCount:   int32(n),
+		TriangleCount: int32(n / 3),
 		Vertices:      (*float32)(unsafe.Pointer(&positions[0])),
 		Texcoords:     (*float32)(unsafe.Pointer(&uvs[0])),
 		Colors:        (*uint8)(unsafe.Pointer(&colors[0])),
@@ -677,330 +706,116 @@ func (s *Sky) buildStarMesh() {
 	mesh.Vertices = nil
 	mesh.Texcoords = nil
 	mesh.Colors = nil
-	s.starMesh = mesh
-
-	// Use local variable for material — cgo rejects &s.starMat (Go heap pointer).
-	mat := rl.LoadMaterialDefault()
-	tex := s.whiteTex
-	if s.hasStar {
-		tex = s.starTex
-	}
-	rl.SetMaterialTexture(&mat, rl.MapDiffuse, tex)
-	s.starMat = mat
-}
-
-// drawStars renders the pre-built star mesh with a single draw call.
-func (s *Sky) drawStars(camX, camY, camZ float32) {
-	if s.starAlpha == 0 || !s.starBuilt {
-		return
-	}
-	radius := s.scale * 300.0
-	maps := (*[32]rl.MaterialMap)(unsafe.Pointer(s.starMat.Maps))
-	maps[rl.MapDiffuse].Color = rl.Color{R: 255, G: 255, B: 240, A: s.starAlpha}
-	transform := rl.MatrixMultiply(
-		rl.MatrixScale(radius, radius, radius),
-		rl.MatrixTranslate(camX, camY, camZ),
-	)
-	rl.BeginBlendMode(rl.BlendAdditive)
-	rl.DrawMesh(s.starMesh, s.starMat, transform)
-	rl.EndBlendMode()
-}
-
-// drawCelestials renders sun and moon as camera-facing billboards.
-func (s *Sky) drawCelestials(camera rl.Camera3D, camX, camY, camZ float32) {
-	radius := s.scale * 280.0 // slightly inside star sphere
-
-	// Sun billboard — alpha blend with corona texture.
-	if s.hasSun && s.sunAlpha > 0 && s.sunDir.Y > -0.1 {
-		sunPos := rl.Vector3{
-			X: camX + s.sunDir.X*radius,
-			Y: camY + s.sunDir.Y*radius,
-			Z: camZ + s.sunDir.Z*radius,
-		}
-		sunSize := s.scale * 100.0
-		src := rl.Rectangle{X: 0, Y: 0, Width: float32(s.sunTex.Width), Height: float32(s.sunTex.Height)}
-		size := rl.Vector2{X: sunSize, Y: sunSize}
-		origin := rl.Vector2{X: sunSize * 0.5, Y: sunSize * 0.5}
-
-		// Additive glow pass (corona texture brightens sky).
-		rl.BeginBlendMode(rl.BlendAdditive)
-		sunClr := rl.Color{R: 255, G: 255, B: 100, A: s.sunAlpha}
-		rl.DrawBillboardPro(camera, s.sunTex, src, sunPos, rl.Vector3{X: 0, Y: 1, Z: 0}, size, origin, 0, sunClr)
-		rl.EndBlendMode()
-	}
-
-	// Moon billboard — alpha blend with moon texture.
-	if s.hasMoon && s.moonAlpha > 0 && s.moonDir.Y > -0.1 {
-		moonPos := rl.Vector3{
-			X: camX + s.moonDir.X*radius,
-			Y: camY + s.moonDir.Y*radius,
-			Z: camZ + s.moonDir.Z*radius,
-		}
-		moonSize := s.scale * 50.0
-		src := rl.Rectangle{X: 0, Y: 0, Width: float32(s.moonTex.Width), Height: float32(s.moonTex.Height)}
-		size := rl.Vector2{X: moonSize, Y: moonSize}
-		origin := rl.Vector2{X: moonSize * 0.5, Y: moonSize * 0.5}
-
-		rl.BeginBlendMode(rl.BlendAlpha)
-		moonClr := rl.Color{R: 220, G: 220, B: 255, A: s.moonAlpha}
-		rl.DrawBillboardPro(camera, s.moonTex, src, moonPos, rl.Vector3{X: 0, Y: 1, Z: 0}, size, origin, 0, moonClr)
-		rl.EndBlendMode()
-	}
+	return mesh
 }
 
 // Cleanup unloads all GPU resources.
 func (s *Sky) Cleanup() {
-	if s == nil {
+	if s == nil || !s.built {
 		return
 	}
-	for i := range s.groups {
-		rl.UnloadMesh(&s.groups[i].Mesh)
+	for _, d := range s.domes {
+		if d != nil && d.built {
+			rl.UnloadMesh(&d.mesh)
+			d.built = false
+		}
 	}
-	s.groups = nil
-
-	if s.starBuilt {
-		rl.UnloadMesh(&s.starMesh)
-		s.starBuilt = false
+	for _, c := range []*celestial{&s.sun, &s.corona, &s.moon} {
+		if c.ok {
+			rl.UnloadMesh(&c.mesh)
+		}
 	}
-
-	for _, tex := range s.texCache {
-		rl.UnloadTexture(tex)
+	for _, t := range s.texGPU {
+		rl.UnloadTexture(t)
 	}
-	s.texCache = nil
-
-	rl.UnloadTexture(s.whiteTex)
+	s.texGPU = nil
+	rl.UnloadTexture(s.white)
+	rl.UnloadShader(s.shader)
+	s.built = false
 	log.Printf("sky: cleanup complete")
 }
 
-// uploadSurfaceDirect uploads a surface texture to GPU unconditionally (no cache).
-// Used for billboard textures that may share DictID with dome surfaces.
-func (s *Sky) uploadSurfaceDirect(surf *esf.Surface, label string) rl.Texture2D {
-	rlImg := rl.NewImageFromImage(surf.Image)
-	tex := rl.LoadTextureFromImage(rlImg)
-	rl.UnloadImage(rlImg)
-	rl.GenTextureMipmaps(&tex)
-	rl.SetTextureFilter(tex, rl.FilterTrilinear)
-	rl.SetTextureWrap(tex, rl.WrapRepeat)
-	log.Printf("sky: %s texture uploaded direct (%dx%d) glID=%d dictID=0x%08x",
-		label, tex.Width, tex.Height, tex.ID, surf.ObjInfo().DictID)
-	return tex
-}
-
-// uploadSurface loads a surface texture to GPU if not already cached.
-func (s *Sky) uploadSurface(surf *esf.Surface) {
-	if surf == nil || surf.Image == nil {
-		return
-	}
-	texID := surf.ObjInfo().DictID
-	if _, ok := s.texCache[texID]; ok {
-		return
-	}
-	rlImg := rl.NewImageFromImage(surf.Image)
-	tex := rl.LoadTextureFromImage(rlImg)
-	rl.UnloadImage(rlImg)
-	rl.GenTextureMipmaps(&tex)
-	rl.SetTextureFilter(tex, rl.FilterTrilinear)
-	rl.SetTextureWrap(tex, rl.WrapRepeat)
-	s.texCache[texID] = tex
-}
-
-// buildMeshGroup creates a GPU mesh for Layer 0 (base sky texture).
-func (s *Sky) buildMeshGroup(sd *spriteData, matIdx int, tris []esf.Vertex, uvMul float32, isOverlay bool) {
-	n := len(tris)
-	positions := make([]float32, n*3)
-	uvs := make([]float32, n*2)
-	colors := make([]uint8, n*4)
-
-	for i, v := range tris {
-		p3 := i * 3
-		p2 := i * 2
-		p4 := i * 4
-
-		positions[p3+0] = v.X
-		positions[p3+1] = v.Y
-		positions[p3+2] = v.Z
-
-		uvs[p2+0] = v.U * uvMul
-		uvs[p2+1] = v.V * uvMul
-
-		r, g, b := v.R, v.G, v.B
-		if r == 0 && g == 0 && b == 0 {
-			r, g, b = 1, 1, 1
-		}
-		colors[p4+0] = mathutil.FloatToUint8(r)
-		colors[p4+1] = mathutil.FloatToUint8(g)
-		colors[p4+2] = mathutil.FloatToUint8(b)
-		colors[p4+3] = 255
-	}
-
-	mesh := rl.Mesh{
-		VertexCount:   int32(n),
-		TriangleCount: int32(n / 3),
-		Vertices:      (*float32)(unsafe.Pointer(&positions[0])),
-		Texcoords:     (*float32)(unsafe.Pointer(&uvs[0])),
-		Colors:        (*uint8)(unsafe.Pointer(&colors[0])),
-	}
-
-	rl.UploadMesh(&mesh, false)
-	runtime.KeepAlive(positions)
-	runtime.KeepAlive(uvs)
-	runtime.KeepAlive(colors)
-	mesh.Vertices = nil
-	mesh.Texcoords = nil
-	mesh.Colors = nil
-
-	mat := rl.LoadMaterialDefault()
-	tex := s.whiteTex
-	hasAlpha := false
-	surf := sd.surfaces[matIdx]
-	if surf != nil && surf.Image != nil {
-		texID := surf.ObjInfo().DictID
-		if t, ok := s.texCache[texID]; ok {
-			tex = t
-		}
-		hasAlpha = surf.HasAlpha
-	}
-	rl.SetMaterialTexture(&mat, rl.MapDiffuse, tex)
-
-	s.groups = append(s.groups, meshGroup{
-		Mesh:     mesh,
-		Material: mat,
-		HasAlpha: hasAlpha,
-	})
-}
-
-// buildOverlayGroup creates a GPU mesh for Layer 1 (cloud detail overlay).
-// PS2: Layer 1 uses additive blend mode 3 with UV tiled by uvMul (typically 3x).
-func (s *Sky) buildOverlayGroup(surf *esf.Surface, tris []esf.Vertex, uvMul float32) {
-	n := len(tris)
-	positions := make([]float32, n*3)
-	uvs := make([]float32, n*2)
-	colors := make([]uint8, n*4)
-
-	for i, v := range tris {
-		p3 := i * 3
-		p2 := i * 2
-		p4 := i * 4
-
-		positions[p3+0] = v.X
-		positions[p3+1] = v.Y
-		positions[p3+2] = v.Z
-
-		// Apply UV scale for tiled overlay (PS2 UVTransform[0] = 3.0)
-		uvs[p2+0] = v.U * uvMul
-		uvs[p2+1] = v.V * uvMul
-
-		// Overlay uses white vertex colors
-		colors[p4+0] = 255
-		colors[p4+1] = 255
-		colors[p4+2] = 255
-		colors[p4+3] = 255
-	}
-
-	mesh := rl.Mesh{
-		VertexCount:   int32(n),
-		TriangleCount: int32(n / 3),
-		Vertices:      (*float32)(unsafe.Pointer(&positions[0])),
-		Texcoords:     (*float32)(unsafe.Pointer(&uvs[0])),
-		Colors:        (*uint8)(unsafe.Pointer(&colors[0])),
-	}
-
-	rl.UploadMesh(&mesh, false)
-	runtime.KeepAlive(positions)
-	runtime.KeepAlive(uvs)
-	runtime.KeepAlive(colors)
-	mesh.Vertices = nil
-	mesh.Texcoords = nil
-	mesh.Colors = nil
-
-	mat := rl.LoadMaterialDefault()
-	tex := s.whiteTex
-	if surf != nil && surf.Image != nil {
-		texID := surf.ObjInfo().DictID
-		if t, ok := s.texCache[texID]; ok {
-			tex = t
-		}
-	}
-	rl.SetMaterialTexture(&mat, rl.MapDiffuse, tex)
-
-	s.groups = append(s.groups, meshGroup{
-		Mesh:     mesh,
-		Material: mat,
-		HasAlpha: true, // overlay always uses alpha blending
-		Overlay:  true, // mark for additive blend in Draw()
-	})
-}
-
-// destripVertices converts a triangle strip to individual triangle vertices
-// with swapped even/odd winding (PS2 CW → OpenGL CCW).
+// destripVertices converts a triangle strip to a triangle list, skipping
+// degenerate triangles. The sky draws with culling off, so winding does not
+// matter.
 func destripVertices(strip []esf.Vertex) []esf.Vertex {
-	numTris := len(strip) - 2
-	if numTris <= 0 {
+	if len(strip) < 3 {
 		return nil
 	}
-
-	out := make([]esf.Vertex, 0, numTris*3)
-	odd := true // matches terrain/model pattern: starts true, first tri swaps
-
-	for t := 0; t < numTris; t++ {
-		var i0, i1, i2 int
-		if odd {
-			i0, i1, i2 = t, t+2, t+1
-		} else {
-			i0, i1, i2 = t, t+1, t+2
+	out := make([]esf.Vertex, 0, (len(strip)-2)*3)
+	for t := 0; t+2 < len(strip); t++ {
+		v0, v1, v2 := strip[t], strip[t+1], strip[t+2]
+		if t%2 == 0 {
+			v1, v2 = v2, v1
 		}
-		odd = !odd
-
-		v0, v1, v2 := strip[i0], strip[i1], strip[i2]
-
-		// Skip degenerate triangles.
-		if v0.X == v1.X && v0.Y == v1.Y && v0.Z == v1.Z {
+		if same(v0, v1) || same(v0, v2) || same(v1, v2) {
 			continue
 		}
-		if v0.X == v2.X && v0.Y == v2.Y && v0.Z == v2.Z {
-			continue
-		}
-		if v1.X == v2.X && v1.Y == v2.Y && v1.Z == v2.Z {
-			continue
-		}
-
 		out = append(out, v0, v1, v2)
 	}
 	return out
 }
 
-// resolveSurface gets the Layer 0 texture Surface for a material index.
-func resolveSurface(mp *esf.MaterialPalette, matIdx int) *esf.Surface {
-	if mp == nil || matIdx < 0 || matIdx >= len(mp.Materials) {
-		return nil
-	}
-	mat := mp.Materials[matIdx]
-	if len(mat.Layers) == 0 {
-		return nil
-	}
-	return mat.Layers[0].Surface
-}
+func same(a, b esf.Vertex) bool { return a.X == b.X && a.Y == b.Y && a.Z == b.Z }
 
-// resolveOverlay gets the Layer 1 texture Surface and UV scale for a material.
-// PS2 dome material: Layer 1 = cloud detail overlay with UVTransform 3x scale
-// and blend mode 3 (additive).
-func resolveOverlay(mp *esf.MaterialPalette, matIdx int) (*esf.Surface, float32) {
-	if mp == nil || matIdx < 0 || matIdx >= len(mp.Materials) {
-		return nil, 0
-	}
-	mat := mp.Materials[matIdx]
-	if len(mat.Layers) < 2 {
-		return nil, 0
-	}
-	layer1 := mat.Layers[1]
-	if layer1.Surface == nil {
-		return nil, 0
-	}
-	// Extract UV scale from UVTransform[0] (the M00 element = U scale factor).
-	scale := layer1.UVTransform[0]
-	if scale == 0 {
-		scale = 1.0
-	}
-	return layer1.Surface, scale
+// The dome shader: the texture × the layer colour, its UVs scaled by the
+// layer's UVTransform and offset by its scroll.
+const skyVS = `#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+uniform mat4 mvp;
+uniform vec2 uvScale;
+uniform vec2 uvOffset;
+out vec2 fragTexCoord;
+void main() {
+    fragTexCoord = vertexTexCoord * uvScale + uvOffset;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
 }
+`
 
+const skyFS = `#version 330
+in vec2 fragTexCoord;
+uniform sampler2D texture0;
+uniform vec4 layerColor;
+out vec4 finalColor;
+void main() {
+    finalColor = texture(texture0, fragTexCoord) * layerColor;
+}
+`
+
+// starNoise is VIAtmosphere's sStarNoise: three bytes per star, the
+// heading, pitch and roll Init turns (0, 100, 0) by.
+var starNoise = [384]byte{
+	0xF9, 0xF6, 0xA3, 0x48, 0xC7, 0xDB, 0x76, 0x15, 0x91, 0x35, 0x67, 0xE7,
+	0xDA, 0xA9, 0x1A, 0x55, 0x02, 0x62, 0x81, 0x22, 0x71, 0x3E, 0x62, 0x4E,
+	0x58, 0x46, 0x7B, 0xBF, 0x5D, 0x8F, 0x75, 0xA3, 0x9B, 0xC8, 0xF1, 0x51,
+	0x79, 0xDA, 0x39, 0x60, 0xAF, 0x22, 0x78, 0xAB, 0x1B, 0xFE, 0xA8, 0x94,
+	0x2D, 0xFD, 0x18, 0x48, 0xC6, 0xC3, 0x0D, 0x88, 0x5F, 0x19, 0x08, 0x53,
+	0x15, 0x9C, 0x9C, 0x9B, 0x69, 0x41, 0xFA, 0x45, 0xD7, 0xFE, 0x21, 0xF0,
+	0xD6, 0xFE, 0x0C, 0x07, 0x30, 0x41, 0x59, 0x09, 0xA4, 0x0A, 0xDB, 0xF4,
+	0x01, 0x70, 0xC2, 0x16, 0x49, 0x3B, 0x1B, 0x6B, 0x08, 0xD1, 0x2A, 0xC1,
+	0x15, 0x16, 0xD3, 0xEA, 0x74, 0x92, 0xAC, 0x10, 0xDC, 0x98, 0x20, 0xB5,
+	0x12, 0xC3, 0x78, 0xC0, 0x86, 0x67, 0x92, 0x13, 0x9B, 0x71, 0x28, 0x9B,
+	0xED, 0x9D, 0x06, 0x84, 0x32, 0x98, 0x77, 0x5E, 0xFB, 0x19, 0x84, 0xD7,
+	0xED, 0x73, 0xD9, 0x18, 0x40, 0x78, 0x20, 0x73, 0xC1, 0xE1, 0xAA, 0xD3,
+	0x6A, 0x70, 0x71, 0xA6, 0xF9, 0xE6, 0x89, 0xD3, 0xA9, 0xBB, 0xDB, 0xD1,
+	0x1C, 0x40, 0x52, 0x2F, 0xBE, 0x93, 0xEC, 0xB0, 0xD0, 0x15, 0x93, 0xAD,
+	0x7A, 0x0A, 0x28, 0xFA, 0xA1, 0xA3, 0xD6, 0x42, 0x58, 0x6B, 0x06, 0xE6,
+	0xB7, 0x1D, 0x75, 0x69, 0x8E, 0xFB, 0xB9, 0x43, 0x19, 0xD6, 0x37, 0xDC,
+	0x20, 0x34, 0x53, 0xDD, 0xFC, 0x66, 0x4C, 0x30, 0xD3, 0x37, 0xAF, 0xF2,
+	0xF7, 0x90, 0xF1, 0x71, 0x52, 0x78, 0xB7, 0x2D, 0xF8, 0x69, 0x1A, 0xD5,
+	0xE2, 0x05, 0x03, 0xEF, 0xB7, 0xE1, 0x24, 0xE3, 0x41, 0x08, 0xEC, 0xF9,
+	0x4F, 0x82, 0x63, 0xB5, 0x4F, 0x53, 0x03, 0xEB, 0x28, 0xE8, 0xAD, 0x4F,
+	0xC9, 0x84, 0x5F, 0xA0, 0xD8, 0xDE, 0xB8, 0x25, 0x20, 0x51, 0x54, 0x45,
+	0x3D, 0xD8, 0x25, 0x6A, 0x94, 0x38, 0x27, 0x3F, 0x4C, 0x6F, 0x28, 0xB2,
+	0xED, 0x0C, 0x23, 0xA0, 0xF7, 0x67, 0x1B, 0xC7, 0x69, 0x3E, 0x49, 0xC2,
+	0x48, 0x05, 0x6A, 0xCB, 0xEA, 0x8C, 0xBD, 0xC9, 0x07, 0x54, 0x6A, 0xDD,
+	0xB3, 0x05, 0xCF, 0x8F, 0x35, 0xC3, 0x82, 0xE8, 0xD7, 0x51, 0x5B, 0x63,
+	0x55, 0xD7, 0xFD, 0x7A, 0x94, 0xBC, 0xF0, 0xC9, 0x59, 0x6C, 0x09, 0x63,
+	0xD9, 0xB7, 0x1D, 0x70, 0xF9, 0x22, 0xCA, 0x5D, 0xFF, 0x53, 0x78, 0xC5,
+	0x74, 0xCC, 0x68, 0xA5, 0xC2, 0x24, 0x17, 0xC8, 0x7F, 0x27, 0x8B, 0x43,
+	0x22, 0x7F, 0x0F, 0xE2, 0x58, 0x4E, 0x01, 0xF2, 0xE4, 0xB8, 0x18, 0x60,
+	0xF5, 0x33, 0x32, 0xFE, 0x1C, 0xBB, 0xAB, 0x5C, 0x3D, 0xE8, 0x2E, 0x87,
+	0xCF, 0xD3, 0x75, 0x0A, 0x60, 0xBC, 0xDC, 0xED, 0xB6, 0x07, 0xD7, 0x44,
+	0x35, 0x08, 0x52, 0xBE, 0xD2, 0x69, 0xC6, 0xB2, 0x48, 0x9F, 0xF3, 0x0F,
+}

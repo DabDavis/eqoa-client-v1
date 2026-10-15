@@ -217,7 +217,6 @@ func (c *Client) handleInWorldInput() {
 	const (
 		ps2WalkBase     = float32(3.0)    // PS2 InitParms walk base (fixed)
 		ps2DefaultRunBase = float32(8.833) // PS2 InitParms default run base
-		walkRunRatio    = float32(0.3397)  // ps2WalkBase / ps2DefaultRunBase
 		// PS2 UpdatePhysics (0x486198): exponential velocity damping.
 		// powf(dampingBase, dt) applied per tick. dampingBase = InitParms+0x40 = 0.02.
 		// At 30fps (dt=0.033): decay = 0.02^0.033 ≈ 0.876. At 60fps: 0.02^0.016 ≈ 0.936.
@@ -231,12 +230,7 @@ func (c *Client) handleInWorldInput() {
 		// Extracted from EE memory dump: _13VIWalkControl$Gravity at 0x004E31F8.
 		gravityAccel    = float32(19.6) // $Gravity.Y magnitude (approx 2g, PS2 uses -19.6)
 		waterGravity    = float32(1.0)  // PS2 $WGravity.Y = -1.0 (slow sink when submerged)
-		maxStepDown     = float32(1.5)  // max Y drop before falling (matches stepUp)
-		terminalVelY    = float32(25.0) // PS2 InitParms+0x264 = 25.0
-		// PS2 UpdatePhysics: deceleration rate when exceeding terminal velocity.
-		// Constant 0x40C00000 = 6.0 u/s².
-		terminalVelDecel = float32(6.0)
-		jumpVelY        = float32(8.0)  // upward velocity impulse on jump (not in PS2 -- custom)
+		airDamping      = float64(0.8)  // PS2 InitParms m_parm44: UpdatePhysics's damping in the air
 		swimSpeed       = float32(3.0)  // PS2 InitParms+0x20 = 3.0 (vertical swim speed)
 		charHeight = float32(5.0) // approximate character height for water probing
 	)
@@ -671,12 +665,23 @@ func (c *Client) handleInWorldInput() {
 	if serverSpeed <= 0 {
 		serverSpeed = ps2DefaultRunBase // fallback before server sends speed
 	}
-	walkSpeedCap := serverSpeed * walkRunRatio // PS2 Run() in liquid uses walk speed
+	// VIClient::SetSpeed (0x00F8): run is the server's value and walk a flat
+	// 3.0 (0 when the run is 0); walk used to scale with the run.
+	walkSpeedCap := ps2WalkBase
 
 	// PS2 UpdatePhysics speed ramping: exponential damping + force accumulation.
 	// velocity = velocity * powf(dampingBase, dt) + targetSpeed * (1 - powf(dampingBase, dt))
 	// dampingBase = 0.02 from InitParms+0x40.
 	decay := float32(math.Pow(dampingBase, float64(dt)))
+
+	// In the air VIWalkControl::ViewRelativeMove adds no force and sets no
+	// heading (it returns unless on a floor or in a liquid), and UpdatePhysics
+	// damps by m_parm44 = 0.8 a second instead of 0.02: no air control, and
+	// the run carries on.
+	if zt != nil && !c.onGround && c.waterState == terrain.WaterNone && !c.gmNoClip {
+		moveX, moveZ = 0, 0
+		decay = float32(math.Pow(airDamping, float64(dt)))
+	}
 
 	if moveX != 0 || moveZ != 0 {
 		// Cancel emote on movement
@@ -740,38 +745,15 @@ func (c *Client) handleInWorldInput() {
 			}
 		}
 
-		// PS2 VIWalkControl::CalcFloor — ground snap for horizontal movement.
-		// No ramp hacks — the 2.5D path includes ground-level ramp entrance
-		// waypoints so normal SampleHeight terrain-following handles ramps.
+		// PS2 VIWalkControl::Move's floor half — step up, step down, headroom.
 		c.rampClimbing = false
-		if zt != nil && c.onGround && !c.gmNoClip {
-			oldY := p.Y
-			if newY, ok := zt.SampleHeight(p.X, p.Z, p.Y); ok {
-				drop := oldY - newY
-				if drop <= maxStepDown {
-					p.Y = newY
-					if terrain.CollDebug && newY != oldY {
-						fmt.Printf("CalcFloor: Y %.2f -> %.2f (delta %.2f)\n", oldY, newY, newY-oldY)
-					}
-				} else {
-					c.onGround = false
-					if terrain.CollDebug {
-						fmt.Printf("CalcFloor: ledge detected! drop=%.2f > maxStepDown=%.1f -> falling\n",
-							drop, maxStepDown)
-					}
-				}
-			} else {
-				c.onGround = false
-			}
+		if zt != nil && c.onGround && !c.gmNoClip && c.waterState == terrain.WaterNone {
+			c.walkFloor(zt, oldX, p.Y, oldZ)
 		}
 
 		c.engine.Walking = true
 		// PS2 UpdateLocomotion: classify speed into animation state.
-		if speed > walkSpeedCap*1.1 {
-			c.engine.AnimByte = animRun
-		} else {
-			c.engine.AnimByte = 1 // walk
-		}
+		c.engine.AnimByte = locoAnim(speed, walkSpeedCap, serverSpeed)
 		c.engine.VelX = moveX * speed
 		c.engine.VelZ = moveZ * speed
 		if c.onGround {
@@ -809,26 +791,12 @@ func (c *Client) handleInWorldInput() {
 					c.currentSpeed = 0
 				}
 			}
-			if zt != nil && c.onGround && !c.gmNoClip {
-				oldY := p.Y
-				if newY, ok := zt.SampleHeight(p.X, p.Z, p.Y); ok {
-					drop := oldY - newY
-					if drop <= maxStepDown {
-						p.Y = newY
-					} else {
-						c.onGround = false
-					}
-				} else {
-					c.onGround = false
-				}
+			if zt != nil && c.onGround && !c.gmNoClip && c.waterState == terrain.WaterNone {
+				c.walkFloor(zt, oldX, p.Y, oldZ)
 			}
 
 			c.engine.Walking = true
-			if speed > walkSpeedCap*1.1 {
-				c.engine.AnimByte = animRun
-			} else {
-				c.engine.AnimByte = 1 // walk
-			}
+			c.engine.AnimByte = locoAnim(speed, walkSpeedCap, serverSpeed)
 			c.engine.VelX = c.lastMoveX * speed
 			c.engine.VelZ = c.lastMoveZ * speed
 			if c.onGround {
@@ -1030,14 +998,6 @@ func (c *Client) handleInWorldInput() {
 			}
 		}
 
-		// PS2 UpdatePhysics: terminal velocity deceleration applies in water too.
-		if c.velocityY < -terminalVelY {
-			c.velocityY += terminalVelDecel * dt
-			if c.velocityY > -terminalVelY {
-				c.velocityY = -terminalVelY
-			}
-		}
-
 		c.onGround = false
 
 		// Swim animation: CPlayList slot 12 for all swim states.
@@ -1051,23 +1011,16 @@ func (c *Client) handleInWorldInput() {
 		// Airborne on land -- PS2 VIWalkControl::UpdatePhysics (0x486198).
 		// PS2 $Gravity at 0x004E31F8 = (0, -19.6, 0)
 
-		// PS2 velocity Verlet integration (two-pass damped):
-		//   y += v*dt + 0.5*a*dt²   (position from current velocity + acceleration)
-		//   v += a*dt               (then update velocity)
-		// More accurate than Euler for constant-acceleration free fall.
-		accel := -gravityAccel
-		p.Y += c.velocityY*dt + 0.5*accel*dt*dt
-		c.velocityY += accel * dt
-
-		// PS2 terminal velocity: smooth deceleration at 6.0 u/s² (0x40C00000)
-		// when falling speed exceeds terminal velocity (per-instance at +0x18C).
-		// Unlike a hard clamp, this gradually decelerates to terminal speed.
-		if c.velocityY < -terminalVelY {
-			c.velocityY += terminalVelDecel * dt
-			if c.velocityY > -terminalVelY {
-				c.velocityY = -terminalVelY
-			}
-		}
+		// UpdatePhysics (viwalkcontrol.cpp:788) with the force at Gravity and
+		// the air damping:
+		//   pos += f·dt²·damp + v·dt·damp;  v = (v + f·dt)·damp
+		// There is no terminal velocity. The 25 that stood here is the
+		// camera's orbit limit, and its "6.0 deceleration" is the rate the
+		// render height offset relaxes after a step (+0x18C → +0x104).
+		damp := float32(math.Pow(airDamping, float64(dt)))
+		f := -gravityAccel
+		p.Y += f*dt*dt*damp + c.velocityY*dt*damp
+		c.velocityY = (c.velocityY + f*dt) * damp
 
 		// Fall animation: CPlayList slot 6 (64+ anim models; 40-anim falls back to idle).
 		c.engine.AnimByte = animFall
@@ -1082,11 +1035,11 @@ func (c *Client) handleInWorldInput() {
 	// Skip ground snap when swimming -- water physics handles vertical position.
 	// Skip during ramp climbing -- nudge handles Y.
 	if zt != nil && c.waterState == terrain.WaterNone {
-		if groundY, ok := zt.SampleHeight(p.X, p.Z, p.Y); ok {
-			if c.onGround {
-				// Already on ground -- snap to surface (handles small terrain changes).
-				p.Y = groundY
-			} else if p.Y <= groundY {
+		if c.onGround {
+			// Standing: Move runs every tick, so the floor follows here too.
+			c.walkFloor(zt, p.X, p.Y, p.Z)
+		} else if groundY, ok := zt.SampleHeight(p.X, p.Z, p.Y); ok {
+			if p.Y <= groundY {
 				// Falling and reached ground -- land.
 				p.Y = groundY
 				if terrain.CollDebug && c.velocityY != 0 {
@@ -1098,11 +1051,9 @@ func (c *Client) handleInWorldInput() {
 				}
 				c.velocityY = 0
 				c.onGround = true
+				c.floorY = groundY
 			}
 			// If airborne and above ground, keep falling (physics handles it).
-		} else if c.onGround {
-			// Was on ground but no ground found -- start falling.
-			c.onGround = false
 		}
 	} else if zt != nil && c.waterState != terrain.WaterNone {
 		// In water: prevent sinking below ground.
@@ -1159,6 +1110,7 @@ afterPhysics:
 				p.Y = groundY
 				c.velocityY = 0
 				c.onGround = true
+				c.floorY = groundY
 			}
 		} else {
 			// No ground below — keep falling (gravity handles death).
@@ -1258,4 +1210,56 @@ func (c *Client) inMud() bool {
 		return c.liquidFlags&terrain.LiquidMud != 0
 	}
 	return c.liquidFlags&terrain.LiquidFeetInMud != 0
+}
+
+// walkFloor is the floor half of VIWalkControl::Move (viwalkcontrol.cpp:1137)
+// for a walker on land, once the sphere sweep has moved it on from (fromX,
+// fromY, fromZ). CalcFit (terrain.Fit) finds the floor and the head; then
+//   - with under 1.8 between them the move is refused (m_parm30);
+//   - feet below the floor stand on it: any step up the probe can see, which
+//     starts at the centre, so under 1.2;
+//   - a floor less than 0.6 below the last one stood on is stepped down to
+//     (m_parm28);
+//   - anything else is a fall. The probe reaches only 0.6 below the feet, so
+//     a drop it cannot see is a fall too.
+//
+// The old rule stepped up 1.8 and down 1.5, checked no headroom, and stood on
+// ceilings.
+func (c *Client) walkFloor(zt *terrain.ZoneTerrain, fromX, fromY, fromZ float32) {
+	p := &c.engine.State.Player
+	floor, head := zt.Fit(p.X, p.Y, p.Z)
+	if head-floor < 1.8 {
+		p.X, p.Y, p.Z = fromX, fromY, fromZ
+		if terrain.CollDebug {
+			fmt.Printf("CalcFit: headroom %.2f < 1.8 -> move refused\n", head-floor)
+		}
+		return
+	}
+	if p.Y < floor || c.floorY-floor < 0.6 {
+		if terrain.CollDebug && p.Y != floor {
+			fmt.Printf("CalcFit: Y %.2f -> %.2f\n", p.Y, floor)
+		}
+		p.Y = floor
+		c.floorY = floor
+		c.onGround = true
+		c.velocityY = 0
+		return
+	}
+	if terrain.CollDebug {
+		fmt.Printf("CalcFit: floor %.2f is %.2f below the last -> falling\n", floor, c.floorY-floor)
+	}
+	c.onGround = false
+}
+
+// locoAnim is VIWalkControl::UpdateLocomotion's forward classification:
+// a run past walk + (run − walk)·0.1 (3.58 at the default speeds), a walk past
+// m_speedThreshold 0.5, and otherwise standing.
+func locoAnim(speed, walk, run float32) byte {
+	switch {
+	case walk+(run-walk)*0.1 < speed:
+		return animRun
+	case 0.5 < speed:
+		return 1 // walk
+	}
+	return 0
 }

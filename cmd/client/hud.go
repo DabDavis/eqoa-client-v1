@@ -1046,6 +1046,10 @@ func (c *Client) drawSpellEffects(gs *game.GameState, camera rl.Camera3D) {
 			bolt := c.lightningSystem.GetOrCreate(key, sx, sy, sz, dx, dy, dz, color)
 			bolt.SetEndpoints(sx, sy, sz, dx, dy, dz)
 			bolt.Color = color
+			// The event's m_p10 caps the branches (SetMaxBranchCount, ≤ 3);
+			// a negative one is read as none (Intn would panic on it).
+			branches := max(0, int(fx.LightningMaxBranch))
+			bolt.SetMaxBranchCount(branches)
 			if fx.LightningHeld {
 				bolt.Flash() // SetCharge(1), every frame of the duration
 			}
@@ -1058,6 +1062,7 @@ func (c *Client) drawSpellEffects(gs *game.GameState, camera rl.Camera3D) {
 				bolt2 := c.lightningSystem.GetOrCreate(key2, lx, ly, lz, dx, dy, dz, color)
 				bolt2.SetEndpoints(lx, ly, lz, dx, dy, dz)
 				bolt2.Color = color
+				bolt2.SetMaxBranchCount(branches)
 				if fx.LightningHeld {
 					bolt2.Flash()
 				}

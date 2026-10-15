@@ -23,7 +23,13 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 | `VIWalkControl::SetTargetHeading` | `facing = atan2(moveX, moveZ)` — model +Z forward | `cmd/client/input.go` |
 | `VIWalkControl::Move` (sphere half) | `ZoneTerrain.CalcFit(…, grounded, inLiquid)` — sweep, two skitters, push-out only when wedged in the air | `internal/terrain/collision.go` |
 | `VICollSphere` + `VICollide::Collide(sphere, tri/edge/vertex)` + `VICollRay::Skitter` | `collSphere` — one-sided faces, t=0 for an embedded start, rule for rule with `go-eqoa-vi/vicoll` in float32 | `internal/terrain/sweep.go` |
-| `VIWalkControl::CalcFloor` | `ZoneTerrain.SampleHeight()` — ground snap | `internal/terrain/collision.go` |
+| `VIWalkControl::CalcFit` + `Move`'s floor half | `ZoneTerrain.Fit()` + `walkFloor` — floor and head probes, step up < 1.2, down < 0.6, refuse < 1.8 headroom; ceilings are not ground | `internal/terrain/collision.go`, `cmd/client/input.go` |
+| `VIWalkControl::UpdatePhysics` (air) | airborne integration, damping 0.8^dt, no air control, no terminal velocity | `cmd/client/input.go` |
+| `VIClient::SetSpeed` (0x00F8) | run = server value, walk = flat 3.0 | `cmd/client/input.go` |
+| `VIPad::ScaleStick` | `scaleStick` — dead zone 88..167 of 255 | `cmd/client/gamepad.go` |
+| `VINameSprite::Raster` / `RasterDeferred` | name plates: node 3 + 0.6, 22-unit cut, 24 max, near-first, overlaps dropped | `cmd/client/render.go` |
+| `VIRadialFloraSystem` | 3×3 grid of 40-unit swatches, real FloraSprite meshes | `internal/terrain/flora.go` |
+| `VIWorld::StreamLeaf` | zones load within 900, unload past 950 (3D) | `cmd/client/render.go` |
 | `VIWalkControl::Move` (env half) | `ZoneTerrain.ProbeLiquid()` — the liquid bits at feet+1.2 ±0.1 and mud at the feet | `internal/terrain/water.go` |
 | `VIWalkCamera::Process` | Camera orbit in `handleInWorldInput()` | `cmd/client/input.go` |
 | `VIParticleEmitter::Update` | Analytical particle physics (birth/death/position/size/color) | `internal/game/particles.go` |
@@ -38,7 +44,7 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 | `VIAtmosphere` | WXTYPE 0 clear, 1-3 rain, 4-6 snow; 30 s fade (0xC5) or instant (0xC7); 8 s lightning; splashes | `internal/game/weather.go` |
 | `VIWorld::SetProfiles` + `CalcProfileBlend` | Terrain profiles → fog colour/near/far, overcast weight, ambient track | `internal/terrain/profiles.go` |
 | `VISpellEventDriver::ProcessProjectileEvent` | Projectiles and bolts ride the TARGET driver; 4 flight modes; `VIParticleSystem::DeltaTime` | `internal/game/spelldriver.go` |
-| `VILightning` | Jagged bolt renderer (16 segments, 3 branches) | `internal/game/lightning.go` |
+| `VILightning` | Three harmonics, branches off points 3/6/9, three-frame afterimage | `internal/game/lightning.go` |
 | `VIEffectVolume` | Environmental volumes (fog/dust/leaves/shafts/flock); `Render`'s distance fade and hour window | `internal/game/effectvolumes.go` |
 | `VIZoneTree` | BSP tree for water/lava/slime/mud detection | `internal/terrain/water.go` |
 | `VIUI` | 36-sheet UI textures, 252-entry TexID table; `BlitFrame` with per-piece flip flags, placed by corner sizes | `internal/ui/viui.go` |
@@ -46,13 +52,15 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 
 ### VI Functions NOT Yet Ported
 
-| PS2 VI Function | Purpose | Symbol Address (SUPPORT) |
+Code addresses (the old table listed name-string addresses):
+
+| PS2 VI Function | Purpose | Code Address (SUPPORT) |
 |---|---|---|
-| `VIWalkControl::UpdatePhysics` | Gravity, vertical velocity, jumping | `0x005132F4` |
-| `VIWalkControl::UpdateLocomotion` | Speed ramping (walk/run acceleration) | `0x00513372` |
-| `VIWalkCamera::UpdateCameraPhysics` | Camera-wall collision | `0x00512F5A` |
-| `VIWalkControl::CalcPitchRollToLandscape` | Terrain-following rotation | `0x00513612` |
-| `VIMaterial::SetLayerTexture/BlendMode` | Multi-layer single-pass rendering | CLIENT symbols |
+| `VIWalkControl::UpdatePhysics` | Ground half: force/velocity damping and the bang-bang turn (the air half is ported) | `0x00486198` |
+| `VIWalkControl::UpdateLocomotion` | Locomotion state from measured displacement (only the forward run/walk thresholds are ported) | `0x00487178` |
+| `VIWalkCamera::UpdateCameraPhysics` | Drag camera, `MoveCamera` + `FindOrbitAngle` wall swing | `0x00482758` |
+| `VIWalkControl::CalcPitchRollToLandscape` | Terrain-following rotation | `0x00485FE8` |
+| `VIRStrip4` (VU1) | Character lighting — not decompiled; characters are drawn unlit | — |
 
 ## Architecture
 
@@ -103,15 +111,15 @@ internal/game/
   particles.go                       # ParticleSystem/Emitter — billboard quad rendering
   spellfx.go                         # SPELLFX.ESF loader
   spellsprites.go                    # Spell sprite model loading/caching (GPU meshes)
-  weather.go                         # VIAtmosphere: 7 weather types, transitions, splash
-  lightning.go                       # VILightning: bolt renderer (16 segments, 3 branches)
-  effectvolumes.go                   # VIEffectVolume: fog/dust/leaves/shafts/flock (512 max)
+  weather.go                         # VIAtmosphere: WXTYPE 0-6, transitions, splash, lightning cycle
+  lightning.go                       # VILightning: harmonics, branches, afterimage
+  effectvolumes.go                   # VIEffectVolume: fog/dust/leaves/shafts/flock, actor-local
 
 internal/terrain/
   terrain.go                         # ESF zone loading, ZoneTerrain, EffectVolumes, PointLights
   renderer.go                        # GPU mesh upload, multi-pass rendering, frustum culling
   collision.go                       # CalcFit (wall slide), castWallRay, SampleHeight
-  flora.go                           # Radial flora (triangle scatter, 256-unit chunks)
+  flora.go                           # VIRadialFloraSystem: 40-unit swatches around the camera
   water.go                           # VIZoneTree BSP: water/lava/slime/mud detection, ProbeWater
   navmesh.go                         # Wrapper — delegates to server ESF navmesh builder
   obstaclenav.go                     # Obstacle avoidance waypoints, doorway probing
@@ -138,10 +146,9 @@ internal/network/
 
 internal/audio/
   audio.go                           # Sound system: 3D positional, looping, distance attenuation
-  ambient.go                         # AMBTRACK.ESF: XM→PCM, zone-based day/night selection
-  bgm.go                             # BGM zones from TUNARIA.ESF StreamAudioSprite placements
-  bgmstream.go                       # VAG ADPCM streaming decoder (block-interleaved stereo)
-  vag.go                             # VAG decoder (EQOA reversed nibble variant)
+  ambient.go, ambientmix.go          # AMBTRACK.ESF: XM→PCM, (day, night) pairs, SetSoundTrack mixing
+  bgm.go                             # Music regions from TUNARIA.ESF StreamAudioSprite placements
+  vag.go                             # VAG decoder (standard layout)
 
 internal/sky/sky.go                  # SKY.ESF dome, time-of-day tint, sun/moon/stars, weather
 internal/ui/viui.go                  # PS2 UI renderer (36 sheets, 9-slice, 252-entry TexID table)
@@ -260,7 +267,7 @@ Overlays use `glDepthFunc(GL_LEQUAL)` + `glDepthMask(GL_FALSE)` during Pass 2. T
 **Do NOT use `glPolygonOffset`** — it creates visible sub-pixel cracks between terrain strips. See `claude-notes/terrain-rendering.md` for full history of failed approaches.
 
 ### Radial Flora
-Procedural flora uses a hybrid approach: scatter on **render overlay triangles** (correct visible Y positions) filtered by a **collision mesh FloraType grid** (PS2 CollBuffer type 3 per-vertex flora set index). This ensures flora only appears on natural surfaces (grass, dirt) and not on cobblestone, stone, etc. Also filtered by slope (normal Y > 0.7, ~45 degrees). Key file: `internal/terrain/flora.go`.
+A port of `VIRadialFloraSystem` (`internal/terrain/flora.go`): a 3×3 grid of 40-unit swatches on the world grid follows the camera; each is grown from the ROOM collision triangles under it (actors rejected, ≤ 30° from up, the newest strip vertex's flora byte), (int)(area × Σweight) plants per triangle, newlib `rand` seeded per sub-cell, 100-triangle and 500-plant caps. Plants are the FloraSprite's own mesh (`esf.LoadFloraMesh`, type 0x1230), drawn within 40 units, ≤ 700, far to near, alpha 1 to 10 units then fading to 0 at 40, lit by the terrain shader. The dist record is (flags, model, weight, base scale, scale variance) — "SetIndex" was a flags word.
 
 ## Water & Environment Detection
 
@@ -281,13 +288,15 @@ Procedural flora uses a hybrid approach: scatter on **render overlay triangles**
 
 ## Sky & Weather
 
-**Sky** (`internal/sky/sky.go`): SKY.ESF dome with dual-layer materials (base + cloud overlay at 3x UV tiling). Procedural star field (~200 golden spiral points). Sun/moon billboards with celestial elevation visibility. PS2-derived 24-hour tint table with weather-driven overcast darkening. (The [A]-tier sky items in the audit note are not done.)
+**Sky** (`internal/sky/sky.go`): the "sky" dome only, unrotated ("EQOA_Skydome_360" is the Plane of Sky's), its layers from the ESF material: layer 0 scrolling at 0.009/s, layer 1 ×3 at 0.05/s, blend 3. Every layer is the sky colour (`SetupTimeOfDaySky`, the renderer's `SkyColor`) × texture; `ProcessTransitions` rebuilds the dome under weather (DarkClouds). Sun, Corona and Moon are found by NAME, drawn 8/24/4 at 35 units, additive, hidden under overcast. 128 stars from `sStarNoise` with twinkle, plus a shooting star. 14 additive lightning patches during a flash. `render.go` feeds it `WeatherSystem.SkyAtmosphere()` each frame.
 
 **Game clock**: one game day is 60 real minutes, `h = mod(ts2 + elapsed, 3.6e6)/3.6e6 × 24` (CLIENT `0x00BC7B70`).
 
 **Weather** (`internal/game/weather.go`): a VIAtmosphere port. WXTYPE 0 clear, 1–3 rain and 4–6 snow at intensities {0, .15, .5, 1, .15, .5, 1}. Opcode **0xC5 fades over 30 s, 0xC7 is instant** (the server's `ps2opcodes.go` comments were swapped too). Particles ray-test the ground, so rain stops at a roof; there is no indoor switch. The outdoors factor is the baked sun gate 15 below the camera.
 
-**Lightning** (`internal/game/lightning.go`): 16-segment jagged bolts, up to 3 branches. A spell bolt is held at charge 1 for its event's duration, then decays at 5/s.
+**Lightning** (`internal/game/lightning.go`): `VILightning` — three noise harmonics, branches off bolt-0 points 3/6/9 (the event's `m_p10`, at most 3), the 70–350 ms strike re-roll, a three-frame afterimage, four ribbons. A spell bolt is held at charge 1 for its event's duration, then decays at 5/s.
+
+**Effect volumes** (`internal/game/effectvolumes.go`): rewritten from `vieffectvolume.cpp`, in volume-local space with the actor's rotation and scale. Fog, dust and leaves alpha-blend, shafts add; flock boids (int)(density·8)+1. Leaves and dust take the scene light (`SetLighting`).
 
 **Terrain lighting** (`internal/terrain/renderer.go`): VU1 VIRStrip2/3. lit = min(1, vtx.rgb + ambient(+emissive) + sun·max(0, −N·D)·vtx.a + lantern). Vertex alpha is a SUN GATE, never opacity. Overlay blend 4 is a multiply (`glBlendFunc(ZERO, SRC_ALPHA)`). Only the player's lantern lights terrain. Fog and the far plane come from the terrain profiles.
 
@@ -296,10 +305,11 @@ Procedural flora uses a hybrid approach: scatter on **render overlay triangles**
 | File | Purpose |
 |------|---------|
 | `audio.go` | Sound manager: 3D positional, distance attenuation, BGM streaming; pan is `CalcVolumeAndPan`'s, against the camera (−1 left … +1 right) |
-| `ambient.go` | AMBTRACK.ESF: XM→PCM at 22050Hz, 12 day + 8 night tracks, zone selection |
-| `bgm.go` | BGM zones from TUNARIA.ESF StreamAudioSprite placements |
-| `bgmstream.go` | VAG ADPCM streaming decoder (block-interleaved stereo, auto-detect interleave) |
-| `vag.go` | VAG decoder — EQOA variant with reversed nibble order (predictor=high, shift=low) |
+| `ambient.go` / `ambientmix.go` | AMBTRACK.ESF XM→PCM; 11 (day, night) pairs by terrain profile (`SetTracks`); `SetSoundTrack`'s 15 s crossfade + 15 s hold-off, × (1 − rain)³ × outdoors, muted in liquid |
+| `bgm.go` | Music regions: the camera taken into each StreamAudioSprite actor's space; priority, then nearest centre |
+| `vag.go` | VAG decoder — the standard nibble layout (`AdpcmToPcm`); loops restart at block 1 |
+
+Rain and thunder are SKY.CSF's bare 0xB000 Adpcm objects (`LoadAdpcmSounds`): rain two looping voices at pan ±1, thunder two one-shots. BGM fades out at 0.05 a frame before a switch.
 
 Entity sounds triggered by animation keyframe crossings (`cmd/client/entitysound.go`), using per-model PLSlotSound maps.
 
@@ -406,9 +416,9 @@ Two-layer model matching PS2 `VICSprite::SetAnimation` (0x00422D78):
 - **Layer 0 (`LayerUpper`)**: the upper body; also the whole body of a non-humanoid
 - **Layer 1 (`LayerLower`)**: the lower body (humanoids only)
 
-**Priority gating**: Playing animations always interruptible. Only stopped/finished play-once animations protected by priority. Idle can never replace a stopped anim. Same-animID rejected.
+**Priority gating** is `SetAnimation`'s rules exactly (`setAnimation`, `animcontroller.go`): integer per-layer priorities (a slot the PS2 table omits scores 0), the idle-over-walk exception on the legs, and the in-progress-blend cases. A request while a blend is in flight replaces without blending (`AddPlay`).
 
-**PlayOnce**: Attack anims hold last frame; locomotion loops. `applySkeletal` clamps play-once anims and notifies controller via `MarkActionFinished()`.
+**PlayOnce** comes from the model's play list (`BindModel`), not a guess: every attack, hit, cast and emote slot plays once on all 568 CHAR.ESF models. `applySkeletal` clamps play-once anims and notifies the controller via `MarkActionFinished()`. `SetDefaultEntries` (`ApplyDefaultEntries`, run at model load) fills the slots a model lacks.
 
 **The two layers are body HALVES**: `LayerUpper` (0) and `LayerLower` (1). `Resolve()` returns (upper, lower). A humanoid's `SetLocomotion` and `SetAction` set both layers, and the priority tables decide each layer. Walking plus an attack leaves the upper body swinging and the legs walking. A creature uses layer 0 alone. Death forces slot 14 and the special idle is slot 15 for every skeleton. `ClearAction` empties only non-locomotion layers. Regression-guarded by `internal/models/walk_repro_test.go`.
 
@@ -427,7 +437,7 @@ Two-layer model matching PS2 `VICSprite::SetAnimation` (0x00422D78):
 Each maps logical roles (SpecialIdle, BattleStance, Death, etc.) to ESF CPlayList slot numbers.
 
 ### Cross-Fade Blend
-250ms interpolated transition (PS2 `AddInterpolatedPlay`). Per-pair rejection — locomotion blend doesn't block action pair.
+250ms interpolated transition (PS2 `AddInterpolatedPlay`) for EVERY skeleton, creatures included. The outgoing play holds its frame (`StopPlayback` → `StopEnd`). The play rate is the play-list weight alone — nothing in the running game calls `SetPlayRate`, so a faster run does not animate faster.
 
 ### Negative Speed
 CPlayList speed field negative = reverse playback (idle=-0.80, swim_back=-1.50). `math.Abs()` for rate, sign for direction.
@@ -436,7 +446,7 @@ CPlayList speed field negative = reverse playback (idle=-0.80, swim_back=-1.50).
 - `animTimerB` — idle during combat with timer < 5s forces animID 17 (combat idle)
 - Death forces animID 14, rejects non-death actions when dead
 - Special idle: random 20-40s timer → CPlayList slot 15
-- Per-weapon attack pools: `weaponAttackAnims` maps 12 VICSpriteAttackType values to PS2 CPlayList slot pairs
+- Attacks: `attackActionAnim` is `SetAttackAction`/`SetAttackAltAction` (vicsprite.cpp:551-665) per hand, from the attack type in each hand (11 = empty, the unarmed 23/22 and 25/24)
 
 ### ESF CPlayList Slot-Based Animation
 All animation bytes (`animByte`) are ESF CPlayList slot numbers (sparse: 0,1,3,4,6,7,10,12-15,17,22-44,56-61). `PLSlotToRawPair` maps slot → [upper, lower] raw animation indices per model. This ensures correct animation across all model types (40, 64, 72, 80 anims) since raw indices differ per model but CPlayList slots are semantic.
@@ -600,18 +610,20 @@ Verified zero data races under `-race` vs Sandstorm. Future edits must preserve:
 Auth → patch → server list → world entry. Handshake completes on GuaranteedAck (fast) or 5-packet count (fallback).
 
 ### State Channels
-ACK all valid channels (0x00-0xF7). Dirty count 3 for UDP loss resilience. Cap 40 ACKs per packet. XOR delta with 32-entry base history per channel.
+A message at or below the channel's rx is dropped and the channel re-acked with rx; a delta whose reference base is missing (or > 4,096 ahead) discards the WHOLE datagram, unacked. Acks repeat twice, uncapped. Bases are pruned wrap-safely. A reassigned channel keeps its sequence (`ClearStateAck` is a no-op).
 
 **Outgoing RLE** is `run_length_encode` exactly: the short form holds at most 7 literals (8+ sets bit 7, the long-form flag), and zero runs stop at 255.
 
 **Guaranteed-ack mask**: bit 0 = rx+2, unsigned LEB128 (`connection_get_ack_mask`), pinned to a PS2 capture. Body flag **0x04 is never sent**: the PS2 writes an always-zero field there, and no PS2 capture sets it.
 
 ### Reliability
-- Per-message retransmit with RTO (16-sample RTT buffer, 60s kill)
-- Arrival history bitmap (forward/OOO/duplicate, gap > 64 reset)
-- Fragment reassembly with 30s orphan timeout
-- 60-second server silence detection
-- `ConnectionMetrics`: PacketsRecv, PacketsDropped, ArrivalGaps, Retransmits, FragmentsExpired
+- Every sequence compare is wrap-safe (`int16(a−b)`).
+- Guaranteed messages are held and released strictly in order (`m_delayed`); 0xFA pieces collect until the next 0xFB/0xF9.
+- RTO = the largest of 16 RTT samples + 100 ms, starting at 1,100 ms; fast retransmit once the server acks a later flush.
+- A packet takes messages only while they fit; reliable messages over 1,300 bytes are split.
+- Incoming ack masks are UNSIGNED (bit 0 = ack+2).
+- Run live on Sandstorm 2026-10-15: world entry, the fragmented MemoryDump, ~110 s in world, 0 retransmits/drops.
+- **Sandstorm refuses VPN addresses**: a real login from one gets auth opcode 0x43 and a close (reported as "auth read failed: unexpected EOF").
 
 ### Position Updates (0x40 — 41 bytes)
 ```

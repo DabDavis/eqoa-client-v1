@@ -4,10 +4,15 @@ package audio
 // VAG format: 16-byte blocks, each containing 1 byte shift/predictor,
 // 1 byte flags, 14 bytes of 4-bit ADPCM samples (28 samples per block).
 //
-// EQOA byte 0 layout (non-standard, verified from MIPS disassembly of AdpcmToPcm
-// at 0x0043E190 and confirmed by data analysis — all high nibbles ≤4, low ≤12):
-//   high nibble = predictor (0-4), low nibble = shift (0-12)
-// This is opposite of standard PS2 SPU2 VAG (high=shift, low=predictor).
+// Byte 0 is the standard SPU ADPCM layout, as VIESFParse::AdpcmToPcm reads it:
+// high nibble = predictor (0-4), low nibble = shift (0-12). It was described
+// here as an EQOA variant with the nibbles reversed; it is not one.
+//
+// The flag byte is the SPU's: bit 0 loop end, bit 1 repeat, bit 2 loop start.
+// Every clip on the disc opens with a silent block. A one-shot ends on a 01
+// block; a loop (42 clips in CHAR.ESF, rain_lt in SKY.CSF) sets 06 on block 1,
+// ends its loop on a 03 block and carries a trailing 07 block the voice never
+// reaches.
 
 // VAG prediction coefficients (same as PS2 SPU2).
 var vagCoeffs = [5][2]float64{
@@ -90,6 +95,24 @@ func DecodeVAG(vagData []byte) []int16 {
 	}
 
 	return samples
+}
+
+// vagLoopStart is the sample an SPU voice repeats from: the first sample of
+// the block flagged loop-start (bit 2), which on every looping clip on the
+// disc is block 1, just past the silent lead-in. 0 when the clip does not
+// loop. Restarting there rather than at sample 0 is what keeps the silent
+// block out of the loop.
+func vagLoopStart(vagData []byte) int {
+	for block := 0; block*16+16 <= len(vagData); block++ {
+		flags := vagData[block*16+1]
+		if flags == 7 {
+			return 0 // DecodeVAG stops here
+		}
+		if flags&4 != 0 {
+			return block * 28
+		}
+	}
+	return 0
 }
 
 // detectInterleave auto-detects the stereo interleave size for a VAG file.

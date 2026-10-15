@@ -24,6 +24,11 @@ const slopeThresholdSq = 0.25 // 0.5 * 0.5 = cos²(60°)
 const (
 	charRadius float32 = 0.6 // PS2 walkControl[0x34] = 0.6 — horizontal collision sphere radius
 	charCollY  float32 = 1.2 // PS2 walkControl[0x38] = 1.2 — sphere center height above feet
+	// PS2 m_parm30 = 1.8: how far CalcFit drops its floor probe from the
+	// centre, and the least headroom Move accepts.
+	floorDrop float32 = 1.8
+	// PS2 m_parm3C = 0.001: the radius of CalcFit's two probes.
+	probeRadius float32 = 0.001
 )
 
 // CollTriangle holds three vertices (position only) for collision queries.
@@ -34,7 +39,8 @@ type CollTriangle struct {
 	MinX, MaxX float32 // precomputed XZ bounding box
 	MinZ, MaxZ float32
 	FloraType  int  // -1 = no flora, 0+ = flora set index
-	Walkable   bool // precomputed slope check (normalY > ~0.7)
+	Room       bool // a zone room's geometry; the radial flora query skips actors
+	Walkable   bool // faces up (in the PS2's winding) at under 60° from level
 }
 
 // CollTile holds collision triangles for a tile grid cell.
@@ -568,7 +574,7 @@ func (zt *ZoneTerrain) CalcFit(oldX, oldY, oldZ, newX, newZ float32, grounded, i
 
 	var s collSphere
 	s.init(from, to, charRadius)
-	if !zt.collideSphere(&s) {
+	if !zt.collideSphere(&s, false) {
 		return r
 	}
 	hp := s.hitPoint()
@@ -584,7 +590,7 @@ func (zt *ZoneTerrain) CalcFit(oldX, oldY, oldZ, newX, newZ float32, grounded, i
 	var normal vec3
 	for i := 0; i < 2; i++ {
 		s.skitter(skit)
-		if !zt.collideSphere(&s) {
+		if !zt.collideSphere(&s, false) {
 			wedged = false
 			break
 		}
@@ -599,7 +605,7 @@ func (zt *ZoneTerrain) CalcFit(oldX, oldY, oldZ, newX, newZ float32, grounded, i
 		to = to.add(normal.scale(charRadius))
 		r.PushedOut = true
 		s.init(from, to, charRadius)
-		zt.collideSphere(&s)
+		zt.collideSphere(&s, false)
 	}
 	end := s.hitPoint()
 	r.X, r.Z = end[0], end[2]
@@ -611,9 +617,30 @@ func (zt *ZoneTerrain) CalcFit(oldX, oldY, oldZ, newX, newZ float32, grounded, i
 	return r
 }
 
-// collideSphere sweeps s against the steep collision triangles around its
-// path, keeping the earliest hit — the walker's VIScene::Collide.
-func (zt *ZoneTerrain) collideSphere(s *collSphere) bool {
+// Fit is VIWalkControl::CalcFit (viwalkcontrol.cpp:1255) for a walker whose
+// feet are at feetY: a sphere of radius 0.001 dropped 1.8 from the centre
+// (feet + 1.2) finds the floor, and a second, swept from the centre up to
+// floor + 3.6, finds the head. A probe that meets nothing ends at its end
+// point, so with no floor in reach the floor is feet − 0.6. Faces are
+// one-sided, as in the wall sweep, so the drop meets only faces that point
+// up and the rise only faces that point down, whatever their slope.
+func (zt *ZoneTerrain) Fit(x, feetY, z float32) (floor, head float32) {
+	centre := vec3{x, feetY + charCollY, z}
+	var s collSphere
+	s.init(centre, centre.sub(vec3{0, floorDrop, 0}), probeRadius)
+	zt.collideSphere(&s, true)
+	floor = s.hitPoint()[1]
+
+	s.init(centre, vec3{x, floor + floorDrop*2, z}, probeRadius)
+	zt.collideSphere(&s, true)
+	head = s.hitPoint()[1]
+	return floor, head
+}
+
+// collideSphere sweeps s against the collision triangles around its path,
+// keeping the earliest hit — the walker's VIScene::Collide. The wall sweep
+// passes all = false and meets only the steep faces; see CalcFit.
+func (zt *ZoneTerrain) collideSphere(s *collSphere, all bool) bool {
 	// A zero-length sweep collides with nothing (VICollBuffer's walk).
 	if s.length == 0 {
 		return false
@@ -651,7 +678,7 @@ func (zt *ZoneTerrain) collideSphere(s *collSphere) bool {
 		}
 		for i := range tile.Triangles {
 			tri := &tile.Triangles[i]
-			if tri.Walkable || tri.MaxX < minX || tri.MinX > maxX || tri.MaxZ < minZ || tri.MinZ > maxZ {
+			if (tri.Walkable && !all) || tri.MaxX < minX || tri.MinX > maxX || tri.MaxZ < minZ || tri.MinZ > maxZ {
 				continue
 			}
 			// The PS2's strip order: CollTriangle holds each strip triangle
@@ -789,7 +816,10 @@ func addCollTriToZone(zt *ZoneTerrain, tri CollTriangle) {
 	ny := e1z*e2x - e1x*e2z
 	nz := e1x*e2y - e1y*e2x
 	lenSq := nx*nx + ny*ny + nz*nz
-	tri.Walkable = ny*ny > slopeThresholdSq*lenSq
+	// e1×e2 in this vertex order is the PS2's own face normal (the swap of
+	// the first two vertices and the reversed cross cancel), so ny < 0 is a
+	// ceiling. The square alone let a ceiling count as ground.
+	tri.Walkable = ny > 0 && ny*ny > slopeThresholdSq*lenSq
 
 	cx := (tri.X0 + tri.X1 + tri.X2) / 3
 	cz := (tri.Z0 + tri.Z1 + tri.Z2) / 3

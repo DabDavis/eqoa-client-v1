@@ -540,8 +540,9 @@ type SegmentBody struct {
 	InstanceLocal     int32
 	ArrivalNumber     uint16
 	FlushAck          uint16
+	FlushAckMask      uint64 // body flag 0x04: earlier flushes also seen, bit 0 = FlushAck-1
 	GuaranteedAck     uint16
-	GuaranteedAckMask int64
+	GuaranteedAckMask uint64 // body flag 0x08: held out of order, bit 0 = GuaranteedAck+2
 	StateAcks         []StateAck
 	Messages          []*Message
 }
@@ -587,8 +588,10 @@ func (b *SegmentBody) Read(reader *buffer.Reader, header *SegmentHeader) error {
 			return err
 		}
 
+		// Both masks are buffer_read_packed_uns64 in connection_parse_segment_body:
+		// UNSIGNED. Read zigzag, a mask with bit 0 set came out as -1 -- every bit.
 		if b.Flags&BodyFlagUnknownPacked != 0 {
-			_, err = reader.Read7BitEncodedInt64()
+			b.FlushAckMask, err = reader.Read7BitEncodedUInt64()
 			if err != nil {
 				return err
 			}
@@ -603,7 +606,7 @@ func (b *SegmentBody) Read(reader *buffer.Reader, header *SegmentHeader) error {
 		}
 
 		if b.Flags&BodyFlagGuaranteedAckMask != 0 {
-			b.GuaranteedAckMask, err = reader.Read7BitEncodedInt64()
+			b.GuaranteedAckMask, err = reader.Read7BitEncodedUInt64()
 			if err != nil {
 				return err
 			}
@@ -669,38 +672,22 @@ func (b *SegmentBody) Read(reader *buffer.Reader, header *SegmentHeader) error {
 				return err
 			}
 
-			var opcode GameOpcode
-			if mt != MessageTypePing && size >= 2 {
-				op, err := reader.ReadUint16()
-				if err != nil {
-					return err
-				}
-				opcode = GameOpcode(op)
-				size -= 2
-			}
-
-			if size < 0 {
-				size = 0
-			}
+			// Data() is the message's bytes exactly as sent. The first two are
+			// also read out as the opcode, but a piece shorter than that (the
+			// last fragment of a message can be one byte) has none, and must
+			// not grow two zero bytes.
 			msgData, err := reader.ReadBytes(size)
 			if err != nil {
 				return err
 			}
 
-			msg := &Message{data: make([]byte, len(msgData)+2)}
+			msg := &Message{data: make([]byte, len(msgData))}
 			msg.Type = mt
-			msg.Opcode = opcode
 			msg.Sequence = seqNum
-			// Reconstruct data with opcode prefix for consistency
-			if mt != MessageTypePing {
-				fullData := make([]byte, 2+len(msgData))
-				fullData[0] = byte(opcode)
-				fullData[1] = byte(opcode >> 8)
-				copy(fullData[2:], msgData)
-				msg.SetData(fullData)
-			} else {
-				msg.SetData(msgData)
+			if mt != MessageTypePing && len(msgData) >= 2 {
+				msg.Opcode = GameOpcode(uint16(msgData[0]) | uint16(msgData[1])<<8)
 			}
+			msg.SetData(msgData)
 			b.Messages = append(b.Messages, msg)
 			continue
 		}

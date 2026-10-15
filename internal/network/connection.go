@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eqoa/client/internal/protocol"
 	"github.com/DabDavis/eqoa-esf-tools/pkg/buffer"
+	"github.com/eqoa/client/internal/protocol"
 )
 
 // Connection represents a DRDP UDP connection to the game server.
@@ -29,7 +29,7 @@ type Connection struct {
 	instanceRemote  uint32 // Server's instance (instance_remote) — body SessionAck
 	instanceCounter uint32 // Counter for generating sequential instance IDs
 	sessionID       uint32 // From server after promotion (= player ObjectID)
-	hasInstance      bool
+	hasInstance     bool
 	needsNewInst    bool
 	didServerInit   bool
 
@@ -50,13 +50,23 @@ type Connection struct {
 	recvArrival  uint16 // Last received server packet arrival number
 	recvReliable uint16 // Highest contiguous reliable seq (for guaranteed_ack)
 
-	// Out-of-order reliable message tracking: bitmap of received sequences
-	// above recvReliable. When seq arrives out of order (gap), it's marked
-	// here. When the gap fills, recvReliable advances past the contiguous run.
-	reliableOOO map[uint16]bool
+	// Guaranteed messages held out of order (PS2 m_delayed), keyed by seq.
+	// connection_move_delayed_to_arrivals releases them strictly in sequence:
+	// recvReliable+1 first, then on while the next one is here. The ack mask
+	// is built from these keys.
+	delayed map[uint16]*protocol.Message
 
-	// Server's ack of our reliable messages
+	// Fragment pieces (0xFA) already released in sequence (PS2 m_arrivals):
+	// they accumulate until the next 0xFB/0xF9 is released, and the whole run
+	// is delivered as one message.
+	arrivals []*protocol.Message
+
+	// Server's ack of our reliable messages (PS2 m_usTxAck)
 	serverAckedReliable uint16
+
+	// Highest flush number the server has acked (PS2 m_usFlushAck). An
+	// outstanding message sent in an EARLIER flush is then known lost.
+	flushAckMax uint16
 
 	// Last guaranteed ack we sent (to avoid resending stale values)
 	lastSentReliable uint16
@@ -67,11 +77,12 @@ type Connection struct {
 	// On gap: arrivalHistory <<= gapSize. On old arrival: set bit at position.
 	arrivalHistory uint64
 
-	// Persistent state channel ACKs: channel → highest acked seq.
-	// PS2 uses per-channel dirty counter (decremented per flush). We track
-	// the same with stateAckDirtyCount: set to 1 on receive, decremented on send.
-	stateAckMap        map[byte]uint16
-	stateAckDirtyCount map[byte]byte // Per-channel dirty counter (PS2: state_channel[ch].ack_dirty)
+	// Per state channel: the highest sequence taken (PS2 state_channel.rx,
+	// 0 until the first) and how many more flushes ack it (m_ucRxFlag, set
+	// to 2 by every message on the channel, stale ones included). rx only
+	// moves forward, so the ack never goes backwards.
+	stateRx     map[byte]uint16
+	stateRxFlag map[byte]byte
 
 	// Outgoing message queue
 	outgoing []*protocol.Message
@@ -83,19 +94,15 @@ type Connection struct {
 	// PS2 tracks per-message timers; retransmits ALL expired messages per flush.
 	unackedSendTime map[uint16]time.Time
 
-	// Fragment reassembly: buffer fragments by sequence number, then
-	// assemble in seq order when final 0xFB arrives. This handles UDP
-	// out-of-order delivery where fragment chunks arrive in wrong order.
-	fragmentParts     map[uint16][]byte // seq → chunk data
-	fragmentFinalSeq  uint16           // seq of 0xFB final fragment (0 = none yet)
-	fragmentStartTime time.Time        // when first fragment was buffered (for 30s cleanup)
+	// The flush number each unacked message last went out in (message_set_flush).
+	unackedFlush map[uint16]uint16
 
 	// Incoming parsed packets channel
 	Incoming chan *ReceivedPacket
 
-	// XOR delta bases for state channels (channel -> seq -> data)
+	// XOR delta bases for state channels (channel -> seq -> decoded data),
+	// PS2 state_channel.m_rxList
 	stateBases map[byte]map[uint16][]byte
-	xorBuf     [512]byte // reusable XOR decode buffer (entity=162, stats=268+)
 
 	// Outgoing state channel sequence counters (per channel)
 	sendStateSeq map[byte]uint16
@@ -148,7 +155,7 @@ type Connection struct {
 	flushSendTimes [1024]time.Time
 	rttSamples     [16]time.Duration // PS2: 16-sample circular buffer (#25)
 	rttSampleIdx   byte              // PS2: index at offset 0x1122, wraps with & 0x0F
-	rto            time.Duration     // Retransmit timeout (min 200ms, max 10s, initial 2s)
+	rto            time.Duration     // Retransmit timeout: max RTT sample + 100 ms (initial 1,100 ms)
 
 	// PS2 body flag 0x20 ("short" flag): tracks consecutive good arrivals.
 	// PS2 sets 0x20 when this counter < 17, clears it after 17+ good arrivals.
@@ -246,25 +253,26 @@ func NewConnection(serverAddr string, serverPort int, remoteEndpoint uint16) (*C
 	instanceID := uint32(0x00020000) | uint32(localEndpoint)
 
 	c := &Connection{
-		conn:               udpConn,
-		addr:               addr,
-		localEndpoint:      localEndpoint,
-		remoteEndpoint:     remoteEndpoint,
-		instanceID:         instanceID,
-		instanceCounter:    2, // PS2 starts at 2
-		hasInstance:         true,
-		needsNewInst:       true,
-		sendArrival:        1,      // PS2/Java start flush_seq at 1, not 0 (arrival 0 is rejected as dup by Sandstorm)
-		recvArrival:        0xFFFF, // Sentinel: no packets received yet (#22 signed compare)
-		rto:                2 * time.Second, // PS2 initial RTO before first RTT sample
-		Incoming:           make(chan *ReceivedPacket, 2048),
-		reliableOOO:        make(map[uint16]bool),
-		unackedSendTime:    make(map[uint16]time.Time),
-		stateAckMap:        make(map[byte]uint16),
-		stateAckDirtyCount: make(map[byte]byte),
-		stateBases:         make(map[byte]map[uint16][]byte),
-		sendStateSeq:       make(map[byte]uint16),
-		msgTypeCounts:      make(map[byte]int),
+		conn:            udpConn,
+		addr:            addr,
+		localEndpoint:   localEndpoint,
+		remoteEndpoint:  remoteEndpoint,
+		instanceID:      instanceID,
+		instanceCounter: 2, // PS2 starts at 2
+		hasInstance:     true,
+		needsNewInst:    true,
+		sendArrival:     1,      // PS2/Java start flush_seq at 1, not 0 (arrival 0 is rejected as dup by Sandstorm)
+		recvArrival:     0xFFFF, // Sentinel: no packets received yet (#22 signed compare)
+		rto:             initialRTO,
+		Incoming:        make(chan *ReceivedPacket, 2048),
+		delayed:         make(map[uint16]*protocol.Message),
+		unackedSendTime: make(map[uint16]time.Time),
+		unackedFlush:    make(map[uint16]uint16),
+		stateRx:         make(map[byte]uint16),
+		stateRxFlag:     make(map[byte]byte),
+		stateBases:      make(map[byte]map[uint16][]byte),
+		sendStateSeq:    make(map[byte]uint16),
+		msgTypeCounts:   make(map[byte]int),
 	}
 
 	return c, nil
@@ -307,39 +315,63 @@ func (c *Connection) Close() {
 	close(c.Incoming)
 }
 
+// The DRDP size limits (connection.cpp): a guaranteed message is cut into
+// 1,300-byte pieces, and a best-effort or state message may be no larger.
+const (
+	maxMessagePiece = 1300
+	initialRTO      = 1100 * time.Millisecond           // m_usTimeout 1000, + 100 per message
+	maxRTO          = (0xFFFF + 100) * time.Millisecond // m_usTimeout is a uns16
+)
+
 // QueueReliable queues a reliable message with the given opcode and data.
 // Returns false if the send window is full (4096 in-flight limit).
+//
+// connection_send_guaranteed: a message over 1,300 bytes goes out as 0xFA
+// pieces of 1,300 and a final 0xFB, each with its own sequence number, and
+// either every piece fits the 4,096 window or none is queued.
 func (c *Connection) QueueReliable(opcode protocol.GameOpcode, data []byte) bool {
-	msg := &protocol.Message{}
-	msg.Type = protocol.MessageTypeReliable
-	msg.Opcode = opcode
-
 	// Build message data: opcode (2 bytes) + payload
 	msgData := make([]byte, 2+len(data))
 	msgData[0] = byte(opcode)
 	msgData[1] = byte(opcode >> 8)
 	copy(msgData[2:], data)
-	msg.SetData(msgData)
+	pieces := (len(msgData) + maxMessagePiece - 1) / maxMessagePiece
 
 	c.mu.Lock()
-	// PS2 connection_send_guaranteed: checks send_seq - acked_seq < 0x1000 (4096 in-flight limit).
-	// If window full, PS2 returns -1 (fail). We drop the message to match.
-	if c.sendReliable-c.serverAckedReliable >= 0x1000 {
+	// PS2: fails when a piece's seqnum would pass the last ack + 4096.
+	if int16(c.sendReliable+uint16(pieces)-(c.serverAckedReliable+0x1000)) > 0 {
 		log.Printf("QueueReliable: send window full (send=%d acked=%d), dropping opcode=0x%04X (PS2 returns -1)",
 			c.sendReliable, c.serverAckedReliable, uint16(opcode))
 		c.mu.Unlock()
 		return false
 	}
-	c.sendReliable++
-	msg.Sequence = c.sendReliable
-	c.outgoing = append(c.outgoing, msg)
-	log.Printf("QueueReliable: opcode=0x%04X seq=%d dataLen=%d", uint16(opcode), msg.Sequence, len(data))
+	for off := 0; off == 0 || off < len(msgData); off += maxMessagePiece {
+		end := min(off+maxMessagePiece, len(msgData))
+		msg := &protocol.Message{}
+		msg.Type = protocol.MessageTypeReliable
+		if end < len(msgData) {
+			msg.Type = protocol.MessageTypeSegmentReliable
+		}
+		msg.Opcode = opcode
+		msg.SetData(msgData[off:end])
+		c.sendReliable++
+		msg.Sequence = c.sendReliable
+		c.outgoing = append(c.outgoing, msg)
+	}
+	log.Printf("QueueReliable: opcode=0x%04X seq=%d dataLen=%d pieces=%d", uint16(opcode), c.sendReliable, len(data), pieces)
 	c.mu.Unlock()
 	return true
 }
 
-// QueueUnreliable queues an unreliable message.
+// QueueUnreliable queues an unreliable message. One over 1,300 bytes is
+// refused, as connection_send_best_effort refuses it: it could never fit a
+// packet, and would block the queue behind it.
 func (c *Connection) QueueUnreliable(opcode protocol.GameOpcode, data []byte) {
+	if 2+len(data) > maxMessagePiece {
+		log.Printf("QueueUnreliable: opcode=0x%04X is %d bytes, over the %d limit; dropped",
+			uint16(opcode), 2+len(data), maxMessagePiece)
+		return
+	}
 	msg := &protocol.Message{}
 	msg.Type = protocol.MessageTypeUnreliable
 	msg.Opcode = opcode
@@ -498,12 +530,16 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 			// Save lobby session state BEFORE overwriting endpoints.
 			// The pre-promotion game server session needs ongoing ACKs.
 			if c.lobby == nil {
+				held := make(map[uint16]bool, len(c.delayed))
+				for seq := range c.delayed {
+					held[seq] = true
+				}
 				c.lobby = &LobbySession{
 					remoteEndpoint:    c.serverEndpoint,
 					instanceID:        c.instanceID,
 					recvArrival:       c.recvArrival,
 					recvReliable:      c.recvReliable,
-					reliableOOO:       c.reliableOOO,
+					reliableOOO:       held,
 					arrivalHistory:    c.arrivalHistory,
 					arrivalDirty:      c.arrivalDirty,
 					goodArrivalCount:  c.goodArrivalCount,
@@ -544,22 +580,20 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 	if header.Flags&protocol.SegmentFlagDidServerInitiate != 0 {
 		if !c.didServerInit || c.sessionID != pkt.SessionID {
 			log.Printf("ProcessIncoming: server-initiated session, sessionID=%d (ObjectID)", pkt.SessionID)
-			c.fragmentParts = nil    // Clear any partial fragments from pre-session
-			c.fragmentFinalSeq = 0
-			c.fragmentStartTime = time.Time{}
+			c.arrivals = nil // Clear any partial fragments from pre-session
 			// Reset ALL reliable tracking for the new promoted session.
 			// The server creates a new Connection with fresh counters.
 			// Both incoming (recvReliable) and outgoing (sendReliable) must reset.
 			log.Printf("ProcessIncoming: resetting reliable tracking (was recv=%d sent=%d sendArrival=%d)",
 				c.recvReliable, c.sendReliable, c.sendArrival)
 			c.recvReliable = 0
-			c.reliableOOO = make(map[uint16]bool)
+			c.delayed = make(map[uint16]*protocol.Message)
 			c.lastSentReliable = 0
-			c.goodArrivalCount = 0 // Reset for new session (PS2 resets on promotion)
-			c.arrivalHistory = 0   // Reset arrival bitmap for new session
+			c.goodArrivalCount = 0      // Reset for new session (PS2 resets on promotion)
+			c.arrivalHistory = 0        // Reset arrival bitmap for new session
 			c.handshakeComplete = false // New session needs fresh handshake
-		c.handshakeSentCount = 0   // Reset handshake packet counter
-			c.recvArrival = 0xFFFF // Sentinel: no packets received yet (#22)
+			c.handshakeSentCount = 0    // Reset handshake packet counter
+			c.recvArrival = 0xFFFF      // Sentinel: no packets received yet (#22)
 			c.arrivalDirty = false
 			c.sessionAckPending = false
 			c.serverShort = false
@@ -568,21 +602,23 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 			c.lastFlushTime = time.Time{} // Reset for new session (PS2 0x200 flag cleared)
 			c.rttSamples = [16]time.Duration{}
 			c.rttSampleIdx = 0
-			c.rto = 2 * time.Second
+			c.rto = initialRTO
 			c.lastGuaranteedSendTime = time.Time{}
 			c.flushSendTimes = [1024]time.Time{}
 			c.sendReliable = 0 // Reset outgoing reliable seq for promoted session
 			c.sendArrival = 1  // Reset outgoing arrival for promoted session (starts at 1, not 0)
 			c.serverAckedReliable = 0
+			c.flushAckMax = 0
 			c.unacked = nil
 			c.unackedSendTime = make(map[uint16]time.Time)
+			c.unackedFlush = make(map[uint16]uint16)
 			c.outgoing = nil
 			// Reset state channel tracking for promoted session.
 			// The server creates a new Connection with fresh state channel counters.
 			// Stale ACKs from pre-promotion would reference sequences the promoted
 			// connection never sent, triggering "can't ack more than we've sent".
-			c.stateAckMap = make(map[byte]uint16)
-			c.stateAckDirtyCount = make(map[byte]byte)
+			c.stateRx = make(map[byte]uint16)
+			c.stateRxFlag = make(map[byte]byte)
 			c.sendStateSeq = make(map[byte]uint16)
 
 			c.stateBases = make(map[byte]map[uint16][]byte)
@@ -607,8 +643,8 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 			// in connection_flush. Java Sandstorm validates SessionAck body value
 			// against connection.instance_remote (OUR instance from header HasInstance),
 			// so the SessionAck must carry OUR instance (conn.instanceID).
-			c.gotSessionAck = true          // Persistent: we've seen a SessionAck
-			c.sessionAckPending = true      // Per-flush: cleared after sending (#27)
+			c.gotSessionAck = true     // Persistent: we've seen a SessionAck
+			c.sessionAckPending = true // Per-flush: cleared after sending (#27)
 			log.Printf("ProcessIncoming: promotion — our new instance=0x%X, server instance_remote=0x%X",
 				c.instanceID, c.instanceRemote)
 		}
@@ -623,76 +659,78 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 		}
 	}
 
-	// Track arrival number with PS2-accurate signed 16-bit comparison (#22) and bitmap.
-	// PS2 uses: ((pkt_arrival - arrival_number) * 0x10000) >> 0x10 (signed arithmetic)
-	// to handle uint16 wrap-around at 65536.
-	// PS2 connection_parse_segment_body rejects duplicates entirely (#19):
-	// exact dup (diff==0), old already in bitmap, old > 64 back → skip ALL processing.
+	// connection_parse_segment_body checks the WHOLE segment before
+	// connection_record_segment applies any of it, so a segment that fails
+	// changes nothing: no arrival recorded, no ack sent for it, no message
+	// delivered. The arrival is checked first, with the PS2's signed 16-bit
+	// compare (#22): an exact duplicate, an old one already in the bitmap,
+	// one more than 64 back, or a jump past CONNECTION_FLUSH_WINDOW (#19).
 	arrivalDiff := int16(body.ArrivalNumber - c.recvArrival)
+	arrivalValid := arrivalDiff > 0 // PS2 m_iArrival: a new (forward) arrival
 	isRejected := false
-	arrivalValid := false // PS2 param3[0x104]: true only for new (forward) arrivals
-
-	if arrivalDiff > 0 {
-		// New arrival — PS2 is_ok = true, arrival_valid = true
-		diff := uint16(arrivalDiff)
-		// #19: PS2 rejects arrivals with increment > CONNECTION_FLUSH_WINDOW (0x1000 = 4096).
-		// connection_parse_segment_body: if ((longlong)diff < 0x1001) { ... } else { log_parse_failure("increment > CONNECTION_FLUSH_WINDOW"); }
-		if diff > 4096 {
-			isRejected = true
-		} else {
-			if diff > 1 {
-				c.metrics.ArrivalGaps++
-			}
-			if diff <= 64 {
-				c.arrivalHistory = (c.arrivalHistory << uint(diff)) | (1 << uint(diff-1))
-			} else {
-				c.arrivalHistory = 0
-			}
-			c.recvArrival = body.ArrivalNumber
-			// PS2 100ms ACK timer (#26): when bits 0-3 transition from all-zero,
-			// set desired_flush_time = now + 100ms. Batches ACKs within the window.
-			if !c.arrivalDirty && !c.sessionAckPending {
-				c.ackFlushDeadline = time.Now().Add(100 * time.Millisecond)
-			}
-			c.arrivalDirty = true // #18: flag for FlushAck/GuaranteedAck (PS2 conn.flags bit 0)
-			arrivalValid = true   // PS2 param3[0x104] = 1 — gates ACK processing
-			if c.goodArrivalCount < 255 {
-				c.goodArrivalCount++
-			}
-		}
-	} else if arrivalDiff < 0 {
-		// Old arrival — PS2: is_ok = false
-		diff := uint16(-arrivalDiff)
-		if diff <= 64 {
-			bit := uint64(1) << uint(diff-1)
-			if c.arrivalHistory&bit != 0 {
-				// Already received (duplicate) — PS2 rejects entire packet.
-				// PS2: connection_record_segment NOT called → counter NOT reset.
-				isRejected = true
-			} else {
-				// Out-of-order: mark in bitmap.
-				// PS2: connection_record_segment called, arrival_valid=0 → counter=0.
-				c.arrivalHistory |= bit
-				c.goodArrivalCount = 0
-			}
-		} else {
-			// Too old (> 64 back) — PS2 rejects.
-			// PS2: connection_record_segment NOT called → counter NOT reset.
-			isRejected = true
-		}
-	} else {
-		// Exact duplicate (same arrival number) — PS2 rejects entire packet.
-		// PS2: connection_parse_segment_body returns -1 → connection_record_segment
-		// NOT called → counter NOT reset.
+	switch {
+	case arrivalDiff > 4096:
 		isRejected = true
+	case arrivalDiff == 0:
+		isRejected = true
+	case arrivalDiff < 0:
+		back := -int(arrivalDiff)
+		isRejected = back > 64 || c.arrivalHistory&(uint64(1)<<uint(back-1)) != 0
 	}
-
-	// #19: PS2 rejects duplicate/old arrivals entirely — skip ACK processing and messages.
-	// PS2 connection_record_segment only called for accepted segments, so time_last_arrival
-	// (conn+0xa8) is NOT updated for rejected packets.
+	// Then its messages, against the state of the connection BEFORE this
+	// segment: a guaranteed seqnum beyond the window, or a state delta whose
+	// reference is gone ("refnum does not exist"), fails the segment.
+	var stateStale []bool
+	if !isRejected {
+		var ok bool
+		if stateStale, ok = c.parseSegmentMessages(body); !ok {
+			isRejected = true
+		}
+	}
 	if isRejected {
 		c.mu.Unlock()
 		return nil
+	}
+
+	// connection_record_segment: the arrival history is a sliding bitmap of
+	// the last 64 arrivals; bit N is arrival (recvArrival - 1 - N).
+	if arrivalValid {
+		diff := uint16(arrivalDiff)
+		if diff > 1 {
+			c.metrics.ArrivalGaps++
+		}
+		if diff <= 64 {
+			c.arrivalHistory = (c.arrivalHistory << uint(diff)) | (1 << uint(diff-1))
+		} else {
+			c.arrivalHistory = 0
+		}
+		c.recvArrival = body.ArrivalNumber
+		if c.goodArrivalCount < 255 {
+			c.goodArrivalCount++
+		}
+	} else {
+		// Out of order: mark it, and the run of good arrivals restarts.
+		c.arrivalHistory |= uint64(1) << uint(-int(arrivalDiff)-1)
+		c.goodArrivalCount = 0
+	}
+	// What this segment obliges us to acknowledge. Every new arrival is
+	// acked (the Go client always has; the PS2 acks a segment only for the
+	// messages in it), and so is an old one that carried guaranteed or state
+	// messages (connection_record_segment_messages sets conn.flags 3 / 5).
+	hasAckable := false
+	for _, msg := range body.Messages {
+		if msg.Type.IsReliable() || msg.Type.IsStateChannel() {
+			hasAckable = true
+			break
+		}
+	}
+	if arrivalValid || hasAckable {
+		// PS2 100ms ACK timer (#26): when bits 0-3 transition from all-zero,
+		// set desired_flush_time = now + 100ms. Batches ACKs within the window.
+		if !c.arrivalDirty && !c.sessionAckPending {
+			c.ackFlushDeadline = time.Now().Add(100 * time.Millisecond)
+		}
+		c.arrivalDirty = true // #18: flag for FlushAck/GuaranteedAck (PS2 conn.flags bit 0)
 	}
 
 	// PS2 connection_record_segment line 1017: conn+0xa8 = current_time.
@@ -709,16 +747,25 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 	// Old-but-valid arrivals (reordered) have stale ACK values that are harmlessly
 	// ignored by validation, but PS2 skips them entirely.
 	if arrivalValid && body.Flags&protocol.BodyFlagFlushAck != 0 {
-		// #23: Validate FlushAck doesn't exceed our send sequence
-		if int16(body.FlushAck-c.sendArrival) > 0 {
-			log.Printf("WARNING: server FlushAck %d > our sendArrival %d, ignoring", body.FlushAck, c.sendArrival)
+		// #23: a FlushAck at or past our NEXT flush number acks a segment we
+		// have not sent (PS2: flush_ack >= connection->flush_tx).
+		if int16(body.FlushAck-c.sendArrival) >= 0 {
+			log.Printf("WARNING: server FlushAck %d >= our next flush %d, ignoring", body.FlushAck, c.sendArrival)
 		} else {
-			// #21: RTT measurement from per-seq send timestamps
-			sendTime := c.flushSendTimes[body.FlushAck&0x3FF]
-			if !sendTime.IsZero() {
-				rtt := time.Since(sendTime)
-				c.updateRTT(rtt)
-				c.flushSendTimes[body.FlushAck&0x3FF] = time.Time{} // Clear used timestamp
+			// connection_record_acks: an RTT sample for the flush acked and
+			// for each earlier one its mask says was also seen.
+			c.recordFlushAck(body.FlushAck)
+			if body.Flags&protocol.BodyFlagUnknownPacked != 0 {
+				flush := body.FlushAck
+				for mask := body.FlushAckMask; mask != 0; mask >>= 1 {
+					flush--
+					if mask&1 != 0 {
+						c.recordFlushAck(flush)
+					}
+				}
+			}
+			if int16(body.FlushAck-c.flushAckMax) > 0 {
+				c.flushAckMax = body.FlushAck
 			}
 		}
 	}
@@ -726,38 +773,24 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 	// Process server's guaranteed ack of our reliable messages
 	// #24: PS2 only processes GuaranteedAck for new (forward) arrivals.
 	if arrivalValid && body.Flags&protocol.BodyFlagGuaranteedAck != 0 {
-		// #23: Validate GuaranteedAck doesn't exceed our send sequence
-		if int16(body.GuaranteedAck-c.sendReliable) > 0 {
-			log.Printf("WARNING: server GuaranteedAck %d > our sendReliable %d, ignoring", body.GuaranteedAck, c.sendReliable)
-		} else if int16(body.GuaranteedAck-c.serverAckedReliable) > 4096 {
+		ack := body.GuaranteedAck
+		ahead := int16(ack - c.serverAckedReliable)
+		if int16(ack-c.sendReliable) > 0 {
+			// #23: PS2 guaranteed_ack >= guaranteed_tx (the NEXT seqnum).
+			log.Printf("WARNING: server GuaranteedAck %d > our sendReliable %d, ignoring", ack, c.sendReliable)
+		} else if ahead > 4096 {
 			// #20: PS2 rejects GuaranteedAck window > CONNECTION_FLUSH_WINDOW (0x1000 = 4096).
 			// connection_record_acks: if (window > 0x1000) { log_parse_failure("too many guaranteed rx acks"); }
-			log.Printf("WARNING: GuaranteedAck window %d > 4096, ignoring", int16(body.GuaranteedAck-c.serverAckedReliable))
-		} else {
-			c.serverAckedReliable = body.GuaranteedAck
-			// Remove acked messages from unacked list + their send timestamps (#26).
-			// PS2 connection_record_acks: retires contiguous ACK (GuaranteedAck seq)
-			// AND individual out-of-order messages indicated by the mask bitmap.
-			// Mask bit N = message at seq (GuaranteedAck - 1 - N) is acked.
-			var remaining []*protocol.Message
-			for _, msg := range c.unacked {
-				if msg.Sequence <= body.GuaranteedAck {
-					// Contiguous ACK — retired
-					delete(c.unackedSendTime, msg.Sequence)
-				} else if body.Flags&protocol.BodyFlagGuaranteedAckMask != 0 && body.GuaranteedAckMask != 0 {
-					// Check individual mask bits for OOO ACKs
-					offset := int(msg.Sequence - body.GuaranteedAck - 1)
-					if offset >= 0 && offset < 64 && (body.GuaranteedAckMask>>(uint(offset)))&1 != 0 {
-						// Server selectively ACK'd this OOO message via mask
-						delete(c.unackedSendTime, msg.Sequence)
-					} else {
-						remaining = append(remaining, msg)
-					}
-				} else {
-					remaining = append(remaining, msg)
-				}
+			log.Printf("WARNING: GuaranteedAck window %d > 4096, ignoring", ahead)
+		} else if ahead >= 0 {
+			// An ack behind the last one is stale and ignored (PS2: guaranteed_ack
+			// < connection->guaranteed_ack clears m_iGuaranteedAck).
+			var mask uint64
+			if body.Flags&protocol.BodyFlagGuaranteedAckMask != 0 {
+				mask = body.GuaranteedAckMask
 			}
-			c.unacked = remaining
+			c.retireGuaranteed(ack, mask)
+			c.serverAckedReliable = ack
 		}
 
 		// Hybrid handshake completion: server's GuaranteedAck confirms ACK processing
@@ -818,264 +851,208 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 		}
 	}
 
-	c.mu.Unlock()
-
-	// Process messages and track reliable sequences
+	// connection_record_segment_messages, in body order.
 	var messages []*protocol.Message
-	for _, msg := range body.Messages {
+	for i, msg := range body.Messages {
 		// Debug: log all message types for first 30 arrivals after promotion
 		if c.didServerInit && body.ArrivalNumber <= 30 {
 			log.Printf("MSG arrival=%d type=0x%02X seq=%d xor=%d size=%d",
 				body.ArrivalNumber, byte(msg.Type), msg.Sequence, msg.XORByte, msg.Size())
 		}
 
-		// #25: PS2 skips unreliable (0xFC) messages from old-but-valid arrivals.
-		// Old arrivals still deliver guaranteed and state channel messages, but
-		// unreliable data is stale and would be superseded by newer data.
-		if !arrivalValid && msg.Type == protocol.MessageTypeUnreliable {
-			continue
-		}
-
-		// Deduplicate reliable messages: skip retransmissions we've already processed.
-		// Uses a contiguous counter (recvReliable) + out-of-order bitmap (reliableOOO)
-		// to correctly handle UDP packet reordering without dropping valid fragments.
-		//
-		// Previous bug: single high-water mark dropped valid out-of-order fragments.
-		// Example: seq 24 arrives before 19-23 → recvReliable=24 → seqs 19-23 dropped
-		// → MemoryDump reassembly missing 5 fragments → corrupt spell/item data.
-		if msg.Type.IsReliable() && msg.Sequence > 0 {
-			c.mu.Lock()
-			isDupe := false
-			if msg.Sequence <= c.recvReliable {
-				// Already in contiguous range — definitely a duplicate
-				isDupe = true
-			} else if c.reliableOOO[msg.Sequence] {
-				// Already received out-of-order — duplicate
-				isDupe = true
-			} else {
-				// New message. Check if it's the next contiguous seq.
-				if msg.Sequence == c.recvReliable+1 {
-					// Next in sequence — advance contiguous counter
-					c.recvReliable = msg.Sequence
-					// Drain any buffered OOO seqs that are now contiguous
-					for c.reliableOOO[c.recvReliable+1] {
-						delete(c.reliableOOO, c.recvReliable+1)
-						c.recvReliable++
-					}
-					// PS2 uses a 64-slot window for OOO tracking. Purge any
-					// entries older than 64 seqs behind recvReliable — they
-					// represent permanent gaps (server crash, promotion) that
-					// will never fill. Without cleanup, the map grows unbounded.
-					if len(c.reliableOOO) > 0 {
-						for seq := range c.reliableOOO {
-							if int16(c.recvReliable-seq) > 64 {
-								delete(c.reliableOOO, seq)
-							}
-						}
-					}
-				} else {
-					// Out-of-order — record in bitmap for dedup
-					c.reliableOOO[msg.Sequence] = true
-				}
+		switch {
+		case msg.Type.IsReliable():
+			messages = c.recordGuaranteed(msg, messages)
+		case msg.Type.IsStateChannel():
+			if c.recordStateMessage(msg, stateStale[i]) {
+				messages = append(messages, msg)
 			}
-			c.mu.Unlock()
-			if isDupe {
-				continue
+		default:
+			// #25: a best-effort (0xFC) message is delivered only from a new
+			// arrival; an old one's is stale (PS2 buffer_skip).
+			if arrivalValid {
+				messages = append(messages, msg)
 			}
 		}
-
-		// Handle state channel messages - track ACKs and apply XOR delta
-		if msg.Type.IsStateChannel() && !msg.Type.IsReliable() {
-			channel := byte(msg.Type)
-			c.processStateChannel(channel, msg)
-		}
-
-		// Handle fragment reassembly with ORDERED assembly.
-		// Fragments (0xFA intermediate + 0xFB final) share the reliable sequence counter
-		// and each arrives in its own UDP packet. UDP packets can arrive out of order,
-		// so we buffer fragments by sequence number and reassemble in seq order when
-		// the final 0xFB arrives AND all intermediate seqs are present.
-		//
-		// Wire format: type(1) + size(varint) + seq(2) + chunk_data
-		// Our parser reads first 2 bytes of chunk_data as "opcode" then restores them
-		// into msg.Data(). The original opcode is in the first 2 bytes of the FIRST chunk.
-		if msg.Type == protocol.MessageTypeSegmentReliable {
-			// 0xFA intermediate fragment — buffer it
-			c.mu.Lock()
-			if c.fragmentParts == nil {
-				c.fragmentParts = make(map[uint16][]byte)
-			}
-			if c.fragmentStartTime.IsZero() {
-				c.fragmentStartTime = time.Now()
-			}
-			chunk := make([]byte, len(msg.Data()))
-			copy(chunk, msg.Data())
-			c.fragmentParts[msg.Sequence] = chunk
-			// If we already have the final fragment, try to assemble
-			if c.fragmentFinalSeq > 0 {
-				if assembled := c.tryAssembleFragments(); assembled != nil {
-					c.mu.Unlock()
-					messages = append(messages, assembled)
-					continue
-				}
-			}
-			c.mu.Unlock()
-			continue
-		}
-		if msg.Type == protocol.MessageTypeReliable {
-			c.mu.Lock()
-			hasPendingFragments := len(c.fragmentParts) > 0
-			// Also treat this 0xFB as a potential final fragment if there are
-			// unreceived reliable seqs below us (they could be 0xFA fragments
-			// that haven't arrived yet due to UDP reordering).
-			mightBeFragment := !hasPendingFragments && msg.Sequence > 1 &&
-				c.recvReliable < msg.Sequence-1
-			if hasPendingFragments || mightBeFragment {
-				// This 0xFB is (or might be) the final fragment
-				if c.fragmentParts == nil {
-					c.fragmentParts = make(map[uint16][]byte)
-				}
-				if c.fragmentStartTime.IsZero() {
-					c.fragmentStartTime = time.Now()
-				}
-				chunk := make([]byte, len(msg.Data()))
-				copy(chunk, msg.Data())
-				c.fragmentParts[msg.Sequence] = chunk
-				c.fragmentFinalSeq = msg.Sequence
-				if assembled := c.tryAssembleFragments(); assembled != nil {
-					c.mu.Unlock()
-					messages = append(messages, assembled)
-					continue
-				}
-				c.mu.Unlock()
-				continue
-			}
-			c.mu.Unlock()
-		}
-
-		messages = append(messages, msg)
 	}
 
+	c.mu.Unlock()
 	return messages
 }
 
-// processStateChannel handles an incoming state channel message.
-// Applies XOR delta reconstruction and updates persistent ACK map.
-func (c *Connection) processStateChannel(channel byte, msg *protocol.Message) {
-	decoded := msg.Data()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Log seq progression for state channels (always log to track advancement)
-	if prevSeq, ok := c.stateAckMap[channel]; ok {
-		if msg.Sequence != prevSeq {
-			log.Printf("STATE ch=0x%02X seq %d→%d (xor=%d, %d bytes)", channel, prevSeq, msg.Sequence, msg.XORByte, len(decoded))
+// parseSegmentMessages is the message half of connection_parse_segment_body:
+// it fails the segment for a guaranteed seqnum more than 4,096 past
+// recvReliable, or for a state message more than 4,096 ahead of its channel
+// or whose delta reference is gone. It also XOR-decodes each state delta
+// against the reference it names -- the base set as it stood before this
+// segment, which is what the PS2 decodes against -- and reports which state
+// messages are stale (seq <= the channel's rx): those are dropped, and their
+// channel acked again. Must be called with c.mu held.
+func (c *Connection) parseSegmentMessages(body *protocol.SegmentBody) (stale []bool, ok bool) {
+	stale = make([]bool, len(body.Messages))
+	for i, msg := range body.Messages {
+		switch {
+		case msg.Type.IsReliable():
+			if int16(msg.Sequence-(c.recvReliable+4096)) > 0 {
+				log.Printf("DRDP: seqnum %d > guaranteed_rx %d + 4096, segment dropped", msg.Sequence, c.recvReliable)
+				return nil, false
+			}
+		case msg.Type.IsStateChannel():
+			ch := byte(msg.Type)
+			ahead := int16(msg.Sequence - c.stateRx[ch])
+			if ahead <= 0 {
+				stale[i] = true
+				continue
+			}
+			if ahead > 4096 {
+				log.Printf("STATE ch=0x%02X seq %d is %d past rx %d, segment dropped", ch, msg.Sequence, ahead, c.stateRx[ch])
+				return nil, false
+			}
+			if msg.XORByte == 0 {
+				continue
+			}
+			base, found := c.stateBases[ch][msg.Sequence-uint16(msg.XORByte)]
+			if !found {
+				log.Printf("STATE ch=0x%02X seq %d: reference %d does not exist, segment dropped",
+					ch, msg.Sequence, msg.Sequence-uint16(msg.XORByte))
+				return nil, false
+			}
+			data := msg.Data()
+			for j := 0; j < len(data) && j < len(base); j++ {
+				data[j] ^= base[j]
+			}
 		}
-	} else {
-		log.Printf("STATE ch=0x%02X seq=%d FIRST (xor=%d, %d bytes)", channel, msg.Sequence, msg.XORByte, len(decoded))
 	}
+	return stale, true
+}
 
-	// Initialize base map for this channel if needed
-	if c.stateBases[channel] == nil {
-		c.stateBases[channel] = make(map[uint16][]byte)
+// recordGuaranteed is connection_record_message for the three guaranteed
+// types (0xF9 system, 0xFA fragment, 0xFB guaranteed) plus
+// connection_has_reliable before it. A message is held until every one
+// before it has arrived, then released in sequence; 0xFA pieces collect until
+// the next 0xFB/0xF9 is released and the whole run is delivered as ONE
+// message, with the type of its last piece and the seqnum of its first. So a
+// fragmented MemoryDump survives losing any of its pieces, and a message that
+// overtook a lost piece waits for it. Must be called with c.mu held.
+func (c *Connection) recordGuaranteed(msg *protocol.Message, out []*protocol.Message) []*protocol.Message {
+	if int16(msg.Sequence-c.recvReliable) <= 0 {
+		return out // already released
 	}
+	if _, held := c.delayed[msg.Sequence]; held {
+		return out // a retransmission of one we are holding
+	}
+	c.delayed[msg.Sequence] = msg
+	for {
+		next, ok := c.delayed[c.recvReliable+1]
+		if !ok {
+			break
+		}
+		delete(c.delayed, c.recvReliable+1)
+		c.recvReliable++
+		switch {
+		case next.Type == protocol.MessageTypeSegmentReliable:
+			c.arrivals = append(c.arrivals, next)
+		case len(c.arrivals) == 0:
+			out = append(out, next)
+		default:
+			out = append(out, c.joinArrivals(next))
+		}
+	}
+	return out
+}
 
-	// XOR reconstruction
+// joinArrivals concatenates the held 0xFA pieces and the piece that ends
+// them into one message, as connection_move_delayed_to_arrivals does.
+func (c *Connection) joinArrivals(last *protocol.Message) *protocol.Message {
+	pieces := append(c.arrivals, last)
+	c.arrivals = nil
+	total := 0
+	for _, p := range pieces {
+		total += p.Size()
+	}
+	data := make([]byte, 0, total)
+	for _, p := range pieces {
+		data = append(data, p.Data()...)
+	}
+	msg := &protocol.Message{Type: last.Type, Sequence: pieces[0].Sequence}
+	if len(data) >= 2 && last.Type != protocol.MessageTypePing {
+		msg.Opcode = protocol.GameOpcode(uint16(data[0]) | uint16(data[1])<<8)
+	}
+	msg.SetData(data)
+	log.Printf("Fragment assembly: %d pieces, seqs %d-%d, %d bytes, opcode=0x%04X",
+		len(pieces), pieces[0].Sequence, last.Sequence, len(data), uint16(msg.Opcode))
+	return msg
+}
+
+// recordStateMessage is connection_record_state_message: the message's
+// sequence becomes the channel's rx, the channel is acked on the next two
+// flushes, and the decoded state is kept as a base for later deltas. The
+// bases kept are those from this delta's reference on, or the last 32 after a
+// keyframe (message_seqnum_remove_thru, wrap-safe). A stale message (seq <=
+// rx, flagged by parseSegmentMessages) is dropped but its channel acked again
+// -- with rx, so the ack never goes backwards. Returns whether to deliver it.
+// Must be called with c.mu held.
+//
+// Sandstorm does NOT restart a channel's sequence when it hands the channel
+// to another entity: across four PS2 captures, 114 channel reassignments
+// carried on the old sequence with a delta against the old entity's state.
+func (c *Connection) recordStateMessage(msg *protocol.Message, stale bool) bool {
+	ch := byte(msg.Type)
+	c.stateRxFlag[ch] = 2
+	if stale {
+		return false
+	}
+	c.stateRx[ch] = msg.Sequence
+
+	bases := c.stateBases[ch]
+	if bases == nil {
+		bases = make(map[uint16][]byte)
+		c.stateBases[ch] = bases
+	}
+	keep := msg.Sequence - 32
 	if msg.XORByte != 0 {
-		baseSeq := msg.Sequence - uint16(msg.XORByte)
-		base, ok := c.stateBases[channel][baseSeq]
-		if ok && base != nil {
-			// The RLE-decoded delta length defines the new state size.
-			// If the channel shrank, base may be longer — don't carry
-			// stale tail bytes forward.
-			newLen := len(decoded)
-			var reconstructed []byte
-			if newLen <= len(c.xorBuf) {
-				reconstructed = c.xorBuf[:newLen]
-			} else {
-				reconstructed = make([]byte, newLen)
-			}
-			for i := 0; i < newLen; i++ {
-				var b byte
-				if i < len(base) {
-					b = base[i]
-				}
-				reconstructed[i] = decoded[i] ^ b
-			}
-			decoded = reconstructed
-			// Update the message with reconstructed data so HandleStateChannel
-			// gets the fully decoded state, not the raw XOR delta bytes.
-			msg.SetData(decoded)
-		} else {
-			log.Printf("State channel 0x%02X: missing XOR base seq=%d (xorByte=%d), clearing stale bases",
-				channel, baseSeq, msg.XORByte)
-			// Clear all stale bases for this channel — they're from a broken
-			// chain and can't be used. The next keyframe (xor=0) from the
-			// server will restart the chain cleanly.
-			delete(c.stateBases, channel)
-			// Still ACK the message even though we can't decode it. Without
-			// the ACK, the server's unacked_messages entry for this channel
-			// ages past 60 seconds and triggers terminate(). The data is lost
-			// either way (can't XOR-decode without the base), but ACKing
-			// keeps the connection alive. The next keyframe (xor=0) will
-			// restore correct state.
-			c.stateAckMap[channel] = msg.Sequence
-			c.stateAckDirtyCount[channel] = 3
-			return
+		keep = msg.Sequence - uint16(msg.XORByte)
+	}
+	for seq := range bases {
+		if int16(seq-keep) < 0 {
+			delete(bases, seq)
 		}
 	}
+	base := make([]byte, msg.Size())
+	copy(base, msg.Data())
+	bases[msg.Sequence] = base
+	return true
+}
 
-	// Store as base for future XOR deltas
-	base := make([]byte, len(decoded))
-	copy(base, decoded)
-	c.stateBases[channel][msg.Sequence] = base
-
-	// Limit stored bases to 32
-	if len(c.stateBases[channel]) > 32 {
-		var oldest uint16
-		for k := range c.stateBases[channel] {
-			if oldest == 0 || k < oldest {
-				oldest = k
-			}
-		}
-		delete(c.stateBases[channel], oldest)
+// recordFlushAck is connection_record_flush_ack: the time the acked flush
+// went out is still in the ring, so the difference is a round trip. A flush
+// more than 1,024 back has been overwritten. Must be called with c.mu held.
+func (c *Connection) recordFlushAck(flush uint16) {
+	if int16(flush-(c.sendArrival-1024)) < 0 {
+		return
 	}
-
-	// #21: PS2 rejects state channel sequences with diff > CONNECTION_FLUSH_WINDOW (0x1000 = 4096).
-	// connection_record_state_channel: if (0x1000 < diff) { goto error_stat; }
-	if prevSeq, ok := c.stateAckMap[channel]; ok {
-		seqDiff := int16(msg.Sequence - prevSeq)
-		if seqDiff > 4096 || seqDiff < -4096 {
-			log.Printf("STATE ch=0x%02X seq diff %d (prev=%d new=%d) > 4096, rejecting", channel, seqDiff, prevSeq, msg.Sequence)
-			return
-		}
+	sendTime := c.flushSendTimes[flush&0x3FF]
+	if !sendTime.IsZero() {
+		c.updateRTT(time.Since(sendTime))
+		c.flushSendTimes[flush&0x3FF] = time.Time{}
 	}
+}
 
-	// Update persistent ACK map — always overwrite with latest received sequence.
-	// PS2 does: stc.unknown4 = m.seqnum (unconditional overwrite).
-	// This is critical for channel reassignment: when Sandstorm moves entity A
-	// out of range and assigns entity B to the same channel, sequences reset to 1.
-	// If we kept the old high ACK (e.g., seq=15), the server's validation check
-	// ("can't ack more than we've sent") rejects the entire packet body, killing
-	// all state channel processing including our 0x40 position updates.
-	//
-	// ACK all valid state channels (0x00-0xF7). Java Sandstorm allocates
-	// stateChannels[0xF8] (all 248) and tracks sent messages in unacked_messages.
-	// Un-ACK'd state channel messages age past 60 seconds and trigger terminate().
-	// Channel 0x42 (stat channel) IS tracked — earlier crash was from stale
-	// pre-promotion sequences before we added the promotion state reset.
-	c.stateAckMap[channel] = msg.Sequence
-	// PS2 uses per-channel dirty counter (set on receive, decremented per flush).
-	// Set to 3 so the ACK is sent across 3 consecutive flush cycles, providing
-	// redundancy against UDP packet loss. If the single packet carrying a state ACK
-	// is lost, the server never gets the ACK and the state message ages past 60s →
-	// terminate. Sending across 3 flushes costs only 3 extra bytes per channel per
-	// flush for 2 extra cycles. The server handles redundant ACKs idempotently.
-	c.stateAckDirtyCount[channel] = 3
-
-	// Update the message's data to the fully decoded version
-	msg.SetData(decoded)
+// retireGuaranteed is connection_record_guaranteed_ack: everything up to and
+// including ack is retired, and mask bit N retires ack+2+N (ack+1 is never in
+// the mask: it would not be held). Must be called with c.mu held.
+func (c *Connection) retireGuaranteed(ack uint16, mask uint64) {
+	var remaining []*protocol.Message
+	for _, msg := range c.unacked {
+		ahead := int(int16(msg.Sequence - ack))
+		if ahead <= 0 || (ahead >= 2 && ahead-2 < 64 && mask>>uint(ahead-2)&1 != 0) {
+			delete(c.unackedSendTime, msg.Sequence)
+			delete(c.unackedFlush, msg.Sequence)
+			continue
+		}
+		remaining = append(remaining, msg)
+	}
+	c.unacked = remaining
 }
 
 // processLobbyPacket tracks arrival and reliable sequences for the pre-promotion
@@ -1096,7 +1073,7 @@ func (c *Connection) processLobbyPacket(body *protocol.SegmentBody) {
 			return // Reject huge jumps
 		}
 		if diff <= 64 {
-			lobby.arrivalHistory = (lobby.arrivalHistory << uint(diff)) | (1 << uint(diff - 1))
+			lobby.arrivalHistory = (lobby.arrivalHistory << uint(diff)) | (1 << uint(diff-1))
 		} else {
 			lobby.arrivalHistory = 0
 		}
@@ -1118,10 +1095,11 @@ func (c *Connection) processLobbyPacket(body *protocol.SegmentBody) {
 	}
 	// Exact duplicate (arrivalDiff == 0) — ignore
 
-	// Track reliable message sequences for GuaranteedAck
+	// Track reliable message sequences for GuaranteedAck (wrap-safe: seq 0
+	// follows 65535 like any other)
 	for _, msg := range body.Messages {
-		if msg.Type.IsReliable() && msg.Sequence > 0 {
-			if msg.Sequence <= lobby.recvReliable {
+		if msg.Type.IsReliable() {
+			if int16(msg.Sequence-lobby.recvReliable) <= 0 {
 				continue // Already in contiguous range
 			}
 			if lobby.reliableOOO[msg.Sequence] {
@@ -1237,64 +1215,6 @@ func (c *Connection) sendLobbyPacket(pkt []byte) {
 	}
 }
 
-// tryAssembleFragments attempts to reassemble buffered fragments in sequence order.
-// Must be called with c.mu held. Returns the assembled message if complete, nil if gaps remain.
-func (c *Connection) tryAssembleFragments() *protocol.Message {
-	if c.fragmentFinalSeq == 0 || len(c.fragmentParts) == 0 {
-		return nil
-	}
-
-	// Find the lowest sequence in our fragment map
-	var minSeq uint16 = c.fragmentFinalSeq
-	for seq := range c.fragmentParts {
-		if seq < minSeq {
-			minSeq = seq
-		}
-	}
-
-	// Check if all sequences from minSeq to fragmentFinalSeq are present
-	expectedCount := int(c.fragmentFinalSeq-minSeq) + 1
-	if len(c.fragmentParts) < expectedCount {
-		return nil // Still have gaps — wait for more fragments
-	}
-
-	// Verify every seq is present (no gaps)
-	for seq := minSeq; seq <= c.fragmentFinalSeq; seq++ {
-		if _, ok := c.fragmentParts[seq]; !ok {
-			return nil // Gap at this seq
-		}
-	}
-
-	// All present — reassemble in sequence order
-	var fullData []byte
-	for seq := minSeq; seq <= c.fragmentFinalSeq; seq++ {
-		fullData = append(fullData, c.fragmentParts[seq]...)
-	}
-
-	finalSeq := c.fragmentFinalSeq
-
-	// Clear fragment state
-	c.fragmentParts = nil
-	c.fragmentFinalSeq = 0
-	c.fragmentStartTime = time.Time{}
-
-	// Parse opcode from first 2 bytes of reassembled data
-	var opcode protocol.GameOpcode
-	if len(fullData) >= 2 {
-		opcode = protocol.GameOpcode(uint16(fullData[0]) | uint16(fullData[1])<<8)
-	}
-
-	log.Printf("Fragment assembly: %d parts, seqs %d-%d, %d bytes, opcode=0x%04X",
-		expectedCount, minSeq, finalSeq, len(fullData), uint16(opcode))
-
-	finalMsg := &protocol.Message{}
-	finalMsg.Type = protocol.MessageTypeReliable
-	finalMsg.Sequence = finalSeq
-	finalMsg.Opcode = opcode
-	finalMsg.SetData(fullData)
-	return finalMsg
-}
-
 // TimedOut returns true if the DRDP 240-second connection timeout has been exceeded.
 // PS2 connection_flush: if (time_last_flush + 240000) - current_time < 1 → assert.
 // Offset 0xa4 is updated at end of every successful flush (line 1296).
@@ -1334,16 +1254,9 @@ func (c *Connection) Flush() {
 		return
 	}
 
-	// Fragment cleanup: if a final 0xFB fragment is lost, buffered 0xFA fragments
-	// remain forever. Discard orphaned fragments after 30 seconds.
-	if len(c.fragmentParts) > 0 && !c.fragmentStartTime.IsZero() &&
-		time.Since(c.fragmentStartTime) > 30*time.Second {
-		log.Printf("Fragment cleanup: discarding %d orphaned fragments after 30s", len(c.fragmentParts))
-		c.fragmentParts = nil
-		c.fragmentFinalSeq = 0
-		c.fragmentStartTime = time.Time{}
-		c.metrics.FragmentsExpired++
-	}
+	// (No orphan-fragment purge: pieces are only ever released in sequence,
+	// so held 0xFA pieces are the head of a message whose tail the server is
+	// still retransmitting. Dropping them would deliver the tail alone.)
 
 	// PS2 keepalive: connection_flush sends a 1-byte 0x12 as type 0xF9
 	// (guaranteed) after 30 seconds of no outgoing activity. This prevents
@@ -1384,13 +1297,21 @@ func (c *Connection) Flush() {
 	// threshold without ACK, connection is killed (error code 3 → FUN_004b3e58).
 	if len(c.unacked) > 0 {
 		now := time.Now()
+		// A copy still queued from an earlier flush (one that did not fit)
+		// is not selected again.
+		queued := make(map[uint16]bool)
+		for _, msg := range c.outgoing {
+			if msg.Type.IsReliable() {
+				queued[msg.Sequence] = true
+			}
+		}
 		// Collect all expired messages first, then prepend in order.
 		// Previous code prepended individually, which reversed the order when
 		// multiple messages expired in the same flush (seq=3,5 became [5,3,...]).
 		var toRetransmit []*protocol.Message
 		for _, msg := range c.unacked {
 			sendTime, ok := c.unackedSendTime[msg.Sequence]
-			if !ok {
+			if !ok || queued[msg.Sequence] {
 				continue
 			}
 			age := now.Sub(sendTime)
@@ -1403,10 +1324,15 @@ func (c *Connection) Flush() {
 				c.mu.Unlock()
 				return
 			}
-			if age >= c.rto {
+			// connection_message_get_desired_flush_time: due at send time +
+			// the RTO (max RTT + 100 ms); or at once when the server has acked
+			// a LATER flush than the one this went out in -- the segment that
+			// carried it was lost -- provided the server reports a clean run
+			// of arrivals (no 0x20 "short" flag, PS2 conn.flags 0x10).
+			lost := !c.serverShort && int16(c.flushAckMax-c.unackedFlush[msg.Sequence]) > 0
+			if age >= c.rto || lost {
 				retransmit := *msg // shallow copy — data slice shared (read-only)
 				toRetransmit = append(toRetransmit, &retransmit)
-				c.unackedSendTime[msg.Sequence] = now // Reset timer for this message
 				c.metrics.Retransmits++
 				log.Printf("RETRANSMIT: resending reliable seq=%d type=0x%02X (serverAcked=%d, unacked=%d)",
 					msg.Sequence, byte(msg.Type), c.serverAckedReliable, len(c.unacked))
@@ -1446,6 +1372,17 @@ func (c *Connection) Flush() {
 	msgs := c.outgoing
 	c.outgoing = nil
 
+	// Build packet UNDER LOCK — BuildPacket reads/writes conn maps (stateRxFlag,
+	// stateRx, delayed) and fields (sendArrival++, needsNewInst). Without the lock,
+	// concurrent ProcessIncoming writes cause Go map data races → corruption/panic.
+	// Messages go in, in order, while they fit (connection_append stops at the
+	// first that does not); the rest stay queued, ahead of anything newer.
+	packet, written := BuildPacket(c, msgs)
+	if written < len(msgs) {
+		c.outgoing = append(msgs[written:len(msgs):len(msgs)], c.outgoing...)
+	}
+	msgs = msgs[:written]
+
 	// Track NEW reliable messages for retransmit (skip retransmitted ones already in unacked).
 	// Use a set for O(1) dedup instead of O(N) linear scan per message.
 	unackedSet := make(map[uint16]bool, len(c.unacked))
@@ -1458,14 +1395,10 @@ func (c *Connection) Flush() {
 			unackedSet[msg.Sequence] = true
 		}
 	}
-	// Build packet UNDER LOCK — BuildPacket reads/writes conn maps (stateAckDirtyCount,
-	// stateAckMap, reliableOOO) and fields (sendArrival++, needsNewInst). Without the lock,
-	// concurrent processStateChannel writes cause Go map data races → corruption/panic.
-	packet := BuildPacket(c, msgs)
 
 	// Post-build bookkeeping (still under lock)
 	now := time.Now()
-	sentArrival := c.sendArrival - 1 // BuildPacket incremented after writing
+	sentArrival := c.sendArrival - 1          // BuildPacket incremented after writing
 	c.flushSendTimes[sentArrival&0x3FF] = now // #21: store per-seq send timestamp for RTT
 	// PS2 connection_flush line 1292: conn.flags &= 0xfff0 — clears bits 0-3 atomically.
 	c.arrivalDirty = false
@@ -1473,21 +1406,21 @@ func (c *Connection) Flush() {
 	c.ackFlushDeadline = time.Time{} // #26: clear 100ms ACK timer after flush
 	// PS2 offset 0xa4 (line 1296): store current time as time_last_flush.
 	c.lastFlushTime = now
-	// PS2 connection_flush line 1262-1267: when conn.flags & 0x40 NOT set
-	// (instance_ack not received), inflate min RTT (conn+0x1124) by 1000ms per
-	// flush. Since RTO = 2*minRTT, this effectively adds 2000ms to RTO per flush.
+	// PS2 connection_flush: while conn.flags & 0x40 is NOT set (instance_ack
+	// not received), the timeout (m_usTimeout, the max RTT) grows by 1000 ms
+	// per flush. The next RTT sample replaces it.
 	if !c.handshakeComplete {
-		c.rto += 2000 * time.Millisecond // PS2: +1000 to minRTT → +2000 to RTO (RTO = 2*minRTT)
-		if c.rto > 10*time.Second {
-			c.rto = 10 * time.Second
+		c.rto += 1000 * time.Millisecond
+		if c.rto > maxRTO {
+			c.rto = maxRTO
 		}
 	}
-	// #26: Record per-message send timestamps for newly sent reliable messages
+	// #26: each reliable message written gets this send time and this flush
+	// number (message_set_time / message_set_flush), retransmissions included.
 	for _, msg := range msgs {
 		if msg.Type.IsReliable() {
-			if _, exists := c.unackedSendTime[msg.Sequence]; !exists {
-				c.unackedSendTime[msg.Sequence] = now
-			}
+			c.unackedSendTime[msg.Sequence] = now
+			c.unackedFlush[msg.Sequence] = sentArrival
 			c.lastGuaranteedSendTime = now
 		}
 	}
@@ -1531,8 +1464,8 @@ func (c *Connection) SendInitialPacket(gameVersion byte, username string, sessio
 	w.WriteUint32(uint32(len(username))) // Username length
 	w.WriteStringUTF8Raw(username)       // Username
 	if len(sessionToken) == 32 {
-		w.WriteByte(0x01)            // Has-token flag
-		w.WriteBytes(sessionToken)   // 32-byte session token
+		w.WriteByte(0x01)          // Has-token flag
+		w.WriteBytes(sessionToken) // 32-byte session token
 	}
 	authData := authBuf[:w.Position()]
 	// Not the bytes: they are the account name and the password-derived token.
@@ -1561,8 +1494,8 @@ func (c *Connection) SendGameAuth(gameVersion byte, username string, sessionToke
 	w.WriteUint32(uint32(len(username))) // Username length
 	w.WriteStringUTF8Raw(username)       // Username
 	if len(sessionToken) == 32 {
-		w.WriteByte(0x01)            // Has-token flag
-		w.WriteBytes(sessionToken)   // 32-byte session token
+		w.WriteByte(0x01)          // Has-token flag
+		w.WriteBytes(sessionToken) // 32-byte session token
 	}
 	authData := authBuf[:w.Position()]
 	log.Printf("Authenticate2 payload (%d bytes, token %v)", len(authData), len(sessionToken) == 32)
@@ -1608,17 +1541,14 @@ func (c *Connection) SendReset() {
 	log.Printf("Sent Reset packet to endpoint 0x%04X", c.serverEndpoint)
 }
 
-// ClearStateAck removes a single channel from the persistent ACK map and
-// clears its XOR delta bases. Called when a channel is emptied (objectID=0)
-// so we don't send stale ACKs for a channel the server has freed, and so
-// the next entity assigned to this channel starts with a fresh XOR chain.
-func (c *Connection) ClearStateAck(channel byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.stateAckMap, channel)
-	delete(c.stateAckDirtyCount, channel)
-	delete(c.stateBases, channel)
-}
+// ClearStateAck is called when a channel's entity is removed (objectID 0).
+// It deliberately does NOTHING: the PS2 has no such step. A channel's
+// sequence and its delta bases outlive the entity on it -- the server hands
+// the channel to the next entity with the next sequence number and a delta
+// against the last state we acked (114 reassignments in four PS2 captures,
+// not one restart). Forgetting the bases made that delta undecodable, and
+// forgetting rx would let the ack go backwards.
+func (c *Connection) ClearStateAck(channel byte) {}
 
 // SwitchToGameServer reconfigures the connection for the game server endpoint.
 func (c *Connection) SwitchToGameServer(endpointID uint16) {
@@ -1639,17 +1569,19 @@ func (c *Connection) SwitchToGameServer(endpointID uint16) {
 	c.sendReliable = 0
 	c.recvArrival = 0xFFFF // Sentinel: no packets received yet (#22)
 	c.recvReliable = 0
-	c.reliableOOO = make(map[uint16]bool)
+	c.delayed = make(map[uint16]*protocol.Message)
+	c.arrivals = nil
 	c.serverAckedReliable = 0
+	c.flushAckMax = 0
 	c.lastSentReliable = 0
-	c.serverEndpoint = 0 // Reset — learn from first game server response (Sandstorm reuses endpoint pool, so game server may respond from a different endpoint than 0xB991)
-	c.serverEndpointPacked = 0  // Reset — learned from server's DidServerInitiate local_endpoint
-	c.instanceRemote = 0        // Reset — learned from server's NewInstance or SessionAck
+	c.serverEndpoint = 0       // Reset — learn from first game server response (Sandstorm reuses endpoint pool, so game server may respond from a different endpoint than 0xB991)
+	c.serverEndpointPacked = 0 // Reset — learned from server's DidServerInitiate local_endpoint
+	c.instanceRemote = 0       // Reset — learned from server's NewInstance or SessionAck
 	c.gotSessionAck = false
 	c.handshakeComplete = false // Reset for new handshake
-	c.handshakeSentCount = 0   // Reset handshake packet counter
-	c.goodArrivalCount = 0     // Reset for new session (PS2 short flag 0x20)
-	c.arrivalHistory = 0       // Reset arrival bitmap
+	c.handshakeSentCount = 0    // Reset handshake packet counter
+	c.goodArrivalCount = 0      // Reset for new session (PS2 short flag 0x20)
+	c.arrivalHistory = 0        // Reset arrival bitmap
 	c.arrivalDirty = false
 	c.sessionAckPending = false
 	c.serverShort = false
@@ -1658,20 +1590,20 @@ func (c *Connection) SwitchToGameServer(endpointID uint16) {
 	c.lastFlushTime = time.Time{} // Reset for new session (PS2 0x200 flag cleared)
 	c.rttSamples = [16]time.Duration{}
 	c.rttSampleIdx = 0
-	c.rto = 2 * time.Second
+	c.rto = initialRTO
 	c.lastGuaranteedSendTime = time.Time{}
 	c.flushSendTimes = [1024]time.Time{}
 	c.lastSentReliable = 0
 	c.didServerInit = false // Reset for game server session detection
-	c.pktCount = 0         // Reset debug counter for game server phase
+	c.pktCount = 0          // Reset debug counter for game server phase
 	c.unacked = nil
 	c.unackedSendTime = make(map[uint16]time.Time)
-	c.fragmentParts = nil
-	c.fragmentFinalSeq = 0
-	c.fragmentStartTime = time.Time{}
+	c.unackedFlush = make(map[uint16]uint16)
 	c.outgoing = nil
-	c.stateAckMap = make(map[byte]uint16)
-	c.stateAckDirtyCount = make(map[byte]byte)
+	// A new connection: every state channel starts again at rx 0 with no bases.
+	c.stateRx = make(map[byte]uint16)
+	c.stateRxFlag = make(map[byte]byte)
+	c.stateBases = make(map[byte]map[uint16][]byte)
 }
 
 // Metrics returns a snapshot of protocol health counters.
@@ -1681,32 +1613,21 @@ func (c *Connection) Metrics() ConnectionMetrics {
 	return c.metrics
 }
 
-// updateRTT updates the retransmit timeout using PS2's 16-sample max-RTT algorithm.
-// PS2 connection_add_rtt_sample: circular buffer uint16[16] at conn+0x1126,
-// index at conn+0x1122 (& 0x0F). Computes MAXIMUM across all 16 samples (conn+0x1124).
-// PS2 uses max RTT for conservative RTO — avoids premature retransmits under jitter.
-// RTO = 2 * maxRTT (clamped to 200ms..10s).
+// updateRTT is connection_add_rtt_sample: a 16-deep ring of round trips
+// (uns16 ms, so at most 65,535), and the timeout is the LARGEST of them.
+// A message is due again at its send time + that timeout + 100 ms
+// (connection_message_get_desired_flush_time), so RTO = max + 100 ms --
+// not 2 x max, and with no floor or ceiling.
 func (c *Connection) updateRTT(rtt time.Duration) {
+	if rtt > 0xFFFF*time.Millisecond {
+		rtt = 0xFFFF * time.Millisecond
+	}
 	c.rttSamples[c.rttSampleIdx&0x0F] = rtt
 	c.rttSampleIdx++
 
-	// PS2: find MAXIMUM across all 16 samples (conservative retransmit).
-	// connection_add_rtt_sample seeds from history[0], then for each entry:
-	//   if (entry < current) keep current; else use entry → accumulates max.
-	maxRTT := time.Duration(0)
-	for _, s := range c.rttSamples {
-		if s > maxRTT {
-			maxRTT = s
-		}
+	maxRTT := c.rttSamples[0]
+	for _, s := range c.rttSamples[1:] {
+		maxRTT = max(maxRTT, s)
 	}
-
-	if maxRTT > 0 {
-		c.rto = maxRTT * 2
-	}
-	if c.rto < 200*time.Millisecond {
-		c.rto = 200 * time.Millisecond
-	}
-	if c.rto > 10*time.Second {
-		c.rto = 10 * time.Second
-	}
+	c.rto = maxRTT + 100*time.Millisecond
 }

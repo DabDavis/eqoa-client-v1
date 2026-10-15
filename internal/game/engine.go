@@ -231,6 +231,8 @@ func (e *Engine) Tick() {
 				e.SpellFX.HasTripped = e.hasTrippedCB
 				e.SpellFX.IsCSprite = e.isCSpriteCB
 				e.SpellFX.SetWeaponTrail = e.weaponTrailCB
+				// Camera shake is the local player's alone.
+				e.SpellFX.IsPlayer = func(id uint32) bool { return id == e.State.Player.ObjectID }
 				e.SpellFX.Audio = e.Audio
 				// Load spell sounds from SPELLFX file if audio available
 				if e.Audio != nil && sfx.File() != nil {

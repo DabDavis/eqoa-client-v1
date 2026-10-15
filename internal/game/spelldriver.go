@@ -39,7 +39,8 @@ type AudioPlayer interface {
 // Port of VISpellActiveEvent (0xB8 bytes on PS2).
 type ActiveEvent struct {
 	eventType uint32          // from SpellEvent.EventType
-	id        int32           // Fields[0] — emitter/sprite/sound ID
+	localID   int32           // Fields[0] (m_p04): what Destroy*/SetEmitter* find it by
+	id        int32           // the emitter's global ID, the sound's audio ID, else Fields[0]
 	event     *esf.SpellEvent // reference to source event data
 	startTime time.Time       // when this event was created
 	maxLife   time.Duration   // auto-expire after this duration
@@ -47,21 +48,28 @@ type ActiveEvent struct {
 	fadeStart float32
 	fadeEnd   float32
 	fadeDurMS int32
-	// Attractor parameters (type 5 — SetEmitterAttractor)
-	attractorTarget   int32   // actor ID for attraction
-	attractorStrength float32 // attraction pull strength
+	// Attractor (type 5 — SetEmitterAttractor): m_p84 and m_f88. The selector
+	// is NOT an actor: bit 16 = caster, bit 17 = target, else the list's
+	// actor, and the low 16 bits a node (0xFFFF = the actor itself). It is -1
+	// (no attractor) until an event sets it.
+	attractorSet      bool
+	attractorSel      int32
+	attractorStrength float32
+	// Motif (type 6 — SetEmitterMotif): the blender it drives and the factor
+	// the ramp starts from (m_f9C).
+	blender    *MotifBlender
+	blendStart float32
 	// Emit shape parameters (type 3 — CreateEmitter, shapes 1-3)
 	// PS2 ProcessCreateEmitter: emitShape=(Fields[2]>>20)&3
 	// Shapes 1-3 use rotating radius from Floats[0-4]:
-	//   interpRadius = Floats[0] + (Floats[1]-Floats[0]) * (sin(angle)*0.5+0.5)
-	//   angle advances by Floats[2]*dt, radius param by Floats[3]*2*dt
+	//   interpRadius = Floats[0] + (Floats[1]-Floats[0]) * (sin(radParam)*0.5+0.5)
+	//   angle advances by Floats[3]*2*dt, radius param by Floats[2]*dt
 	emitShape    int32   // 0=point, 1=line, 2=ring, 3=sphere
 	emitAngle    float32 // current rotation angle (advances per frame)
 	emitRadParam float32 // current radius interpolation parameter
 	// Bone attachment (type 3 — CreateEmitter)
 	// PS2: nodeID = Fields[2] & 0xFFFF, 0xFFFF = no specific bone
 	nodeID uint16 // bone/node index for position attachment
-	emitDebugCounter int // throttle debug logging
 	// Sprite (type 9 — CreateSprite)
 	spriteDictID int32   // Fields[1] — sprite DictID in SPELLFX.ESF
 	spriteActorID uint32 // actor this sprite is attached to
@@ -157,22 +165,21 @@ type SpellEventDriver struct {
 
 	// PS2 dispatches one event per frame at ~30fps. Throttle dispatch to match.
 	lastDispatchTime time.Time
-
-	// Map local emitter IDs (Fields[0], 1-6 per effect) to globally unique IDs.
-	// Without this, concurrent spell effects reuse the same local IDs, causing
-	// DestroyEmitter/DrainEmitter/SetPosition to target the wrong emitter.
-	localToGlobalID map[int32]int32
 }
 
-// resolveGlobalID maps a local emitter ID (Fields[0]) to its globally unique ID.
-// Returns the local ID unchanged if no mapping exists (fallback for unmapped IDs).
-func (d *SpellEventDriver) resolveGlobalID(localID int32) int32 {
-	if d.localToGlobalID != nil {
-		if gid, ok := d.localToGlobalID[localID]; ok {
-			return gid
+// findActive is FindCreateEmitter / FindCreateSound / FindCreateSprite: the
+// first active event of that type whose Fields[0] is id. Each type has its own
+// ids, and they are this list's own: an emitter and a sound may both be 1.
+// (A local→global map shared by all types used to send DestroySound and
+// DestroySprite looking for an emitter's ID whenever the numbers coincided —
+// both such events in SPELLFX do — so the sound or sprite was never removed.)
+func (d *SpellEventDriver) findActive(eventType uint32, id int32) *ActiveEvent {
+	for _, ae := range d.activeEvents {
+		if ae.eventType == eventType && ae.localID == id {
+			return ae
 		}
 	}
-	return localID
+	return nil
 }
 
 func newSpellEventDriver(eff *SpellEffectDriver, events []esf.SpellEvent, actorID uint32, listIndex int) *SpellEventDriver {
@@ -557,6 +564,13 @@ func (d *SpellEventDriver) processInactive() {
 			// Check if the emitter still has live particles.
 			if d.effDriver.particles != nil {
 				if d.effDriver.particles.EmitterHasParticles(ae.id) {
+					// ProcessCreateEmitter(e, false): no placing, no births,
+					// but the attractor still pulls.
+					for _, em := range d.effDriver.particles.emitters {
+						if em.emitterID == ae.id {
+							d.applyAttractor(ae, em)
+						}
+					}
 					continue // still draining — keep in inactive list
 				}
 			}
@@ -585,123 +599,46 @@ func (d *SpellEventDriver) processActive(now time.Time, dt float32) {
 				}
 				d.inactiveEvents = append(d.inactiveEvents, ae)
 			}
+			if ae.eventType == 11 {
+				d.stopSound(ae) // deleting the event releases its sound actor
+			}
 			d.activeEvents = append(d.activeEvents[:i], d.activeEvents[i+1:]...)
 			continue
 		}
 
 		switch ae.eventType {
-		case 3: // Emitter — update position to track actor per-frame
-			// PS2 ProcessCreateEmitter: Fields[2] bit 16=caster, bit 17=target override
-			// PS2: nodeID = Fields[2] & 0xFFFF for bone attachment
+		case 3: // ProcessCreateEmitter: follow the actor's node, then turn the shape
 			if d.effDriver.particles != nil {
-				actorID := d.actorID
-				if ae.event.Fields[2]&0x10000 != 0 {
-					actorID = d.effDriver.casterObjID
-				}
-				if ae.event.Fields[2]&0x20000 != 0 {
-					actorID = d.effDriver.targetObjID
-				}
-				// Use bone-aware position resolution
-				ax, ay, az := d.resolveActorPos(actorID, ae.nodeID)
-
-				// PS2 ProcessCreateEmitter emit shape offset (shapes 1-3).
-				// PS2 builds a rotation matrix from emitAngle, defines a local offset
-				// vector, rotates it, then transforms by actor world matrix.
-				// Shape 0 (point): no offset, emitter at actor position.
-				var ox, oy, oz float32
+				d.placeEmitter(ae)
 				if ae.emitShape >= 1 && ae.emitShape <= 3 {
+					// The angles step on the particle system's DeltaTime after
+					// the offset is taken: Floats[3]·2 turns, Floats[2] the radius.
+					step := dt
+					if sys := d.effDriver.system; sys != nil && sys.deltaTime > 0 {
+						step = sys.deltaTime
+					}
 					ev := ae.event
-
-					// Radius interpolation: sinf(radParam)*0.5+0.5 maps [-1,1] to [0,1]
-					t := float32(math.Sin(float64(ae.emitRadParam)))*0.5 + 0.5
-					interpR := ev.Floats[0] + (ev.Floats[1]-ev.Floats[0])*t
-					extent := ev.Floats[4]
-
-					sinA := float32(math.Sin(float64(ae.emitAngle)))
-					cosA := float32(math.Cos(float64(ae.emitAngle)))
-
-					// PS2: BuildRotationMatrix(eulerAngles) × localOffset
-					// PS2 euler convention: angles[0]=Y-axis, angles[1]=X-axis, angles[2]=Z-axis
-					// Shape 1 stores angle in angles[1] (X-axis/pitch rotation)
-					// Shape 2 stores angle in angles[0] (Y-axis/heading rotation)
-					// Shape 3 stores angle in angles[2] (Z-axis/roll rotation)
-					switch ae.emitShape {
-					case 1: // X-axis rotation of (interpR, extent, 0)
-						ox = interpR
-						oy = extent * cosA
-						oz = -extent * sinA
-					case 2: // Y-axis rotation of (0, interpR, extent) — horizontal orbit
-						ox = -extent * sinA
-						oy = interpR
-						oz = extent * cosA
-					case 3: // Z-axis rotation of (extent, 0, interpR)
-						ox = extent * cosA
-						oy = -extent * sinA
-						oz = interpR
-					}
-
-					// Debug: log emit shape state every ~60 frames
-					ae.emitDebugCounter++
-					if ae.emitDebugCounter%60 == 1 {
-						log.Printf("[SPELL]   shape id=%d shape=%d angle=%.2f radParam=%.2f t=%.3f interpR=%.3f extent=%.3f offset=(%.2f,%.2f,%.2f)",
-							ae.id, ae.emitShape, ae.emitAngle, ae.emitRadParam, t, interpR, extent, ox, oy, oz)
-					}
-
-					// Advance angles per frame
-					// PS2 confirmed: Floats[3]=rotation (*2), Floats[2]=radius oscillation
-					ae.emitAngle += ev.Floats[3] * 2 * dt
-					ae.emitRadParam += ev.Floats[2] * dt
-					// Wrap to [-2PI, +2PI]
-					twoPi := float32(2 * math.Pi)
-					for ae.emitAngle > twoPi {
-						ae.emitAngle -= twoPi
-					}
-					for ae.emitAngle < -twoPi {
-						ae.emitAngle += twoPi
-					}
-					for ae.emitRadParam > twoPi {
-						ae.emitRadParam -= twoPi
-					}
-					for ae.emitRadParam < -twoPi {
-						ae.emitRadParam += twoPi
-					}
-				}
-
-				// PS2 Step 2: Transform offset by actor world matrix.
-				// PS2 does TransformPoint(actorWorldMatrix, rotatedOffset, worldPos).
-				// We approximate with Y-rotation by actor facing angle, which makes
-				// the orbit plane follow the character's orientation.
-				if (ox != 0 || oy != 0 || oz != 0) && d.effDriver.resolveFacing != nil {
-					facing := d.effDriver.resolveFacing(actorID)
-					cosF := float32(math.Cos(float64(facing)))
-					sinF := float32(math.Sin(float64(facing)))
-					rx := ox*cosF + oz*sinF
-					rz := -ox*sinF + oz*cosF
-					ox, oz = rx, rz
-				}
-
-					for _, em := range d.effDriver.particles.emitters {
-					if em.emitterID == ae.id {
-						em.SetPosition(ax+ox, ay+oy, az+oz)
-						em.SetTrackPos(ax, ay, az) // actor raw pos for local-space tracking
-						// PS2: direction matrix updated per-frame from actor transform
-						if d.effDriver.resolveFacing != nil {
-							em.SetFacing(d.effDriver.resolveFacing(actorID))
-						}
-
-						// Apply attractor if set (from SetEmitterAttractor, type 5)
-						if ae.attractorStrength > 0 {
-							tx, ty, tz := d.effDriver.resolvePos(uint32(ae.attractorTarget))
-							em.attractorPos = [3]float32{tx, ty, tz}
-							em.attractorStrength = ae.attractorStrength
-							em.attractorActive = true
-						}
-					}
+					ae.emitAngle = wrap2Pi(ae.emitAngle + ev.Floats[3]*2*step)
+					ae.emitRadParam = wrap2Pi(ae.emitRadParam + ev.Floats[2]*step)
 				}
 			}
 			// PS2: Fields[3] as auto-expire timer (handled by ae.maxLife + expired() check above)
-		case 6: // SetEmitterMotif — PS2 does per-frame interpolation over duration.
-			// We apply the change instantly (no blender), auto-expire via maxLife.
+		case 6: // ProcessSetEmitterMotif: ramp to Floats[0] over Fields[2] ms, then hold
+			ev := ae.event
+			elapsed := now.Sub(ae.startTime).Milliseconds()
+			if int64(ev.Fields[2]) < elapsed || ev.Fields[2] == 0 {
+				if ae.blender.Factor() != ev.Floats[0] {
+					ae.blender.SetFactor(ev.Floats[0])
+				}
+			} else {
+				f := float32(elapsed) / float32(ev.Fields[2])
+				f = ae.blendStart + (ev.Floats[0]-ae.blendStart)*f
+				ae.blender.SetFactor(min(max(0, f), 1))
+			}
+			// It retires only when its emitter is gone and the motif unlinked.
+			if !ae.blender.Linked() {
+				d.activeEvents = append(d.activeEvents[:i], d.activeEvents[i+1:]...)
+			}
 		case 8: // PlayTargetProjectile — never an active event: the projectile
 			// lives on the target driver and processProjectile moves its emitters.
 		case 9: // CreateSprite — track per-frame (auto-expires via maxLife)
@@ -863,21 +800,18 @@ func (d *SpellEventDriver) newCreateEmitter(ev *esf.SpellEvent, now time.Time) {
 	// PS2: nodeID = Fields[2] & 0xFFFF (bottom 16 bits = bone index)
 	nodeID := uint16(ev.Fields[2] & 0xFFFF)
 
-	// Map local ID (Fields[0], 1-6 per effect) to a globally unique ID.
-	// Without this, concurrent spell effects reuse the same local IDs,
-	// causing DestroyEmitter/DrainEmitter/SetPosition to target wrong emitters.
+	// The particle system knows the emitter by a global ID, since concurrent
+	// effects reuse the same local IDs (Fields[0], 1-6 per effect); the
+	// list's own events find it by the local one (findActive).
 	localID := ev.Fields[0]
 	globalID := localID
 	if ps != nil {
 		globalID = ps.NextGlobalEmitterID()
 	}
-	if d.localToGlobalID == nil {
-		d.localToGlobalID = make(map[int32]int32)
-	}
-	d.localToGlobalID[localID] = globalID
 
 	ae := &ActiveEvent{
 		eventType: ev.EventType,
+		localID:   localID,
 		id:        globalID,
 		event:     ev,
 		startTime: now,
@@ -934,46 +868,149 @@ func (d *SpellEventDriver) newCreateEmitter(ev *esf.SpellEvent, now time.Time) {
 	}
 }
 
+// newSetEmitterMotif is VISpellEventDriver::NewSetEmitterMotif. Fields[0]
+// names the CreateEmitter, Fields[1] the motif (the hash of its name, which
+// ParseSpellEffectObj leaves unresolved), Fields[2] the ramp in ms and
+// Floats[0] the factor it ramps to. The event lives as long as the emitter —
+// the PS2 retires it once the blender's motif is unlinked — so the factor is
+// HELD after the ramp; it used to expire after Fields[2] ms, or never when that
+// was 0 (66 of 612), which held the effect for the 60 s timeout. A second event
+// on the same emitter and motif takes the blender over from where it had got.
 func (d *SpellEventDriver) newSetEmitterMotif(ev *esf.SpellEvent, now time.Time) {
-	// PS2 ProcessSetEmitterMotif: per-frame interpolation over Fields[2] duration.
-	// We now use a motif blender that lerps particle attributes over the duration.
-	var maxLife time.Duration
-	if ev.Fields[2] > 0 {
-		maxLife = time.Duration(ev.Fields[2]) * time.Millisecond
+	ce := d.findActive(3, ev.Fields[0])
+	if ce == nil {
+		return
 	}
-	globalID := d.resolveGlobalID(ev.Fields[0])
 	ae := &ActiveEvent{
 		eventType: ev.EventType,
-		id:        globalID,
+		localID:   ev.Fields[0],
+		id:        ce.id,
 		event:     ev,
 		startTime: now,
-		maxLife:   maxLife,
+	}
+	taken := false
+	for i, old := range d.activeEvents {
+		if old.eventType == 6 && old.localID == ev.Fields[0] && old.blender.Linked() &&
+			viHashResourceID(old.blender.motif.Name) == ev.Fields[1] {
+			ae.blender = old.blender
+			ae.blendStart = old.blender.Factor()
+			d.activeEvents = append(d.activeEvents[:i], d.activeEvents[i+1:]...)
+			taken = true
+			break
+		}
+	}
+	if !taken {
+		ae.blender = d.effDriver.particles.LinkMotifBlender(ce.id, ev.Fields[1])
 	}
 	d.activeEvents = append(d.activeEvents, ae)
+}
 
-	// PS2 NewSetEmitterMotif:
-	//   Fields[0] = emitter ID (which emitter to modify)
-	//   Fields[1] = motif DictID/hash to switch to
-	//   Fields[2] = blend duration in ms (0 = instant)
-	if d.effDriver.particles != nil && globalID != 0 {
-		d.effDriver.particles.StartMotifBlend(globalID, ev.Fields[1], ev.Fields[2])
+// newSetEmitterAttractor is VISpellEventDriver::NewSetEmitterAttractor:
+// Fields[0] names the CreateEmitter, Fields[1] is the attractor SELECTOR
+// (bit 16 caster, bit 17 target, else this list's actor; low 16 bits the
+// node) and Floats[0] the pull. Fields[1] used to be taken for an object ID.
+func (d *SpellEventDriver) newSetEmitterAttractor(ev *esf.SpellEvent) {
+	if ae := d.findActive(3, ev.Fields[0]); ae != nil {
+		ae.attractorSet = true
+		ae.attractorSel = ev.Fields[1]
+		ae.attractorStrength = ev.Floats[0]
 	}
 }
 
-// newSetEmitterAttractor sets attractor parameters on an active emitter.
-// PS2 NewSetEmitterAttractor at 0x00476B88:
-//   Fields[0] = emitter ID to modify (passed to FindActiveEvent helper)
-//   Fields[1] = target actor ID for attraction (stored at ae+0x84)
-//   Floats[0] = attraction strength (stored at ae+0x88)
-func (d *SpellEventDriver) newSetEmitterAttractor(ev *esf.SpellEvent) {
-	id := d.resolveGlobalID(ev.Fields[0])
-	for _, ae := range d.activeEvents {
-		if ae.eventType == 3 && ae.id == id {
-			ae.attractorTarget = ev.Fields[1] // PS2: event+0x08 = Fields[1], NOT Fields[2]
-			ae.attractorStrength = ev.Floats[0]
-			return
+// flagActor is the actor a CreateEmitter/Sound/Sprite flags word picks:
+// bit 16 the caster, bit 17 the target (which wins), else this list's actor.
+func (d *SpellEventDriver) flagActor(flags int32) uint32 {
+	actor := d.actorID
+	if flags&0x10000 != 0 {
+		actor = d.effDriver.casterObjID
+	}
+	if flags&0x20000 != 0 {
+		actor = d.effDriver.targetObjID
+	}
+	return actor
+}
+
+// emitShapeOffset is ProcessCreateEmitter's offset for emit shapes 1-3, in the
+// actor's frame: the shape's vector times RotateHPR of its angle, with row
+// vectors (VIMatrix44::Mul). Shape 1 turns (r, extent, 0) about X, shape 2
+// turns (0, r, extent) about Y and shape 3 turns (extent, 0, r) about Z. The
+// port had the transpose's signs, so every orbit ran the other way round.
+func emitShapeOffset(ae *ActiveEvent) [3]float32 {
+	ev := ae.event
+	t := float32(math.Sin(float64(ae.emitRadParam)))*0.5 + 0.5
+	r := ev.Floats[0] + (ev.Floats[1]-ev.Floats[0])*t
+	ext := ev.Floats[4]
+	a := ae.emitAngle
+	switch ae.emitShape {
+	case 1:
+		return rotateHPR(0, a, 0, [3]float32{r, ext, 0})
+	case 2:
+		return rotateHPR(a, 0, 0, [3]float32{0, r, ext})
+	case 3:
+		return rotateHPR(0, 0, a, [3]float32{ext, 0, r})
+	}
+	return [3]float32{}
+}
+
+// wrap2Pi folds an emit-shape angle back once past ±2π, as
+// ProcessCreateEmitter does.
+func wrap2Pi(a float32) float32 {
+	const twoPi = float32(6.2831855)
+	if a > twoPi {
+		return a - twoPi
+	}
+	if a < -twoPi {
+		return a + twoPi
+	}
+	return a
+}
+
+// placeEmitter is ProcessCreateEmitter's placing: the emitter goes to the node
+// on the actor its flags pick, plus the shape offset turned by the actor's
+// facing (the actor transform, heading only here), takes that facing as its
+// direction, and has its attractor set or cleared.
+func (d *SpellEventDriver) placeEmitter(ae *ActiveEvent) {
+	actorID := d.flagActor(ae.event.Fields[2])
+	ax, ay, az := d.resolveActorPos(actorID, ae.nodeID)
+	var off [3]float32
+	if ae.emitShape >= 1 && ae.emitShape <= 3 {
+		off = emitShapeOffset(ae)
+		if d.effDriver.resolveFacing != nil {
+			facing := d.effDriver.resolveFacing(actorID)
+			c := float32(math.Cos(float64(facing)))
+			sn := float32(math.Sin(float64(facing)))
+			off[0], off[2] = off[0]*c+off[2]*sn, -off[0]*sn+off[2]*c
 		}
 	}
+	for _, em := range d.effDriver.particles.emitters {
+		if em.emitterID != ae.id {
+			continue
+		}
+		em.SetPosition(ax+off[0], ay+off[1], az+off[2])
+		em.SetTrackPos(ax, ay, az) // actor raw pos for local-space tracking
+		if d.effDriver.resolveFacing != nil {
+			em.SetFacing(d.effDriver.resolveFacing(actorID))
+		}
+		d.applyAttractor(ae, em)
+	}
+}
+
+// applyAttractor is the attractor half of ProcessCreateEmitter, which runs for
+// a draining emitter as well: no SetEmitterAttractor, or a selector of -1,
+// clears it; otherwise it is the selected actor's node at the event's pull.
+func (d *SpellEventDriver) applyAttractor(ae *ActiveEvent, em *ParticleEmitter) {
+	if !ae.attractorSet || ae.attractorSel == -1 {
+		em.attractorActive = false // ClearAttractor
+		return
+	}
+	actor := d.flagActor(ae.attractorSel)
+	if actor == 0xFFFFFFFF {
+		return // no sprite: the PS2 leaves the attractor as it was
+	}
+	x, y, z := d.resolveActorPos(actor, uint16(ae.attractorSel&0xFFFF))
+	em.attractorPos = [3]float32{x, y, z}
+	em.attractorStrength = ae.attractorStrength
+	em.attractorActive = true
 }
 
 // targetDrivers creates the drivers a PlayTarget event asks for — PS2
@@ -1101,7 +1138,7 @@ func (d *SpellEventDriver) newPlayTargetInstant(ev *esf.SpellEvent) {
 // PS2 NewCreateSprite at 0x004777E0:
 //   Fields[1] = sprite DictID, Fields[2] = bit flags (bit 18=loop, bit 19=play-once)
 //   Fields[3] = duration in ms (0 = no auto-expire, waits for DestroySprite)
-//   PS2 does NOT read Fields[0] here — Go uses it as ID for Destroy matching.
+//   Fields[0] is the id NewDestroySprite / NewFadeSprite find it by.
 func (d *SpellEventDriver) newCreateSprite(ev *esf.SpellEvent, now time.Time) {
 	// PS2: Fields[3] as lifetime, 0 = infinite (no auto-expire, waits for DestroySprite)
 	var maxLife time.Duration
@@ -1127,6 +1164,7 @@ func (d *SpellEventDriver) newCreateSprite(ev *esf.SpellEvent, now time.Time) {
 
 	ae := &ActiveEvent{
 		eventType:     ev.EventType,
+		localID:       ev.Fields[0],
 		id:            ev.Fields[0],
 		event:         ev,
 		startTime:     now,
@@ -1138,46 +1176,57 @@ func (d *SpellEventDriver) newCreateSprite(ev *esf.SpellEvent, now time.Time) {
 	d.activeEvents = append(d.activeEvents, ae)
 }
 
-// newCreateSound creates a sound active event and starts audio playback.
-// PS2 NewCreateSound at 0x00477660:
-//   Fields[1] = sound DictID, Fields[2] = bit flags (bit 18=pan, bits 19-20=attenuation)
-//   Fields[3] = duration in ms (0 = no auto-expire, waits for DestroySound)
-//   Floats[0] = volume/distance parameter
-//   PS2 does NOT read Fields[0] here — Go uses it as ID for Destroy matching.
+// newCreateSound is VISpellEventDriver::NewCreateSound + ProcessCreateSound.
+// The sound is a scene actor at the node Fields[2] names, on the actor its bits
+// 16/17 pick, at scale Floats[0]. VIScene::UpdateSoundEmitters fades it to
+// silence at scale × the sound sprite's radius, with the sprite's volume; the
+// 0xB101 header holds radius and volume, or neither in a version-0 header
+// (1 and 1): 491 of SPELLFX's 527 CreateSounds, so their reach is 10 units,
+// not the 50 this used to give every sound. Fields[3] is its lifetime, and
+// the sound stops when the event goes. Fields[0] is the id DestroySound finds
+// it by; the audio system gets an ID of its own.
+//
+// Not ported (the AudioPlayer cannot say them): Fields[2] bit 18 (pan; without
+// it the sound is centred), bits 19/20 (the two quartic attenuation curves),
+// and moving with the actor after it starts.
 func (d *SpellEventDriver) newCreateSound(ev *esf.SpellEvent, now time.Time) {
-	// PS2: Fields[3] as lifetime, 0 = infinite (no auto-expire, waits for DestroySound)
+	if d.actorID == 0xFFFFFFFF {
+		return
+	}
 	var maxLife time.Duration
 	if ev.Fields[3] > 0 {
 		maxLife = time.Duration(ev.Fields[3]) * time.Millisecond
 	}
+	sys := d.effDriver.system
 	ae := &ActiveEvent{
 		eventType: ev.EventType,
+		localID:   ev.Fields[0],
 		id:        ev.Fields[0],
 		event:     ev,
 		startTime: now,
 		maxLife:   maxLife,
 	}
+	if sys != nil {
+		ae.id = sys.newSoundID()
+	}
 	d.activeEvents = append(d.activeEvents, ae)
 
-	// Play audio if audio system is available
-	if audio := d.effDriver.system.Audio; audio != nil {
-		soundDictID := ev.Fields[1]
-		if audio.HasSound(soundDictID) {
-			// Resolve source actor position for 3D audio
-			var pos [3]float32
-			if d.effDriver.resolvePos != nil {
-				x, y, z := d.effDriver.resolvePos(d.actorID)
-				pos = [3]float32{x, y, z}
-			}
-			// PS2: Floats[0] is the max audible distance (typically 10.0),
-			// not a 0-1 volume. Scale to world units for attenuation.
-			maxDist := ev.Floats[0]
-			if maxDist <= 0 {
-				maxDist = 50.0
-			}
-			maxDist *= 5.0 // scale to world units (10.0 → 50 units)
-			audio.Play(soundDictID, ev.Fields[0], pos, 1.0, maxDist)
-		}
+	if sys == nil || sys.Audio == nil || !sys.Audio.HasSound(ev.Fields[1]) {
+		return
+	}
+	actor := d.flagActor(ev.Fields[2])
+	if actor == 0xFFFFFFFF {
+		return
+	}
+	x, y, z := d.resolveActorPos(actor, uint16(ev.Fields[2]&0xFFFF))
+	radius, volume := sys.soundSpriteParams(ev.Fields[1])
+	sys.Audio.Play(ev.Fields[1], ae.id, [3]float32{x, y, z}, volume, ev.Floats[0]*radius)
+}
+
+// stopSound stops a CreateSound event's sound.
+func (d *SpellEventDriver) stopSound(ae *ActiveEvent) {
+	if sys := d.effDriver.system; sys != nil && sys.Audio != nil {
+		sys.Audio.Stop(ae.id)
 	}
 }
 
@@ -1237,6 +1286,7 @@ func (d *SpellEventDriver) newFadeSprite(ev *esf.SpellEvent, now time.Time) {
 
 	ae := &ActiveEvent{
 		eventType: ev.EventType,
+		localID:   ev.Fields[0],
 		id:        ev.Fields[0],
 		event:     ev,
 		startTime: now,
@@ -1248,33 +1298,29 @@ func (d *SpellEventDriver) newFadeSprite(ev *esf.SpellEvent, now time.Time) {
 	d.activeEvents = append(d.activeEvents, ae)
 }
 
-// newDestroyByType destroys the first active event matching the given type and ID.
-// PS2 behavior differs by type:
-//   - Emitters (type 3): Move to inactiveEvents for deferred drain (particles fade out)
-//   - Sprites (type 9): Immediate DestroyActiveEvent (no deferred cleanup)
-//   - Sounds (type 11): Immediate DestroyActiveEvent (no deferred cleanup)
+// newDestroyByType is NewDestroyEmitter / NewDestroySound / NewDestroySprite:
+// the first active event of the type with that Fields[0] (findActive).
+//   - Emitters (type 3): moved to inactiveEvents to drain (particles fade out)
+//   - Sprites (type 9) and sounds (type 11): deleted at once, a sound stopping
 func (d *SpellEventDriver) newDestroyByType(ev *esf.SpellEvent, matchType uint32) {
-	id := d.resolveGlobalID(ev.Fields[0])
-	for i, ae := range d.activeEvents {
-		if ae.eventType == matchType && ae.id == id {
-			if matchType == 3 {
-				// PS2: DestroyEmitter moves to inactiveEvents. ProcessInactiveEvents
-				// then calls ProcessCreateEmitter(isActive=false) until particles drain.
-				if d.effDriver.particles != nil {
-					d.effDriver.particles.DrainEmitter(ae.id)
-				}
-				d.inactiveEvents = append(d.inactiveEvents, ae)
-			}
-			if matchType == 11 {
-				// Stop audio playback for this sound
-				if audio := d.effDriver.system.Audio; audio != nil {
-					audio.Stop(ae.id)
-				}
-			}
-			// Remove from active list (emitters go to inactive, sprites/sounds just removed)
+	ae := d.findActive(matchType, ev.Fields[0])
+	if ae == nil {
+		return
+	}
+	for i, x := range d.activeEvents {
+		if x == ae {
 			d.activeEvents = append(d.activeEvents[:i], d.activeEvents[i+1:]...)
-			return
+			break
 		}
+	}
+	switch matchType {
+	case 3:
+		if d.effDriver.particles != nil {
+			d.effDriver.particles.DrainEmitter(ae.id)
+		}
+		d.inactiveEvents = append(d.inactiveEvents, ae)
+	case 11:
+		d.stopSound(ae)
 	}
 }
 
@@ -1366,76 +1412,100 @@ func (d *SpellEventDriver) newPlayAttack(ev *esf.SpellEvent) {
 	d.armSpellFXTriggers()
 }
 
+// newShakeCamera is VISpellEventDriver::NewShakeCamera. It acts only when this
+// list's actor is the local player. Fields[0] bit 16 starts a shake at speed
+// Fields[1] (low byte: 0 stops it, 1-3 slow/medium/fast) with amplitude
+// Floats[0]; bit 17 ramps the amplitude to Floats[1] over Floats[2] seconds.
+// The port's own model (a decaying sine with a duration) is gone with it.
 func (d *SpellEventDriver) newShakeCamera(ev *esf.SpellEvent) {
-	// PS2 NewShakeCamera at 0x00476638:
-	//   Fields[0] = flags bitmask: bit 16 = enable shake, bit 17 = enable interpolation
-	//   Fields[1] = speed enum (low byte, 0-3): 0=stop, 1=slow, 2=medium, 3=fast
-	//   Floats[0] = shake amplitude/magnitude
-	//   Floats[1] = target magnitude (for ShakeTerp interpolation end value)
-	//   Floats[2] = duration in seconds (for ShakeTerp interpolation)
-	flags := ev.Fields[0]
-	amplitude := ev.Floats[0]
-	targetMag := ev.Floats[1]
-	durationSec := ev.Floats[2]
-
-	if d.effDriver.system == nil {
+	sys := d.effDriver.system
+	if sys == nil || sys.IsPlayer == nil || !sys.IsPlayer(d.actorID) {
 		return
 	}
-
-	// PS2 checks bit 16 for shake, bit 17 for interpolation.
-	// PS2 also uses Fields[1] low byte as speed enum (0=stop, 1-3=speed).
-	// Speed 0 forces amplitude to 0.0 (stop shaking).
-	speed := ev.Fields[1] & 0xFF
-	if flags&0x10000 != 0 {
-		// PS2: speed=0 forces amplitude to 0.0 (stop shake command)
-		if speed == 0 {
-			amplitude = 0
-		}
-		if amplitude > 0 {
-			d.effDriver.system.ShakeStartTime = time.Now()
-			d.effDriver.system.ShakeDuration = time.Duration(durationSec*1000) * time.Millisecond
-			if d.effDriver.system.ShakeDuration <= 0 {
-				d.effDriver.system.ShakeDuration = 500 * time.Millisecond
-			}
-			d.effDriver.system.ShakeAmplitude = amplitude
-		} else {
-			// Stop shaking
-			d.effDriver.system.ShakeDuration = 0
-			d.effDriver.system.ShakeAmplitude = 0
+	ce := &sys.Camera
+	speed := int32(uint8(ev.Fields[1]))
+	if ev.Fields[0]&0x10000 != 0 {
+		switch speed {
+		case 0:
+			ce.Shake(0, 0)
+		case 1, 2, 3:
+			ce.Shake(speed, ev.Floats[0])
 		}
 	}
-	if flags&0x20000 != 0 {
-		// Interpolation mode: ramp to targetMag over durationSec
-		if durationSec <= 0 {
-			// Instant snap to target magnitude
-			d.effDriver.system.ShakeAmplitude = targetMag
-		} else {
-			d.effDriver.system.ShakeStartTime = time.Now()
-			d.effDriver.system.ShakeDuration = time.Duration(durationSec*1000) * time.Millisecond
-			d.effDriver.system.ShakeAmplitude = targetMag
-		}
+	if ev.Fields[0]&0x20000 != 0 {
+		ce.ShakeTerp(ev.Floats[1], ev.Floats[2])
 	}
 }
 
-// CameraShakeOffset returns the current XY camera offset from active shake effects.
-// Returns (0,0) if no shake is active.
-func (sys *SpellEffectSystem) CameraShakeOffset() (float32, float32) {
-	if sys == nil || sys.ShakeDuration == 0 {
-		return 0, 0
+// CameraEffect is VICameraEffect's shake (its manual camera move is not used by
+// spells). The speed picks a cycle of samples, and each Apply bobs the eye by
+// amplitude·0.025 and the look direction by amplitude·0.009 times the next
+// sample, VERTICALLY only. It does not end by itself: a speed-0 Shake stops it,
+// and a ShakeTerp to 0 silences it.
+type CameraEffect struct {
+	speed         int32
+	sample        int32
+	amplitude     float32
+	amplitudeEnd  float32
+	amplitudeRate float32
+}
+
+// shakeCount and shakeSample are VICameraEffect's two file-scope tables.
+var shakeCount = [4]int32{0, 6, 4, 2}
+var shakeSample = [4][6]float32{
+	{0, 0, 0, 0, 0, 0},
+	{1, 0.7, -0.7, -1, -0.7, 0.7},
+	{1, 1, -1, -1, 0, 0},
+	{1, -1, 0, 0, 0, 0},
+}
+
+// Shake is VICameraEffect::Shake.
+func (c *CameraEffect) Shake(speed int32, amp float32) {
+	c.speed = speed
+	c.amplitude = amp
+	c.amplitudeEnd = amp
+	c.amplitudeRate = 0
+}
+
+// ShakeTerp is VICameraEffect::ShakeTerp: ramp from the last target to amp
+// over time seconds (at once when time is 0).
+func (c *CameraEffect) ShakeTerp(amp, time float32) {
+	if time == 0 {
+		c.Shake(c.speed, amp)
+		return
 	}
-	elapsed := time.Since(sys.ShakeStartTime)
-	if elapsed >= sys.ShakeDuration {
-		sys.ShakeDuration = 0
-		return 0, 0
+	from := c.amplitudeEnd
+	c.amplitudeEnd = amp
+	c.amplitude = from
+	c.amplitudeRate = (amp - from) / time
+}
+
+// Update is VICameraEffect::Update's shake half: the amplitude ramp, dt in
+// seconds.
+func (c *CameraEffect) Update(dt float32) {
+	if c.speed == 0 || c.amplitudeRate == 0 {
+		return
 	}
-	// Decaying sinusoidal shake
-	progress := float32(elapsed.Seconds())
-	decay := 1.0 - float32(elapsed)/float32(sys.ShakeDuration)
-	amp := sys.ShakeAmplitude * decay
-	// Use different frequencies for X and Y to avoid circular motion
-	ox := amp * float32(math.Sin(float64(progress)*37.0))
-	oy := amp * float32(math.Sin(float64(progress)*53.0))
-	return ox, oy
+	c.amplitude += c.amplitudeRate * dt
+	if (c.amplitudeRate > 0 && c.amplitude >= c.amplitudeEnd) ||
+		(c.amplitudeRate < 0 && c.amplitude <= c.amplitudeEnd) {
+		c.amplitude = c.amplitudeEnd
+		c.amplitudeRate = 0
+	}
+}
+
+// Apply is VICameraEffect::Apply's shake half, once per frame: pos is the eye
+// and dir the look direction, which comes back normalized and bobbed.
+func (c *CameraEffect) Apply(pos, dir *[3]float32) {
+	if c.speed <= 0 || c.speed > 3 {
+		return
+	}
+	*dir = vnorm(*dir)
+	c.sample %= shakeCount[c.speed]
+	s := shakeSample[c.speed][c.sample]
+	pos[1] += c.amplitude * 0.025 * s
+	dir[1] += c.amplitude * 0.009 * s
+	c.sample++
 }
 
 // --- Spell Effect Driver (manages one active spell) ---
@@ -1526,6 +1596,15 @@ func (d *SpellEffectDriver) trackEmitter(emitterID int32) {
 // Called when the driver finishes or is force-expired.
 // PS2: emitters are destroyed with their parent VISpellEffectDriver.
 func (d *SpellEffectDriver) cleanupEmitters() {
+	// Sounds still playing (the 60 s timeout, StopAll) stop with the driver,
+	// as ~VISpellEventDriver deleting their events releases the sound actors.
+	for _, ed := range d.eventDrivers {
+		for _, ae := range ed.activeEvents {
+			if ae.eventType == 11 {
+				ed.stopSound(ae)
+			}
+		}
+	}
 	if d.particles == nil {
 		return
 	}
@@ -1587,10 +1666,15 @@ type SpellEffectSystem struct {
 	deltaTime float32
 	dtHistory [8]float32
 
-	// Camera shake state (from ShakeCamera event type 17)
-	ShakeStartTime time.Time
-	ShakeDuration  time.Duration
-	ShakeAmplitude float32
+	nextSoundID int32 // newSoundID's counter
+
+	// Camera is the VICameraEffect a ShakeCamera event (type 17) drives. The
+	// client runs Camera.Update(dt) and Camera.Apply(&eye, &dir) each frame.
+	Camera CameraEffect
+
+	// IsPlayer reports whether an actor is the local player, the only actor a
+	// ShakeCamera event acts for (VISpellEffectDriver::m_playerActor).
+	IsPlayer func(objID uint32) bool
 
 	// Audio system for spell sound playback (nil = no audio).
 	Audio AudioPlayer
@@ -1636,11 +1720,45 @@ type SpellEffectSystem struct {
 }
 
 // NewSpellEffectSystem creates a new spell effect system.
+// VIParticleSystem::Init seeds the delta-time history with 1/30 s.
 func NewSpellEffectSystem(db *SpellFXDB) *SpellEffectSystem {
-	return &SpellEffectSystem{
+	sys := &SpellEffectSystem{
 		db:        db,
 		Particles: NewParticleSystem(db),
 	}
+	for i := range sys.dtHistory {
+		sys.dtHistory[i] = 1.0 / 30.0
+	}
+	return sys
+}
+
+// newSoundID gives each spell sound an audio ID of its own, clear of the IDs
+// the client's other sounds use (0, negative object IDs, 9990/9991).
+func (sys *SpellEffectSystem) newSoundID() int32 {
+	sys.nextSoundID++
+	return 0x100000 + sys.nextSoundID
+}
+
+// soundSpriteParams is a SoundSprite's radius and volume as ParseSoundSpriteObj
+// reads them: the 0xB101 header's two floats, or 1 and 1 when the header is
+// version 0. (esf.SoundSprite calls them InnerRadius and OuterRadius.)
+func (sys *SpellEffectSystem) soundSpriteParams(dictID int32) (radius, volume float32) {
+	radius, volume = 1, 1
+	if sys.db == nil || sys.db.File() == nil {
+		return
+	}
+	obj, err := sys.db.File().FindObject(dictID)
+	if err != nil {
+		return
+	}
+	ss, ok := obj.(*esf.SoundSprite)
+	if !ok {
+		return
+	}
+	if h := ss.ObjInfo().Child(esf.TypeSoundSpriteHeader); h != nil && h.Version > 0 {
+		return ss.InnerRadius, ss.OuterRadius
+	}
+	return
 }
 
 // Play starts a spell effect playback.
@@ -1779,65 +1897,8 @@ func (d *SpellEventDriver) updateEmitterPositions(dt float32) {
 		return
 	}
 	for _, ae := range d.activeEvents {
-		if ae.eventType != 3 {
-			continue
-		}
-		actorID := d.actorID
-		if ae.event.Fields[2]&0x10000 != 0 {
-			actorID = d.effDriver.casterObjID
-		}
-		if ae.event.Fields[2]&0x20000 != 0 {
-			actorID = d.effDriver.targetObjID
-		}
-		ax, ay, az := d.resolveActorPos(actorID, ae.nodeID)
-
-		var ox, oy, oz float32
-		if ae.emitShape >= 1 && ae.emitShape <= 3 {
-			ev := ae.event
-			t := float32(math.Sin(float64(ae.emitRadParam)))*0.5 + 0.5
-			interpR := ev.Floats[0] + (ev.Floats[1]-ev.Floats[0])*t
-			extent := ev.Floats[4]
-			sinA := float32(math.Sin(float64(ae.emitAngle)))
-			cosA := float32(math.Cos(float64(ae.emitAngle)))
-			switch ae.emitShape {
-			case 1:
-				ox = interpR
-				oy = extent * cosA
-				oz = -extent * sinA
-			case 2:
-				ox = -extent * sinA
-				oy = interpR
-				oz = extent * cosA
-			case 3:
-				ox = extent * cosA
-				oy = -extent * sinA
-				oz = interpR
-			}
-		}
-
-		if (ox != 0 || oy != 0 || oz != 0) && d.effDriver.resolveFacing != nil {
-			facing := d.effDriver.resolveFacing(actorID)
-			cosF := float32(math.Cos(float64(facing)))
-			sinF := float32(math.Sin(float64(facing)))
-			rx := ox*cosF + oz*sinF
-			rz := -ox*sinF + oz*cosF
-			ox, oz = rx, rz
-		}
-
-		for _, em := range d.effDriver.particles.emitters {
-			if em.emitterID == ae.id {
-				em.SetPosition(ax+ox, ay+oy, az+oz)
-				em.SetTrackPos(ax, ay, az)
-				if d.effDriver.resolveFacing != nil {
-					em.SetFacing(d.effDriver.resolveFacing(actorID))
-				}
-				if ae.attractorStrength > 0 && d.effDriver.resolvePos != nil {
-					tx, ty, tz := d.effDriver.resolvePos(uint32(ae.attractorTarget))
-					em.attractorPos = [3]float32{tx, ty, tz}
-					em.attractorStrength = ae.attractorStrength
-					em.attractorActive = true
-				}
-			}
+		if ae.eventType == 3 {
+			d.placeEmitter(ae)
 		}
 	}
 }

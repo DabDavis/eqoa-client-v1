@@ -365,6 +365,33 @@ func (l *Loader) FindNearbyZones(x, z, radius float32) []int {
 	return result
 }
 
+// ZonesWithin returns the zones whose box is within radius of (x, y, z) in 3D:
+// VIWorld::StreamLeaf's test, VIBBox::DistanceSquared against the radius
+// squared.
+func (l *Loader) ZonesWithin(x, y, z, radius float32) []int {
+	if l.proxies == nil {
+		return nil
+	}
+	gap := func(v, lo, hi float32) float32 {
+		switch {
+		case v < lo:
+			return lo - v
+		case v > hi:
+			return v - hi
+		}
+		return 0
+	}
+	var result []int
+	for i := range l.proxies.Zones {
+		bb := &l.proxies.Zones[i].BBox
+		dx, dy, dz := gap(x, bb.MinX, bb.MaxX), gap(y, bb.MinY, bb.MaxY), gap(z, bb.MinZ, bb.MaxZ)
+		if dx*dx+dy*dy+dz*dz < radius*radius {
+			result = append(result, i)
+		}
+	}
+	return result
+}
+
 // EnsureZoneLoaded queues a zone for loading if not already loaded/loading.
 // Loading is serialized (one at a time) because esf.ObjFile is not goroutine-safe.
 func (l *Loader) EnsureZoneLoaded(proxyIndex int) {
@@ -677,19 +704,14 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 					sp.Transform(&pbl)
 					sp.Transform(&pc)
 
-					// Flora type from vertices (CollBuffer type 5 stores per-vertex flora set; type 3 = no flora)
-					ft := a.FloraType
-					if ft < 0 {
-						ft = b.FloraType
-					}
-					if ft < 0 {
-						ft = c.FloraType
-					}
+					// The flora set is the NEWEST strip vertex's byte
+					// (VICollide::QueryBufferVGF hands Intersect vertex i+2's).
 					ct := CollTriangle{
 						X0: pa.X, Y0: pa.Y, Z0: pa.Z,
 						X1: pbl.X, Y1: pbl.Y, Z1: pbl.Z,
 						X2: pc.X, Y2: pc.Y, Z2: pc.Z,
-						FloraType: ft,
+						FloraType: c.FloraType,
+						Room:      sp.IsRoom,
 					}
 
 					// Skip degenerate collision triangles.
@@ -800,6 +822,15 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 					sp.Transform(&pa)
 					sp.Transform(&pb)
 					sp.Transform(&pc)
+					// The sun is lit in world space, so the normals turn with
+					// the actor; unturned, a rotated prop was lit as if it
+					// faced the way it was modelled.
+					na := esf.Point{X: a.NX, Y: a.NY, Z: a.NZ}
+					nb := esf.Point{X: b.NX, Y: b.NY, Z: b.NZ}
+					nc := esf.Point{X: c.NX, Y: c.NY, Z: c.NZ}
+					sp.TransformNormal(&na)
+					sp.TransformNormal(&nb)
+					sp.TransformNormal(&nc)
 
 					// The PS2's light inputs per vertex (VU1 VIRStrip2/3): RGB is
 					// light ADDED to the ambient and sun, alpha gates the sun.
@@ -860,9 +891,9 @@ func (l *Loader) loadZoneData(zone *esf.Zone, file *esf.ObjFile, placements []*e
 						v2 := c.U*m[1] + c.V*m[4] + m[7]
 
 						tri := Triangle{
-							X0: pa.X, Y0: pa.Y, Z0: pa.Z, U0: u0, V0: v0, NX0: a.NX, NY0: a.NY, NZ0: a.NZ, R0: ar, G0: ag, B0: ab, A0: aa,
-							X1: pb.X, Y1: pb.Y, Z1: pb.Z, U1: u1, V1: v1, NX1: b.NX, NY1: b.NY, NZ1: b.NZ, R1: br, G1: bg, B1: bb, A1: ba,
-							X2: pc.X, Y2: pc.Y, Z2: pc.Z, U2: u2, V2: v2, NX2: c.NX, NY2: c.NY, NZ2: c.NZ, R2: cr, G2: cg, B2: cb, A2: ca,
+							X0: pa.X, Y0: pa.Y, Z0: pa.Z, U0: u0, V0: v0, NX0: na.X, NY0: na.Y, NZ0: na.Z, R0: ar, G0: ag, B0: ab, A0: aa,
+							X1: pb.X, Y1: pb.Y, Z1: pb.Z, U1: u1, V1: v1, NX1: nb.X, NY1: nb.Y, NZ1: nb.Z, R1: br, G1: bg, B1: bb, A1: ba,
+							X2: pc.X, Y2: pc.Y, Z2: pc.Z, U2: u2, V2: v2, NX2: nc.X, NY2: nc.Y, NZ2: nc.Z, R2: cr, G2: cg, B2: cb, A2: ca,
 							TexID:      layer.TexID,
 							Layer:      int32(li),
 							URate:      layer.URate,

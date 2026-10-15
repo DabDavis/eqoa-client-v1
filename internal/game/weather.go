@@ -18,6 +18,8 @@ import (
 	"math/rand"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
+
+	"github.com/eqoa/client/internal/sky"
 )
 
 // WeatherType is the PS2 WXTYPE.
@@ -62,11 +64,11 @@ const (
 
 // Per-kind particle constants from VIAtmosphere::Init; index 0 is rain, 1 snow.
 var (
-	weatherSize    = [2]float32{0.095, 0.05}                                       // m_p88: billboard half-size
-	weatherSquashW = [2]float32{0, 0}                                              // m_p90
-	weatherSquashH = [2]float32{0.8, 0}                                            // m_p98
+	weatherSize    = [2]float32{0.095, 0.05}                                           // m_p88: billboard half-size
+	weatherSquashW = [2]float32{0, 0}                                                  // m_p90
+	weatherSquashH = [2]float32{0.8, 0}                                                // m_p98
 	weatherWobble  = [2][3]float32{{0.0025, 0.008, 0.0025}, {0.0106, 0.01723, 0.0106}} // m_p50
-	weatherFall    = [2]float32{-0.21042, -0.02199}                                // m_p68.y, per 1/60 s
+	weatherFall    = [2]float32{-0.21042, -0.02199}                                    // m_p68.y, per 1/60 s
 )
 
 // weatherParticle is VIWeatherParticle: its position is relative to the box
@@ -96,6 +98,8 @@ type WeatherSystem struct {
 	skyNow     int         // m_p5EC: 0 clear sky, 1 overcast
 	skyNext    int         // m_p5F0
 	defaultSky int         // m_p60C: the region's default sky (Init: 1; 2 is overcast)
+	nextSkyTex int         // m_p5F8: the sky texture a transition heads to (sky.SkyTex*)
+	skyT       float32     // m_p608 as this frame's transition saw it: 1 on completion
 
 	Intensity float32 // m_intensity
 	EffectMix float32 // m_effectMix: 0 all rain .. 1 all snow
@@ -121,11 +125,12 @@ type WeatherSystem struct {
 	Ground func(x, z float32) (y float32, water bool, ok bool)
 
 	// Lightning (ResetLightning / GetLightning).
-	cycle     float32 // m_p1198: seconds left in the 8 s cycle
-	flashAt   float32 // m_p119C: when in the cycle the flash starts
-	flashT    float32 // m_p11A0: time into the flash, 0 = none
-	flashDist float32 // m_p11A8: 0.1..0.8, dims the flash and the thunder
-	flashDur  float32 // m_p11A4
+	cycle     float32        // m_p1198: seconds left in the 8 s cycle
+	flashAt   float32        // m_p119C: when in the cycle the flash starts
+	flashT    float32        // m_p11A0: time into the flash, 0 = none
+	flashDist float32        // m_p11A8: 0.1..0.8, dims the flash and the thunder
+	flashDur  float32        // m_p11A4
+	patches   [14][4]float32 // m_patches: RecomputeLightningPatches
 	thunder   []float32
 	rainOn    bool // m_p1190 != -1: the rain voices are started
 
@@ -152,6 +157,7 @@ type WeatherSystem struct {
 func NewWeatherSystem() *WeatherSystem {
 	ws := &WeatherSystem{
 		defaultSky:  1,
+		nextSkyTex:  sky.SkyTexDefault,
 		NightFactor: 1,
 		SkyScale:    1,
 		SunAlpha:    255,
@@ -218,8 +224,10 @@ func (ws *WeatherSystem) SetWeather(t WeatherType, instant bool) {
 		if ws.defaultSky == 2 {
 			ws.skyNext = 1
 		}
+		ws.nextSkyTex = ws.defaultSky
 	} else {
 		ws.skyNext = 1
+		ws.nextSkyTex = sky.SkyTexDark
 	}
 }
 
@@ -251,6 +259,43 @@ func (ws *WeatherSystem) resetLightning() {
 	ws.cycle = 8
 	ws.flashAt = ws.flashDist * 6
 	ws.flashDur = ws.rand255()*0.6 + 0.6
+	ws.recomputeLightningPatches()
+}
+
+// recomputeLightningPatches is VIAtmosphere::RecomputeLightningPatches: 14
+// patches 100 out — (0, 100, 0) turned by a random heading within ±0.45π and
+// pitch and roll within ±0.32π — each 70..90 across.
+func (ws *WeatherSystem) recomputeLightningPatches() {
+	for i := range ws.patches {
+		h := float64(128-ws.rng.Intn(256)) / 128 * 0.45 * math.Pi
+		p := float64(128-ws.rng.Intn(256)) / 128 * 0.32 * math.Pi
+		r := float64(128-ws.rng.Intn(256)) / 128 * 0.32 * math.Pi
+		sh, ch := math.Sincos(h)
+		sp, cp := math.Sincos(p)
+		sr, cr := math.Sincos(r)
+		// (0, 100, 0) × RotateHPR: 100 × the matrix's row 1.
+		ws.patches[i] = [4]float32{
+			float32(100 * (-sr*ch + cr*sp*sh)),
+			float32(100 * (cr * cp)),
+			float32(100 * (sr*sh + cr*sp*ch)),
+			ws.rand255()*20 + 70,
+		}
+	}
+}
+
+// SkyAtmosphere is the state the sky's passes read (RenderSky, RenderStars
+// and ProcessTransitions' dome material). The caller adds the sky colour.
+func (ws *WeatherSystem) SkyAtmosphere() sky.Atmosphere {
+	return sky.Atmosphere{
+		NightFactor: ws.NightFactor,
+		SkyScale:    ws.SkyScale,
+		SunAlpha:    ws.SunAlpha,
+		CoronaAlpha: ws.CoronaAlpha,
+		Transition:  ws.skyT,
+		NextSky:     ws.nextSkyTex,
+		Flash:       ws.LightningBrightness,
+		Patches:     ws.patches,
+	}
 }
 
 // overcastInterp is VIAtmosphere::GetOvercastInterp.
@@ -296,9 +341,11 @@ func (ws *WeatherSystem) Update(dt, gameHour float32, camera rl.Camera3D) {
 // processTransitions is VIAtmosphere::ProcessTransitions minus the sky-dome
 // material work, which the sky does from t, skyNow and skyNext.
 func (ws *WeatherSystem) processTransitions(dt, hour float32) {
+	ws.skyT = 0
 	if ws.t != 0 {
 		ws.NightFactor = nightFactor(hour)
 		ws.t = min(ws.t+dt/weatherFadeTime, 1)
+		ws.skyT = ws.t
 
 		var alpha int
 		switch {
@@ -411,6 +458,10 @@ func (ws *WeatherSystem) getLightning(dt float32) float32 {
 	}
 	if ws.flashT >= ws.flashDur {
 		ws.flashT = 0
+	}
+	// Past the flash's midpoint, a new set of patches 6 times in 16.
+	if h := ws.flashDur * 0.5; t <= h && h < ws.flashT && ws.rng.Intn(16) < 6 {
+		ws.recomputeLightningPatches()
 	}
 	c := min(max(0, b), 1)
 	return c * (1 - ws.flashDist) * 0.8

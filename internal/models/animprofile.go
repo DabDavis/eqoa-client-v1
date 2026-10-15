@@ -99,3 +99,114 @@ var nonHumanoidProfile = AnimProfile{
 // profileOverrides maps specific model DictIDs to non-default AnimProfiles.
 // Final fallback for edge cases that don't fit SkelType-based assignment.
 var profileOverrides = map[int32]AnimProfile{}
+
+// ApplyDefaultEntries is VICSprite::SetDefaultEntries (decomp/src/vicsprite.cpp,
+// run by ParseCSpriteObj right after the play list is parsed): every slot the
+// ESF left empty — no entry, or an entry whose upper animation did not
+// resolve — becomes a COPY of a related one, the whole entry (animations,
+// weight, sync, sounds). Most come from idle (0), the attack families from 23
+// or 22, and 65 from 41 at half weight. Slots 7, 34 and the emotes copied
+// from idle play once. Slots with no case (19-21, 47-49, 54, 55, 58, 62) stay
+// empty. It is idempotent: a second call finds every slot it fills full.
+//
+// It is what makes an attack slot a model lacks play something sensible:
+// throwing (attack type 8) asks for 35/32, which no player body has, and gets
+// 23/22; a creature's alt attack 25/24 gets its 23/22.
+func ApplyDefaultEntries(m *CharModel) {
+	if m == nil || m.PLSlotToRawPair == nil {
+		return
+	}
+	has := func(slot int) bool {
+		pair, ok := m.PLSlotToRawPair[slot]
+		return ok && pair[0] >= 0
+	}
+	// copyEntry copies slot src into dst; once != nil forces the sync.
+	copyEntry := func(dst, src int, once *bool) {
+		pair, ok := m.PLSlotToRawPair[src]
+		if !ok {
+			// m_entries[src] is the constructor's: no animation, weight 1,
+			// loop. Copying it leaves dst empty, as on the PS2.
+			return
+		}
+		m.PLSlotToRawPair[dst] = pair
+		if m.PLSlotToRaw != nil {
+			if raw, ok := m.PLSlotToRaw[src]; ok {
+				m.PLSlotToRaw[dst] = raw
+			} else {
+				delete(m.PLSlotToRaw, dst)
+			}
+		}
+		if m.PLSlotSpeed != nil {
+			if spd, ok := m.PLSlotSpeed[src]; ok {
+				m.PLSlotSpeed[dst] = spd
+			}
+		}
+		if m.PLSlotPlayOnce != nil {
+			m.PLSlotPlayOnce[dst] = m.PLSlotPlayOnce[src]
+			if once != nil {
+				m.PLSlotPlayOnce[dst] = *once
+			}
+		}
+		if m.PLSlotSound != nil {
+			if snd, ok := m.PLSlotSound[src]; ok {
+				m.PLSlotSound[dst] = snd
+			} else {
+				delete(m.PLSlotSound, dst)
+			}
+		}
+	}
+	once := true
+	for i := 0; i < 66; i++ {
+		if has(i) {
+			continue
+		}
+		switch i {
+		case 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14,
+			15, 16, 17, 18, 37, 38, 39, 45, 46:
+			copyEntry(i, 0, nil)
+
+		case 65:
+			switch {
+			case m.Race == 9:
+				copyEntry(i, 0, &once)
+			case has(41):
+				copyEntry(i, 41, nil)
+				if m.PLSlotSpeed != nil {
+					if _, ok := m.PLSlotToRawPair[i]; ok {
+						spd, ok := m.PLSlotSpeed[i]
+						if !ok {
+							spd = 1 // m_weight's constructor value
+						}
+						m.PLSlotSpeed[i] = spd * 0.5
+					}
+				}
+			default:
+				copyEntry(i, 0, &once)
+			}
+			// m_sound[0] = m_sound[1] = -1.
+			if m.PLSlotSound != nil {
+				delete(m.PLSlotSound, i)
+			}
+
+		case 7, 34, 56, 57, 59, 60, 61, 63, 64:
+			copyEntry(i, 0, &once)
+
+		case 23, 25, 26, 28, 29, 31, 33, 35, 41, 42, 43, 44, 50, 51, 52, 53:
+			if has(23) {
+				copyEntry(i, 23, nil)
+			} else {
+				copyEntry(i, 0, &once)
+			}
+
+		case 22, 24, 27, 30, 32, 36, 40:
+			switch {
+			case has(22):
+				copyEntry(i, 22, nil)
+			case has(23):
+				copyEntry(i, 23, nil)
+			default:
+				copyEntry(i, 0, &once)
+			}
+		}
+	}
+}

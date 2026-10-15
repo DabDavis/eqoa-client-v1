@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"sync"
+	"time"
 	"unsafe"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -17,6 +18,7 @@ import (
 type soundData struct {
 	pcm        []int16
 	sampleRate int32
+	loopStart  int // sample a repeating voice restarts at (vagLoopStart); 0 = none
 }
 
 // System manages all audio playback for the EQOA client.
@@ -36,6 +38,21 @@ type System struct {
 	bgmActive  bool            // true if bgm is loaded and playing
 	bgmPath    string          // path of currently playing BGM
 	bgmVol     float32         // BGM volume (0-1)
+	// VISoundDevice::StreamBgm's fade: m_bgmFade (1 while playing) and a
+	// fade-out in progress, with the request that starts once it is silent.
+	bgmFade     float32
+	bgmFadeOut  bool
+	bgmPending  *bgmRequest
+	bgmLastTick time.Time
+
+	voiceSeq int32 // last PlayVoice handle
+	rainOn   bool  // the two rain_lt voices are running
+	rainVoices [2]int32
+
+	// VIScene::SetSoundTrack's two ambient slots (ambientmix.go).
+	ambMix    ambientMix
+	ambVoices [2]ambVoice
+	ambStart  time.Time
 
 	// Ambient track state (plays alongside BGM)
 	ambMusic   rl.Music        // currently playing ambient loop
@@ -54,6 +71,11 @@ type ActiveSound struct {
 	MaxDist  float32    // max audible distance
 	ID       int32      // spell event ID for matching
 	Loop     bool       // if true, restart when finished (continuous sounds)
+	// Fixed: volume and pan were set once at the start (PlayVoice) and are
+	// not re-derived from the position; Volume holds what was set.
+	Fixed bool
+	Pan   float32
+	Voice int32 // PlayVoice's handle, 0 for the other kinds
 }
 
 // NewSystem creates the audio system and initializes the raylib audio device.
@@ -74,7 +96,11 @@ func (s *System) Close() {
 
 	// Stop BGM and ambient
 	s.stopBGMLocked()
+	s.bgmPending = nil
 	s.stopAmbientLocked()
+	for j := range s.ambVoices {
+		s.ambVoices[j].stop()
+	}
 
 	// Unload all active sound instances
 	for _, a := range s.active {
@@ -144,7 +170,7 @@ func (s *System) LoadModelSounds(clips []esf.SoundClip) int {
 		if sr <= 0 {
 			sr = 11025
 		}
-		s.sounds[clip.DictID] = &soundData{pcm: pcm, sampleRate: sr}
+		s.sounds[clip.DictID] = &soundData{pcm: pcm, sampleRate: sr, loopStart: vagLoopStart(clip.RawVAG)}
 		count++
 	}
 	return count
@@ -186,21 +212,53 @@ func (s *System) parseSoundSprite(file *esf.ObjFile, info *esf.ObjInfo) (int32, 
 			continue
 		}
 
-		return dictID, &soundData{pcm: pcm, sampleRate: params.SampleRate}, true
+		return dictID, &soundData{pcm: pcm, sampleRate: params.SampleRate, loopStart: vagLoopStart(vagData)}, true
 	}
 
 	return 0, nil, false
 }
 
+// LoadAdpcmSounds registers the file's bare Adpcm (0xB000) objects under the
+// DictID in their own header — ParseAdpcmObj's, which needs no SoundSprite
+// around it. SKY.CSF holds rain_lt and lightning_far02 only that way, so
+// LoadSpellSounds (SoundSprites only) never found them and rain and thunder
+// were silent.
+func (s *System) LoadAdpcmSounds(file *esf.ObjFile) int {
+	if s == nil || file == nil {
+		return 0
+	}
+	file.BuildDictionary()
+	count := 0
+	for _, info := range file.AllObjects() {
+		if info.Type != esf.TypeAdpcm {
+			continue
+		}
+		params, vagData := s.parseAdpcm(file, info)
+		if params.DictID == 0 || vagData == nil {
+			continue
+		}
+		pcm := DecodeVAG(vagData)
+		if len(pcm) == 0 {
+			continue
+		}
+		s.mu.Lock()
+		s.sounds[params.DictID] = &soundData{pcm: pcm, sampleRate: params.SampleRate, loopStart: vagLoopStart(vagData)}
+		s.mu.Unlock()
+		count++
+	}
+	return count
+}
+
 // adpcmParams holds parsed AdpcmHeader fields (PS2: 7 × int32/float32 = 28 bytes).
+// ParseAdpcmObj reads them as id, channels, blocks, rate, volume, pan, loop.
 type adpcmParams struct {
 	DictID     int32
 	Channels   int32
 	NumBlocks  int32
 	SampleRate int32
-	Volume1    float32
-	Volume2    float32
-	LoopStart  int32
+	Volume1    float32 // volume
+	Volume2    float32 // pan
+	LoopStart  int32   // a FLAG: 1 when the clip carries a trailing loop block
 }
 
 // parseAdpcm reads the AdpcmHeader (0xb010) and raw audio data (0xb020) children.
@@ -241,13 +299,19 @@ func (s *System) parseAdpcm(file *esf.ObjFile, info *esf.ObjInfo) (adpcmParams, 
 
 // newSoundInstance creates a fresh raylib Sound from stored PCM data.
 // Each call returns an independent playback handle that must be UnloadSound'd.
-func newSoundInstance(sd *soundData) rl.Sound {
+// A looping instance starts at the clip's loop block, so each restart repeats
+// the loop the way the SPU does rather than the silent lead-in before it.
+func newSoundInstance(sd *soundData, loop bool) rl.Sound {
+	pcm := sd.pcm
+	if loop && sd.loopStart > 0 && sd.loopStart < len(pcm) {
+		pcm = pcm[sd.loopStart:]
+	}
 	wave := rl.Wave{
-		FrameCount: uint32(len(sd.pcm)),
+		FrameCount: uint32(len(pcm)),
 		SampleRate: uint32(sd.sampleRate),
 		SampleSize: 16,
 		Channels:   1,
-		Data:       unsafe.Pointer(&sd.pcm[0]),
+		Data:       unsafe.Pointer(&pcm[0]),
 	}
 	return rl.LoadSoundFromWave(wave)
 }
@@ -268,7 +332,7 @@ func (s *System) Play(dictID int32, id int32, pos [3]float32, volume, maxDist fl
 	}
 
 	// Create independent sound instance
-	snd := newSoundInstance(sd)
+	snd := newSoundInstance(sd, false)
 
 	// Calculate distance-based volume, scaled by SFX volume
 	vol := s.calcVolume(pos, volume, maxDist) * s.sfxVolume
@@ -303,7 +367,7 @@ func (s *System) PlayLoop(dictID int32, id int32, pos [3]float32, volume, maxDis
 		return false
 	}
 
-	snd := newSoundInstance(sd)
+	snd := newSoundInstance(sd, true)
 	vol := s.calcVolume(pos, volume, maxDist) * s.sfxVolume
 	pan := s.calcPan(pos)
 
@@ -394,6 +458,9 @@ func (s *System) Update() {
 			continue
 		}
 
+		if a.Fixed {
+			continue
+		}
 		// Update volume/pan based on current listener position
 		vol := s.calcVolume(a.Position, a.Volume, a.MaxDist) * s.sfxVolume
 		pan := s.calcPan(a.Position)
@@ -443,6 +510,150 @@ func panFor(cam, dir, src [3]float32) float32 {
 	return (dx*rx + dz*rz) / (dl * rn)
 }
 
+// CalcVolumeAndPan is VICSprite::CalcVolumeAndPan (vicsprite.cpp:1376) from
+// the listener: the volume falls off linearly to nothing at 50 units of 3D
+// distance, and the pan is panFor's; out of earshot both are 0.
+func (s *System) CalcVolumeAndPan(pos [3]float32) (vol, pan float32) {
+	if s == nil {
+		return 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return calcVolumeAndPan(s.listener, s.camDir, pos)
+}
+
+func calcVolumeAndPan(cam, dir, at [3]float32) (vol, pan float32) {
+	dx, dy, dz := cam[0]-at[0], cam[1]-at[1], cam[2]-at[2]
+	vol = float32(math.Sqrt(float64(dx*dx+dy*dy+dz*dz))) * 0.02
+	vol = min(1, max(0, 1-vol))
+	if vol > 0 {
+		pan = panFor(cam, dir, at)
+	}
+	return vol, pan
+}
+
+// SPU pitch: 4096 plays a clip at its own rate.
+const pitchUnity = 4096
+
+// PlayVoice plays dictID once with its volume, pan and pitch (4096 = the
+// clip's own rate) set at the start and left there: VISoundDevice::Play then
+// SetVolume / SetPan / SetPitch, the way VICSprite::Process and
+// VIAtmosphere start a sound. Returns a handle for StopVoice, 0 when nothing
+// played.
+func (s *System) PlayVoice(dictID int32, vol, pan float32, pitch int) int32 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.playVoiceLocked(dictID, vol, pan, pitch, false)
+}
+
+func (s *System) playVoiceLocked(dictID int32, vol, pan float32, pitch int, loop bool) int32 {
+	if s.sfxMuted {
+		return 0
+	}
+	sd, ok := s.sounds[dictID]
+	if !ok {
+		return 0
+	}
+	snd := newSoundInstance(sd, loop)
+	rl.SetSoundVolume(snd, vol*s.sfxVolume)
+	rl.SetSoundPan(snd, pan)
+	rl.SetSoundPitch(snd, float32(pitch)/pitchUnity)
+	rl.PlaySound(snd)
+	s.voiceSeq++
+	if s.voiceSeq <= 0 {
+		s.voiceSeq = 1
+	}
+	s.active = append(s.active, &ActiveSound{
+		DictID: dictID, Sound: snd, Volume: vol, Pan: pan, ID: math.MinInt32,
+		Fixed: true, Loop: loop, Voice: s.voiceSeq,
+	})
+	return s.voiceSeq
+}
+
+// StopVoice stops a PlayVoice sound; a handle that has finished is ignored.
+func (s *System) StopVoice(h int32) {
+	if s == nil || h == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopVoiceLocked(h)
+}
+
+func (s *System) stopVoiceLocked(h int32) {
+	for i := len(s.active) - 1; i >= 0; i-- {
+		if s.active[i].Voice == h {
+			rl.StopSound(s.active[i].Sound)
+			rl.UnloadSound(s.active[i].Sound)
+			s.active = append(s.active[:i], s.active[i+1:]...)
+			return
+		}
+	}
+}
+
+// setVoiceVolumeLocked is VISoundDevice::SetVolume on a running voice.
+func (s *System) setVoiceVolumeLocked(h int32, vol float32) {
+	for _, a := range s.active {
+		if a.Voice == h {
+			a.Volume = vol
+			rl.SetSoundVolume(a.Sound, vol*s.sfxVolume)
+			return
+		}
+	}
+}
+
+// The weather's sounds (VIAtmosphere::SetResources), bare Adpcm objects in
+// SKY.CSF: load them with LoadAdpcmSounds.
+var (
+	RainSoundID    = esf.HashResourceID("rain_lt")         // 0x06A03517
+	ThunderSoundID = esf.HashResourceID("lightning_far02") // 0xFC286CA8
+)
+
+// SetRain keeps VIAtmosphere::ProcessTransitions' rain going: two rain_lt
+// voices, panned hard left and hard right, the right one pitched to 4176, each
+// at vol (the caller's intensity × (1 − effect mix) × 0.5 × outdoors). on =
+// false stops them.
+func (s *System) SetRain(on bool, vol float32) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !on {
+		if s.rainOn {
+			s.stopVoiceLocked(s.rainVoices[0])
+			s.stopVoiceLocked(s.rainVoices[1])
+			s.rainOn = false
+		}
+		return
+	}
+	if !s.rainOn {
+		s.rainVoices[0] = s.playVoiceLocked(RainSoundID, vol, -1, pitchUnity, true)
+		s.rainVoices[1] = s.playVoiceLocked(RainSoundID, vol, 1, 4176, true)
+		s.rainOn = s.rainVoices[0] != 0
+		return
+	}
+	s.setVoiceVolumeLocked(s.rainVoices[0], vol)
+	s.setVoiceVolumeLocked(s.rainVoices[1], vol)
+}
+
+// PlayThunder is the clap at the end of VIAtmosphere's 8 s lightning cycle:
+// lightning_far02 as two voices, hard left at its own pitch and hard right
+// pitched down to 2496, each at vol ((1 − distance) × intensity × (1 − effect
+// mix) × 0.9 × outdoors, the caller's).
+func (s *System) PlayThunder(vol float32) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.playVoiceLocked(ThunderSoundID, vol, -1, pitchUnity, false)
+	s.playVoiceLocked(ThunderSoundID, vol, 1, 2496, false)
+}
+
 // HasSound returns true if a sound with the given DictID is loaded.
 func (s *System) HasSound(dictID int32) bool {
 	if s == nil {
@@ -479,8 +690,22 @@ func (s *System) SoundCount() int {
 	return len(s.sounds)
 }
 
+type bgmRequest struct {
+	key    string
+	data   []byte
+	volume float32
+}
+
+// bgmFadeStep is StreamBgm's fade, 0.05 per frame of the PS2's 30 fps game
+// loop: a track fades out over two thirds of a second.
+const bgmFadeStep = 0.05 * 30
+
 // PlayBGMData plays BGM from raw VAG ADPCM bytes (read from ISO).
 // key is used to identify the track for dedup (e.g. "BARBARIA.BGM").
+//
+// As VISoundDevice::StreamBgm does, a new track never cuts the playing one
+// off: that one fades out first (bgmFadeStep) and the new one starts, at full
+// volume, once it is silent. The latest request wins.
 func (s *System) PlayBGMData(key string, data []byte, volume float32) {
 	if s == nil {
 		return
@@ -488,15 +713,36 @@ func (s *System) PlayBGMData(key string, data []byte, volume float32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.bgmActive && s.bgmPath == key {
+	if s.bgmActive && s.bgmPath == key && !s.bgmFadeOut {
+		s.bgmPending = nil
 		return
 	}
-
+	if s.bgmActive {
+		s.bgmPending = &bgmRequest{key, data, volume}
+		s.bgmFadeOut = true
+		return
+	}
 	s.playBGMDataLocked(key, data, volume)
+}
+
+// FadeOutBGM is VISoundDevice::StopBgm: the playing track fades out and
+// stops, and nothing follows it.
+func (s *System) FadeOutBGM() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bgmPending = nil
+	if s.bgmActive {
+		s.bgmFadeOut = true
+	}
 }
 
 func (s *System) playBGMDataLocked(key string, data []byte, volume float32) {
 	s.stopBGMLocked()
+	s.bgmFade = 1
+	s.bgmFadeOut = false
 
 	// BGM files are block-interleaved stereo VAG at 44100 Hz.
 	// Decode to PCM, wrap in WAV header, use raylib Music for streaming playback.
@@ -546,13 +792,15 @@ func (s *System) playBGMDataLocked(key string, data []byte, volume float32) {
 		filepath.Base(key), len(pcm)/2, len(pcm), maxSample, minSample, len(wavData))
 }
 
-// StopBGM stops the currently playing background music.
+// StopBGM stops the currently playing background music at once, and drops
+// any track waiting on a fade. FadeOutBGM is the PS2's stop.
 func (s *System) StopBGM() {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bgmPending = nil
 	s.stopBGMLocked()
 }
 
@@ -576,13 +824,35 @@ func (s *System) ResumeBGM() {
 	rl.ResumeMusicStream(s.bgmMusic)
 }
 
-// UpdateBGM must be called each frame to feed the Music stream.
+// UpdateBGM must be called each frame to feed the Music stream. It also runs
+// the fade, by elapsed time, so calling it more than once a frame is harmless.
 func (s *System) UpdateBGM() {
-	if s == nil || !s.bgmActive {
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+	dt := float32(0)
+	if !s.bgmLastTick.IsZero() {
+		dt = min(float32(now.Sub(s.bgmLastTick).Seconds()), 0.1)
+	}
+	s.bgmLastTick = now
+	if !s.bgmActive {
+		return
+	}
+	if s.bgmFadeOut {
+		s.bgmFade -= bgmFadeStep * dt
+		if s.bgmFade <= 0 {
+			s.stopBGMLocked()
+			if p := s.bgmPending; p != nil {
+				s.bgmPending = nil
+				s.playBGMDataLocked(p.key, p.data, p.volume)
+			}
+			return
+		}
+		rl.SetMusicVolume(s.bgmMusic, s.bgmVol*s.bgmFade)
+	}
 	rl.UpdateMusicStream(s.bgmMusic)
 }
 
@@ -637,14 +907,21 @@ func (s *System) stopAmbientLocked() {
 	}
 }
 
-// UpdateAmbient must be called each frame to feed the ambient Music stream.
+// UpdateAmbient must be called each frame to feed the ambient Music streams.
 func (s *System) UpdateAmbient() {
-	if s == nil || !s.ambActive {
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rl.UpdateMusicStream(s.ambMusic)
+	if s.ambActive {
+		rl.UpdateMusicStream(s.ambMusic)
+	}
+	for j := range s.ambVoices {
+		if s.ambVoices[j].active {
+			rl.UpdateMusicStream(s.ambVoices[j].music)
+		}
+	}
 }
 
 // pcmToWAV wraps raw int16 PCM samples in a WAV header.
@@ -688,6 +965,7 @@ func (s *System) stopBGMLocked() {
 	}
 	s.bgmActive = false
 	s.bgmPath = ""
+	s.bgmFadeOut = false
 }
 
 
@@ -731,6 +1009,9 @@ func (s *System) SetSFXVolume(vol float32) {
 	// Update all active sounds with new volume
 	for _, a := range s.active {
 		v := s.calcVolume(a.Position, a.Volume, a.MaxDist) * vol
+		if a.Fixed {
+			v = a.Volume * vol
+		}
 		rl.SetSoundVolume(a.Sound, v)
 	}
 }
@@ -764,6 +1045,6 @@ func (s *System) SetBGMVolume(vol float32) {
 	defer s.mu.Unlock()
 	s.bgmVol = vol
 	if s.bgmActive {
-		rl.SetMusicVolume(s.bgmMusic, vol)
+		rl.SetMusicVolume(s.bgmMusic, vol*s.bgmFade)
 	}
 }

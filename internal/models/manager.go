@@ -118,8 +118,6 @@ func (mg *meshGroup) shouldDraw(equip *EquipmentState) bool {
 		switch mg.TextureSlot {
 		case 5: // hair — PS2 SetHair uses progressive layer visibility per raw slot ID.
 			return hairSlotVisible(mg.RawSlotID, equip)
-		case 8: // robe mesh — only show when a valid robe is equipped (0-3)
-			return equip.Robe < 4
 		}
 	}
 
@@ -150,34 +148,9 @@ func hairSlotVisible(rawSlot int, equip *EquipmentState) bool {
 	style := int(equip.HairStyle)
 	length := int(equip.HairLength)
 
-	// Gnome: facial hair slots are non-contiguous (8, 10, 17), so
-	// standard (slot-N) < style arithmetic doesn't work. Map directly.
-	if equip.Race == 3 {
-		switch {
-		case rawSlot == 8:
-			return style >= 1 // beard
-		case rawSlot == 17:
-			return style >= 2 // glasses
-		case rawSlot == 10:
-			return style >= 3 // fancy mustache
-		case rawSlot >= 11 && rawSlot <= 13:
-			// Hat layers — controlled by HairLength
-			if hasHelm {
-				return false
-			}
-			return (rawSlot - 11) < length
-		case rawSlot == 14:
-			if hasHelm {
-				return false
-			}
-			return length >= 2 && style >= 2
-		case rawSlot == 15:
-			return true // base scalp/hat mesh
-		default:
-			return true
-		}
-	}
-
+	// SetHair has no per-race case. A gnome's facial layers are 8, 10 and
+	// 17, and the general rule already gives them style ≥ 1, ≥ 3 and ≥ 2;
+	// its old branch differed only in leaving 17 visible under a helm.
 	switch {
 	case rawSlot >= 8 && rawSlot <= 10:
 		// Facial hair layers — NOT hidden by helm
@@ -475,6 +448,7 @@ in vec4 fragColor;
 uniform sampler2D texture0;
 uniform sampler2D texture1;
 uniform vec4 colDiffuse;
+uniform vec4 clothTint; // the slot's tint, on the clothing layer only
 out vec4 finalColor;
 void main() {
     vec4 cloth = texture(texture0, fragTexCoord);
@@ -484,7 +458,7 @@ void main() {
     if (alpha < 0.5) discard;
     // Recover clothing color from bilinear-filtered boundary pixels.
     vec3 cleanCloth = cloth.a > 0.01 ? cloth.rgb / cloth.a : vec3(0.0);
-    vec3 blended = cloth.a >= 0.5 ? cleanCloth : skin.rgb;
+    vec3 blended = cloth.a >= 0.5 ? cleanCloth * clothTint.rgb : skin.rgb;
     finalColor = vec4(blended * tint, 1.0);
 }
 `
@@ -579,6 +553,7 @@ type ModelManager struct {
 	clothingShader     rl.Shader        // clothing overlay: discard transparent, force opaque
 	skinShader         rl.Shader        // GPU-skinned alpha cutoff shader
 	skinClothingShader rl.Shader        // GPU-skinned clothing composite shader
+	clothTintLoc       [2]int32         // clothTint in clothingShader, skinClothingShader
 	bodySlots       map[int32]bool                    // DictIDs of body-slot textures (slots 0-4) needing dilation
 	animStates      animStateMap                      // per-entity animation state
 	boneLogCounter  int                               // throttle bone debug logging
@@ -707,6 +682,7 @@ func newManagerFromFiles(file, custFile, faceFile *esf.ObjFile) (*ModelManager, 
 	}
 	skinTex1Loc := rl.GetShaderLocation(skinClothingShader, "texture1")
 	rl.SetShaderValue(skinClothingShader, skinTex1Loc, []float32{tex1AsFloat}, rl.ShaderUniformInt)
+	clothTintLoc := [2]int32{rl.GetShaderLocation(clothingShader, "clothTint"), rl.GetShaderLocation(skinClothingShader, "clothTint")}
 	log.Printf("models: shaders loaded (cutoff=%d, clothing=%d, skin=%d)", shader.ID, clothingShader.ID, skinShader.ID)
 
 	return &ModelManager{
@@ -722,6 +698,7 @@ func newManagerFromFiles(file, custFile, faceFile *esf.ObjFile) (*ModelManager, 
 		clothingShader:     clothingShader,
 		skinShader:         skinShader,
 		skinClothingShader: skinClothingShader,
+		clothTintLoc:       clothTintLoc,
 		bodySlots:           make(map[int32]bool),
 		animStates:      make(animStateMap),
 	}, nil
@@ -789,6 +766,30 @@ func (m *ModelManager) BoneWorldPos(modelID int32, entityID uint32, nodeID uint1
 	ct := centerTransformMat(sinF, cosF, scale, cx, cy, cz, x, y, z)
 	wx, wy, wz := transformPoint(ct, bx, by, bz)
 	return wx, wy, wz, true
+}
+
+// NameAnchor is where a VINameSprite hangs: VICSprite::SetName attaches it
+// at m_node[VICSpriteNodeIDName] (3), and its Raster anchors at (0, 0.6, 0)
+// in that node's space. known is false while the model is not loaded; a
+// loaded model without node 3 (7 of CHAR.ESF's 568) has no name plate at all,
+// as SetName returns without making one.
+func (m *ModelManager) NameAnchor(modelID int32, entityID uint32, x, y, z, facing, entityScale float32) (wx, wy, wz float32, show, known bool) {
+	if m == nil {
+		return 0, 0, 0, false, false
+	}
+	model, ok := m.cache[modelID]
+	if !ok || model == nil || model.Skeleton == nil {
+		return 0, 0, 0, false, false
+	}
+	bx, by, bz, ok := m.BoneWorldPos(modelID, entityID, 3, x, y, z, facing, entityScale)
+	if !ok || !model.HasNodeBones {
+		return 0, 0, 0, false, true
+	}
+	s := entityScale
+	if s <= 0 {
+		s = 1
+	}
+	return bx, by + 0.6*s*model.DefaultScale, bz, true, true
 }
 
 // BoneWorldPosByIdx computes world-space position for a raw skeleton bone index.
@@ -1031,32 +1032,21 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 					maps := (*[32]rl.MaterialMap)(unsafe.Pointer(mg.Material.Maps))
 					origTex = maps[rl.MapDiffuse].Texture
 
-					// Armor slots (0-4): two-pass rendering for armor, single-pass for robes.
-					// Armor textures have transparent areas where skin shows through
-					// (e.g., exposed arms, neckline). Robes cover the full body opaquely.
+					// Armor slots (0-4): two-pass rendering, armor or robe.
+					// Their textures have transparent areas where skin shows
+					// through (e.g., exposed arms, neckline).
 					if mg.TextureSlot >= TextSlotChest && mg.TextureSlot <= TextSlotBoots {
-						// Check if this slot's texture came from a robe (fully opaque coverage).
-						// An override wins over the robe in resolveSlotTexture, so it must
-						// also take the armor path here or it would render single-pass and
-						// lose the skin underneath wherever the art is transparent.
-						// HideRobe too, as resolveSlotTexture checks it: a hidden
-						// robe's slot holds armor, which needs the armor path.
+						// Whether this slot holds the robe, for its tint. An
+						// override wins over the robe in resolveSlotTexture, and
+						// a hidden robe's slot holds armor.
 						isRobe := equip.slotOverride(mg.TextureSlot) == 0 &&
 							equip.Robe < 4 && !equip.HideRobe &&
 							GetRobeTextureDictID(equip.Robe, mg.TextureSlot) != 0
-						if isRobe {
-							// Robes: single-pass direct swap with robe tint.
-							tint := GetTintColor(equip.RobeTint)
-							tintColor := rl.NewColor(tint.R, tint.G, tint.B, tint.A)
-							origColor := maps[rl.MapDiffuse].Color
-							maps[rl.MapDiffuse].Texture = replaceTex
-							maps[rl.MapDiffuse].Color = tintColor
-							rl.DrawMesh(mg.Mesh, mg.Material, transform)
-							maps[rl.MapDiffuse].Texture = origTex
-							maps[rl.MapDiffuse].Color = origColor
-							continue
-						}
-						// Armor: two-pass rendering (skin base + tinted armor overlay).
+						// Armor and robes alike: two-pass rendering (skin base +
+						// tinted overlay). SetRobe writes the robe into the same
+						// layer SetArmorSlot does (m_slots[i].m_layer), over the
+						// skin; drawn single-pass, a robe's transparent texels
+						// were holes.
 						// Pass 1: skin texture (base body, alpha cutoff shader).
 						rl.DrawMesh(mg.Mesh, mg.Material, transform)
 						// Pass 2: the armor in layer 1, tinted, no depth write. Layer 1
@@ -1066,6 +1056,9 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 						// PolygonOffset pushes overlay slightly closer so it reliably
 						// passes the GL_LESS depth test at same-depth as pass 1.
 						_, tintIdx := armorSetForSlot(equip, mg.TextureSlot)
+						if isRobe {
+							tintIdx = equip.RobeTint
+						}
 						tint := GetTintColor(tintIdx)
 						tintColor := rl.NewColor(tint.R, tint.G, tint.B, tint.A)
 						origColor := maps[rl.MapDiffuse].Color
@@ -1090,6 +1083,8 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 			} else if mg.TextureSlot >= TextSlotChest && mg.TextureSlot <= TextSlotBoots && mg.Layer1DictID != 0 {
 				// No armor/robe equipped, but model has a layer 1 clothing texture.
 				// Single-pass composite: layer1 (clothing) over layer0 (skin).
+				// Set 0 is still tinted: SetArmorSlot puts the slot's own
+				// texture back and sets the layer colour to the tint.
 				layer1Tex := m.getEquipmentTexture(mg.Layer1DictID, texSrcAuto)
 				if layer1Tex.ID != m.whiteTex.ID {
 					maps := (*[32]rl.MaterialMap)(unsafe.Pointer(mg.Material.Maps))
@@ -1097,10 +1092,15 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 					origShader := mg.Material.Shader
 					maps[rl.MapDiffuse].Texture = layer1Tex  // texture0 = clothing overlay
 					maps[rl.MapSpecular].Texture = baseTex   // texture1 = skin base
+					_, tintIdx := armorSetForSlot(equip, mg.TextureSlot)
+					t := GetTintColor(tintIdx)
+					clothTint := []float32{float32(t.R) / 255, float32(t.G) / 255, float32(t.B) / 255, 1}
 					if mg.GPUSkinned {
 						mg.Material.Shader = m.skinClothingShader
+						rl.SetShaderValue(m.skinClothingShader, m.clothTintLoc[1], clothTint, rl.ShaderUniformVec4)
 					} else {
 						mg.Material.Shader = m.clothingShader
+						rl.SetShaderValue(m.clothingShader, m.clothTintLoc[0], clothTint, rl.ShaderUniformVec4)
 					}
 					rl.DrawMesh(mg.Mesh, mg.Material, transform)
 					mg.Material.Shader = origShader
@@ -1316,14 +1316,9 @@ if model.PLSlotToRawPair != nil {
 			as.BlendFactor = 1.0 // no blend
 			as.FramePos = 1e6    // clamped to last frame by death clamp below
 			as.PrevFrame = 0
-		} else if model.AnimProfile.F8Slots != nil {
-			// Creature: instant snap (PS2: AddPlay, no blend).
-			as.UpperIdx = upperIdx
-			as.LowerIdx = lowerIdx
-			as.BlendFactor = 1.0
-			as.FramePos = 0
-			as.PrevFrame = 0
 		} else if upperChanged {
+			// Every skeleton blends 250 ms (SetAnimation's AddInterpolatedPlay
+			// has no skeleton test); creatures used to snap.
 			as.playOnceDone = false
 			if as.BlendFactor < 1.0 && as.PrevUpperIdx >= 0 {
 				// Blend already in progress — keep prev, replace target.
@@ -1469,6 +1464,14 @@ if model.PLSlotToRawPair != nil {
 		}
 	}
 
+	// SetAnimation resets the sound triggers of an animation it accepts (the
+	// spell FX ones belong to the spell driver). The old test compared
+	// UpperIdx after it had already been updated, so it never fired.
+	if as.Controller != nil && as.Controller.TriggerResetPending {
+		as.SoundTripped = [2]bool{}
+		as.Controller.TriggerResetPending = false
+	}
+
 	// PS2 ProcessPlayTiming: check if frame crossed any keyframe triggers.
 	// Trip the corresponding trigger when PrevFrame < keyframe.Time <= FramePos.
 	if model.AnimKeyframes != nil {
@@ -1488,12 +1491,6 @@ if model.PLSlotToRawPair != nil {
 				}
 			}
 		}
-	}
-
-	// PS2 SetAnimation: reset sound triggers when animation changes.
-	// Track previous upper index; on change, clear sound tripped flags.
-	if as.UpperIdx != upperIdx {
-		as.SoundTripped = [2]bool{}
 	}
 
 	// Advance lower body frame independently when split (PS2 dual-pair).
@@ -1532,28 +1529,11 @@ if model.PLSlotToRawPair != nil {
 		if as.BlendFactor >= 1.0 {
 			as.BlendFactor = 1.0
 		}
-		// Advance previous animation (don't freeze mid-stride).
+		// The outgoing play holds its frame: SetAnimation stops it
+		// (StopPlayback → VIPlaybackTypeStopEnd), and ProcessPlayTiming does
+		// not advance a stopped play.
 		if as.PrevUpperIdx >= 0 && as.PrevUpperIdx < len(anims) {
-			prevAnim := anims[as.PrevUpperIdx]
-			prevFPS := prevAnim.FPS
-			prevNumFrames := float32(prevAnim.NumFrames)
-			prevSpeed := float32(1.0)
-			if model.PLSlotSpeed != nil {
-				if spd, ok := model.PLSlotSpeed[as.PrevSlot]; ok {
-					prevSpeed = spd
-				}
-			}
-			if prevSpeed < 0 {
-				prevSpeed = -prevSpeed
-			}
-			if prevSpeed <= 0 {
-				prevSpeed = 1.0
-			}
-			as.PrevFramePos += dt * prevFPS * prevSpeed * callerSpeed
-			as.PrevNumFrames = prevNumFrames
-			for as.PrevFramePos >= prevNumFrames {
-				as.PrevFramePos -= prevNumFrames
-			}
+			as.PrevNumFrames = float32(anims[as.PrevUpperIdx].NumFrames)
 		}
 	}
 

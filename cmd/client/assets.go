@@ -87,6 +87,7 @@ func (c *Client) loadAssets(assetsDir string) {
 		c.terrainLoader = loader
 		c.terrainRender = terrain.NewRenderer()
 		c.floraRender = terrain.NewFloraRenderer()
+		c.floraRender.Attach(loader, c.terrainRender)
 		overlayDir := filepath.Join(assetsDir, "overlays")
 		loader.LoadZoneOverlays(overlayDir)
 		log.Printf("loadAssets: terrain loader ready")
@@ -177,13 +178,12 @@ func (c *Client) loadWeatherSounds() {
 	if err != nil {
 		return
 	}
-	n := c.audioSys.LoadSpellSounds(f) // reuse SoundSprite loader
+	// rain_lt and lightning_far02 are bare 0xB000 Adpcm objects, which the
+	// SoundSprite loader never registered: rain and thunder never played.
+	n := c.audioSys.LoadAdpcmSounds(f)
 	if n > 0 {
 		log.Printf("loadWeatherSounds: loaded %d sounds from SKY.ESF", n)
 	}
-	// PS2 DictIDs: rain_lt = 111162647, lightning_far02 = -64459608
-	c.weather.RainSoundDictID = 111162647
-	c.weather.ThunderSoundDictID = -64459608
 }
 
 // loadReticleFromFile loads both Selection_Rings textures from a pre-opened UI.ESF.
@@ -406,6 +406,9 @@ func (c *Client) switchWorldTerrain(worldID byte) {
 	loader.LoadZoneOverlays(overlayDir)
 
 	c.terrainLoader = loader
+	if c.floraRender != nil {
+		c.floraRender.Attach(loader, c.terrainRender) // a new world's flora
+	}
 	c.currentWorld = worldID
 	proxies := loader.GetZoneProxies()
 	proxyCount := 0

@@ -91,6 +91,7 @@ type Client struct {
 	// PS2 VIWalkPhysics vertical state (ported from UpdatePhysics at 0x486198)
 	velocityY float32 // vertical velocity (VIWalkPhysics +0xCC in PS2 struct)
 	onGround  bool    // true when player is on walkable ground
+	floorY    float32 // VIWalkPhysics m_floor: the floor last stood on (walkFloor)
 	swimVelY  float32 // player-requested swim vertical velocity (Q/E/gamepad right stick)
 
 	// PS2 VIWalkControl swim state (ported from VIWalkControl::Move at 0x486778)
@@ -105,14 +106,12 @@ type Client struct {
 	audioSys        *audio.System
 	bgmZones        []audio.BGMZone // StreamAudioSprite bounding boxes from TUNARIA
 	ambientTracks   map[int32]*audio.AmbientTrack
-	lastAmbientID   int32
 	masterVolume    float32         // master volume 0-1
 	sfxVolume       float32         // SFX volume 0-1
 	bgmVolume       float32         // BGM volume 0-1
 	bgmMuted        bool            // BGM muted
 	currentBGM      string          // currently playing BGM name (avoid re-reading ISO)
 	battleBGMActive bool            // PS2 VIBattleMusic: battle BGM currently playing
-	battleTrackRand int             // rotating index for battle track selection
 
 	// Display settings
 	windowMode      int   // 0=windowed, 1=borderless, 2=fullscreen
@@ -767,29 +766,14 @@ func runClient() {
 			//   1 = SetAttackAction(slot=1)    — secondary weapon, primary swing
 			//   2 = SetAttackAltAction(slot=0) — primary weapon, alt swing
 			//   3 = SetAttackAltAction(slot=1) — secondary weapon, alt swing
-			// PS2 SetAttackAction/SetAttackAltAction use the weapon's AttackType
-			// jump table to pick the correct CPlayList slot. We index into the
-			// verified 4-entry weaponAttackAnims[attackType] table:
-			//   [0]=Pri(s=0), [1]=Pri(s=1), [2]=Alt(s=0), [3]=Alt(s=1)
-			idx := int(animPair)
-			if idx < 0 || idx > 3 {
-				idx = 0
+			// SetAttackAction/SetAttackAltAction pick the slot from the attack
+			// type in that hand (vicsprite.cpp:551-665); a type with no swing
+			// plays nothing, and the action is complete at once.
+			a := client.animMgr.AttackActionAnim(engine.State, actorObjID, int(animPair))
+			if a < 0 {
+				return -1
 			}
-
-			var animByte byte
-			if actorObjID == engine.State.PlayerObjectID {
-				atkType := client.animMgr.GetWeaponAttackType(engine.State)
-				if anims, ok := weaponAttackAnims[atkType]; ok {
-					animByte = anims[idx]
-				} else {
-					animByte = weaponAttackAnims[11][idx] // default dagger
-				}
-			} else {
-				// NPC: use generic attack slots (PS2 uses NPC's own attackType,
-				// but we don't track per-NPC weapon types)
-				animByte = weaponAttackAnims[11][idx]
-			}
-			handle := client.triggerSpellAnim(actorObjID, animByte)
+			handle := client.triggerSpellAnim(actorObjID, byte(a))
 
 			// Mark combat active — spell FX PlayAttack means we're in combat.
 			if actorObjID == engine.State.PlayerObjectID {

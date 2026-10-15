@@ -3,12 +3,15 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"sort"
 	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 
 	"github.com/eqoa/client/internal/audio"
 	"github.com/eqoa/client/internal/frustum"
+	"github.com/eqoa/client/internal/sky"
 	"github.com/eqoa/client/internal/game"
 	"github.com/eqoa/client/internal/mathutil"
 	"github.com/eqoa/client/internal/models"
@@ -65,10 +68,13 @@ func (c *Client) drawWorld() {
 	gs := c.engine.State
 	p := gs.Player
 
-	// PS2 radial zone streaming: load all zones within radius of player.
-	const zoneStreamRadius float32 = 500
+	// VIWorld::StreamLeaf: a zone streams in once its box is within 900
+	// (VIScene::Init's m_p2A48[1]) and out only past 950 ([0]), in 3D. The
+	// gap is the hysteresis; the old 500 both ways put the load radius
+	// inside the fog.
 	if c.terrainLoader != nil && (p.X != 0 || p.Z != 0) {
-		nearby := c.terrainLoader.FindNearbyZones(p.X, p.Z, zoneStreamRadius)
+		nearby := c.terrainLoader.ZonesWithin(p.X, p.Y, p.Z, 900)
+		keep := c.terrainLoader.ZonesWithin(p.X, p.Y, p.Z, 950)
 		// Track primary zone (for collision, flora, effects).
 		primaryIdx := c.terrainLoader.FindZone(p.X, p.Z)
 		if primaryIdx >= 0 && primaryIdx != c.terrainZoneIdx {
@@ -76,9 +82,6 @@ func (c *Client) drawWorld() {
 				c.safeValid = false
 				if c.effectVolumes != nil {
 					c.effectVolumes.Clear()
-				}
-				if c.floraRender != nil {
-					c.floraRender.Reset()
 				}
 				// Clear active spell effects on zone change — entities from
 				// the old zone will lose state channel references and emitters
@@ -98,9 +101,11 @@ func (c *Client) drawWorld() {
 			}
 		}
 		// Start loading any new nearby zones.
-		wantSet := make(map[int]bool, len(nearby))
-		for _, idx := range nearby {
+		wantSet := make(map[int]bool, len(keep))
+		for _, idx := range keep {
 			wantSet[idx] = true
+		}
+		for _, idx := range nearby {
 			if !c.loadedZoneIdxs[idx] {
 				log.Printf("drawWorld: streaming in zone %d", idx)
 				c.terrainLoader.EnsureZoneLoaded(idx)
@@ -121,6 +126,17 @@ func (c *Client) drawWorld() {
 	// PS2 VIWalkCamera orbit -- distance=0 naturally becomes first-person.
 	camera := c.currentCamera(p)
 	firstPerson := c.camDist < 0.1
+
+	// VICameraEffect: a spell's shake bobs the eye and the look direction
+	// vertically (it only ever runs for the local player).
+	if fx := c.engine.SpellFX; fx != nil {
+		fx.Camera.Update(rl.GetFrameTime())
+		eye := [3]float32{camera.Position.X, camera.Position.Y, camera.Position.Z}
+		dir := [3]float32{camera.Target.X - eye[0], camera.Target.Y - eye[1], camera.Target.Z - eye[2]}
+		fx.Camera.Apply(&eye, &dir)
+		camera.Position = rl.Vector3{X: eye[0], Y: eye[1], Z: eye[2]}
+		camera.Target = rl.Vector3{X: eye[0] + dir[0], Y: eye[1] + dir[1], Z: eye[2] + dir[2]}
+	}
 
 	// Compute view frustum once per frame for culling.
 	aspect := float32(rl.GetScreenWidth()) / float32(rl.GetScreenHeight())
@@ -156,9 +172,8 @@ func (c *Client) drawWorld() {
 		// Play() selects a random battle track (battle01-08.bgm), Stop() fades out.
 		if c.engine.InCombat && !c.battleBGMActive {
 			c.battleBGMActive = true
-			// Random battle track 1-8 (PS2: rand()%8+1 when trackIndex==9)
-			track := c.battleTrackRand%8 + 1
-			c.battleTrackRand++
+			// VIBattleMusic::Play: a random battle track, rand() % 8 + 1.
+			track := rand.Intn(8) + 1
 			bgmName := fmt.Sprintf("BATTLE%02d.BGM", track)
 			c.playBGMFromISO(bgmName)
 			c.currentBGM = bgmName
@@ -169,7 +184,8 @@ func (c *Client) drawWorld() {
 
 		// Check if player is in a BGM zone and play/stop accordingly
 		if len(c.bgmZones) > 0 && !c.bgmMuted && !c.musicPlayerOn && !c.musicHudOn && !c.battleBGMActive {
-			bgmPath := audio.CheckBGMZone(c.bgmZones, p.X, p.Y, p.Z)
+			// UpdateSoundEmitters tests the regions at the CAMERA.
+			bgmPath := audio.CheckBGMZone(c.bgmZones, camera.Position.X, camera.Position.Y, camera.Position.Z)
 			if bgmPath != "" {
 				bgmName := audio.ResolveBGMName(bgmPath)
 				if bgmName != c.currentBGM {
@@ -178,7 +194,7 @@ func (c *Client) drawWorld() {
 				}
 			} else {
 				if c.currentBGM != "" {
-					c.audioSys.StopBGM()
+					c.audioSys.FadeOutBGM() // StopBgm fades at 0.05 a frame
 					c.currentBGM = ""
 				}
 			}
@@ -208,10 +224,17 @@ func (c *Client) drawWorld() {
 	if c.skyDome != nil {
 		dt := rl.GetFrameTime()
 		gameHour := c.engine.State.GameHour()
-		// PS2: weather drives sky overcast (ProcessTransitions → GetOvercastInterp)
+		// The atmosphere drives the dome (ProcessTransitions: overcast, sun
+		// alpha, dome rebuilds, lightning patches), coloured by the sky colour
+		// SetupTimeOfDaySky computed. Both are last frame's: one frame of lag.
+		atm := sky.DefaultAtmosphere(gameHour)
 		if c.weather != nil {
-			c.skyDome.SetOvercast(c.weather.OvercastInterp)
+			atm = c.weather.SkyAtmosphere()
 		}
+		if c.terrainRender != nil {
+			atm.SkyColor = c.terrainRender.SkyColor
+		}
+		c.skyDome.SetAtmosphere(atm)
 		c.skyDome.Update(dt, gameHour)
 		c.skyDome.Draw(camera)
 	}
@@ -222,10 +245,6 @@ func (c *Client) drawWorld() {
 		gameHour := float32(12.0) // default noon
 		if c.engine.State.TimeValid {
 			gameHour = c.engine.State.GameHour()
-		}
-		isDusk := gameHour >= 19.0 || gameHour < 6.0
-		if c.engine.SpellFX != nil && c.engine.SpellFX.Particles != nil {
-			c.engine.SpellFX.Particles.ZoneLightsOn = isDusk
 		}
 
 		// The lantern — the PS2's only point light (VIRaster::MaxPointLights
@@ -256,20 +275,26 @@ func (c *Client) drawWorld() {
 			c.terrainRender.EnvFlags = zt.GetEnvFlags(camera.Position.X, camera.Position.Y, camera.Position.Z)
 		}
 		c.terrainRender.SetLightingUniforms(camera.Position.X, camera.Position.Y, camera.Position.Z, gameHour)
+		// Ambient stays zero until the lit shader has run (and with lighting
+		// toggled off); never black, as InitTimeOfDay's ambient is ≥ 75/255.
+		if c.effectVolumes != nil && c.terrainRender.Ambient != ([3]float32{}) {
+			// The raster's lights colour the leaf and dust cards, which the
+			// PS2 draws (0,0,0,a) and lets the scene light.
+			c.effectVolumes.SetLighting(c.terrainRender.Ambient, c.terrainRender.Sun, c.terrainRender.SunDir)
+		}
 
 		// Ambient track (VIScene::SetSoundTrack): the (day, night) pair of the
-		// heaviest-weighted terrain profile at the camera.
+		// heaviest-weighted terrain profile at the camera, crossfaded over 15 s
+		// with a 15 s hold-off, scaled by (1 − rain)³ × outdoors and muted in
+		// a liquid. Outdoors is set later in the frame, so it lags by one.
 		if len(c.ambientTracks) > 0 {
 			night := gameHour < 5 || gameHour > 20
-			ambID := audio.AmbientTrackFor(profiles.Heaviest().Music, night)
-			if ambID != c.lastAmbientID {
-				if track, ok := c.ambientTracks[ambID]; ok {
-					c.audioSys.PlayAmbientPCM(audio.AmbientKey(ambID), track.PCM, track.SampleRate, 0.15)
-				} else if ambID == 0 {
-					c.audioSys.StopAmbient()
-				}
-				c.lastAmbientID = ambID
+			rain, outdoors := float32(0), float32(1)
+			if c.weather != nil {
+				rain, outdoors = c.weather.Intensity, c.weather.Outdoors
 			}
+			c.audioSys.SetAmbient(audio.AmbientTrackFor(profiles.Heaviest().Music, night),
+				c.ambientTracks, rain, outdoors, c.terrainRender.EnvFlags&0xF != 0)
 		}
 
 		// Upload + draw each loaded zone.
@@ -322,11 +347,9 @@ func (c *Client) drawWorld() {
 		zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
 		if zt != nil {
 			if c.floraRender != nil && c.floraRender.HasFlora(zt) {
-				if !c.floraRender.IsBuilt() {
-					c.floraRender.UploadBatch(zt)
-				}
-				c.floraRender.Update(p.X, p.Z, zt)
-				c.floraRender.Draw(p.X, p.Y, p.Z, &frust)
+				// VIRadialFloraSystem's swatches follow the camera.
+				c.floraRender.Update(camera.Position.X, camera.Position.Z, zt)
+				c.floraRender.Draw(camera.Position.X, camera.Position.Y, camera.Position.Z, &frust)
 			}
 			if c.effectVolumes != nil && !c.effectVolumes.IsReady() {
 				if len(zt.EffectVolumes) > 0 {
@@ -366,14 +389,11 @@ func (c *Client) drawWorld() {
 
 	c.animMgr.ConsumePendingPlayerHitFX()
 
-	// PS2 dual speed: callerSpeed = server movement speed / base walk speed.
-	const baseWalkSpeed = float32(8.8333)
+	// A play's rate is its play-list weight and nothing else: no code in the
+	// running game (an in-world EE dump, CLIENT included) calls
+	// VIHSprite::SetPlayRate or SetPlaySpeed, so a faster run does not play
+	// the run animation faster.
 	playerCallerSpeed := float32(1.0)
-	if p.Speed > 0 {
-		playerCallerSpeed = p.Speed / baseWalkSpeed
-	} else if gs.ParsedCM != nil && gs.ParsedCM.Speed > 0 {
-		playerCallerSpeed = gs.ParsedCM.Speed / baseWalkSpeed
-	}
 	if !firstPerson {
 		// Debug model override — visual only, not sent to server
 		playerModelID := int32(p.ModelID)
@@ -594,19 +614,12 @@ func (c *Client) drawWorld() {
 		c.weather.Update(dt, gh, camera)
 		c.weather.Render(camera)
 
+		// Rain is two looping voices panned hard left and right; thunder two
+		// one-shots (ProcessTransitions).
 		if c.audioSys != nil {
-			camPos := [3]float32{camera.Position.X, camera.Position.Y, camera.Position.Z}
-			if c.weather.WantsRainLoop() {
-				if !c.weather.IsRainSoundPlaying() {
-					c.audioSys.PlayLoop(c.weather.RainSoundDictID, 9990, camPos, c.weather.RainVolume(), 9999)
-					c.weather.SetRainSoundPlaying(true)
-				}
-			} else if c.weather.IsRainSoundPlaying() {
-				c.audioSys.StopLoop(9990)
-				c.weather.SetRainSoundPlaying(false)
-			}
+			c.audioSys.SetRain(c.weather.WantsRainLoop(), c.weather.RainVolume())
 			if vol, ok := c.weather.PopThunder(); ok {
-				c.audioSys.Play(c.weather.ThunderSoundDictID, 9991, camPos, vol, 9999)
+				c.audioSys.PlayThunder(vol)
 			}
 		}
 	}
@@ -687,83 +700,114 @@ func (c *Client) drawWorld() {
 	//   byte 2 -> NameColors[1]   (Player)
 	//   other  -> NameColors[0]   (fallback)
 
-	const nameplateRange float32 = 40 // max distance to show nameplates
-	const nameplateRangeSq = nameplateRange * nameplateRange
-
-	// Mouse hover detection for inspection tooltip (VIInspectionWND).
-	mousePos := rl.GetMousePosition()
-	var hoverEnt *game.Entity
-	var hoverDistSq float32 = 40 * 40 // max 40px from entity center to trigger
-
-	// Draw nameplates for visible entities (already frustum-culled).
+	// The plates are VINameSprite's (vinamesprite.cpp): Raster queues a plate
+	// whose anchor is within 22 units of the camera — the squared length of
+	// the view-space (x, y, z, w = 1) against 22², so √483 in 3D — up to 24 a
+	// frame; RasterDeferred sorts them by view depth, nearest first, drops
+	// every plate whose screen rectangle overlaps one already kept, and
+	// draws the rest centred on the anchor. (The PS2 also depth-tests them
+	// against the scene, which a 2D overlay cannot.)
+	type namePlate struct {
+		x, y, w, h int32
+		depth      float32
+		text       string
+		clr        rl.Color
+		ent        *game.Entity
+	}
+	const nameFontSize = int32(14)
+	camFwd := rl.Vector3Normalize(rl.Vector3Subtract(camera.Target, camera.Position))
+	var plates []namePlate
+	queuePlate := func(ent *game.Entity, text string, clr rl.Color) {
+		if len(plates) >= 24 {
+			return
+		}
+		ax, ay, az, show, known := c.modelMgr.NameAnchor(int32(ent.ModelID), ent.ObjectID, ent.X, ent.Y, ent.Z, ent.Facing, ent.Scale)
+		if !known {
+			scale := ent.Scale
+			if scale <= 0 {
+				scale = 1
+			}
+			ax, ay, az, show = ent.X, ent.Y+c.modelHeight(ent.ModelID, 1.8)*scale+0.3, ent.Z, true
+		}
+		if !show {
+			return
+		}
+		d := rl.Vector3Subtract(rl.Vector3{X: ax, Y: ay, Z: az}, camera.Position)
+		if 22*22 <= rl.Vector3DotProduct(d, d)+1 {
+			return
+		}
+		depth := rl.Vector3DotProduct(d, camFwd)
+		if depth <= 0 {
+			return
+		}
+		sp := rl.GetWorldToScreen(rl.Vector3{X: ax, Y: ay, Z: az}, camera)
+		w := c.measureText(text, nameFontSize)
+		plates = append(plates, namePlate{
+			x: int32(sp.X) - w/2, y: int32(sp.Y) - nameFontSize/2, w: w, h: nameFontSize,
+			depth: depth, text: text, clr: clr, ent: ent,
+		})
+	}
 	for _, ent := range c.visibleEnts {
 		if ent.Name == "" {
 			continue
 		}
-		// Always show nameplates for all entities with names.
-		pdx, pdz := ent.X-p.X, ent.Z-p.Z
-		if pdx*pdx+pdz*pdz > nameplateRangeSq {
-			continue
+		if ent.ObjectID == c.targetObjectID {
+			queuePlate(ent, "[ "+ent.Name+" ]", rl.White)
+		} else {
+			queuePlate(ent, ent.Name, nameColorFromByte(ent.NameColor))
 		}
-		height := c.modelHeight(ent.ModelID, 1.8)
+	}
+	if p.Name != "" && !firstPerson {
+		queuePlate(&gs.Player, p.Name, nameColorFromByte(p.NameColor))
+	}
+	sort.SliceStable(plates, func(i, j int) bool { return plates[i].depth < plates[j].depth })
+	kept := plates[:0]
+	for _, pl := range plates {
+		clear := true
+		for _, k := range kept {
+			if pl.x < k.x+k.w && k.x < pl.x+pl.w && pl.y < k.y+k.h && k.y < pl.y+pl.h {
+				clear = false
+				break
+			}
+		}
+		if clear {
+			kept = append(kept, pl)
+		}
+	}
+	for _, pl := range kept {
+		c.drawText(pl.text, pl.x, pl.y, nameFontSize, pl.clr)
+		// Aggro indicator (the client's own): an NPC targeting the player.
+		if ent := pl.ent; ent.Target == gs.PlayerObjectID && ent.IsNPC && gs.PlayerObjectID != 0 {
+			c.drawNameplate(rl.Vector2{X: float32(pl.x + pl.w/2), Y: float32(pl.y - 14)}, "!", rl.Color{R: 255, G: 60, B: 60, A: 255})
+		}
+	}
+
+	// Mouse hover detection for the inspection tooltip (VIInspectionWND), on
+	// every visible entity and the player, whether or not its plate shows.
+	mousePos := rl.GetMousePosition()
+	var hoverEnt *game.Entity
+	var hoverDistSq float32 = 40 * 40 // max 40px from entity center to trigger
+	hover := func(ent *game.Entity) {
 		scale := ent.Scale
 		if scale <= 0 {
 			scale = 1.0
 		}
-		worldPos := rl.Vector3{X: ent.X, Y: ent.Y + height*scale + 0.3, Z: ent.Z}
-		screenPos := rl.GetWorldToScreen(worldPos, camera)
-		if screenPos.X < -100 || screenPos.X > float32(rl.GetScreenWidth())+100 ||
-			screenPos.Y < -50 || screenPos.Y > float32(rl.GetScreenHeight())+50 {
-			continue
-		}
-		if ent.ObjectID == c.targetObjectID {
-			// Targeted entity: draw with brackets and brighter color
-			c.drawNameplate(screenPos, "[ "+ent.Name+" ]", rl.White)
-		} else {
-			c.drawNameplate(screenPos, ent.Name, nameColorFromByte(ent.NameColor))
-		}
-
-		// Aggro indicator: NPC targeting the player
-		if ent.Target == gs.PlayerObjectID && ent.IsNPC && gs.PlayerObjectID != 0 {
-			aggroPos := rl.Vector2{X: screenPos.X, Y: screenPos.Y - 14}
-			c.drawNameplate(aggroPos, "!", rl.Color{R: 255, G: 60, B: 60, A: 255})
-		}
-
-		// Check mouse hover — use body center (halfway between feet and nameplate)
+		height := c.modelHeight(ent.ModelID, 1.8)
 		bodyScreen := rl.GetWorldToScreen(rl.Vector3{X: ent.X, Y: ent.Y + height*scale*0.5, Z: ent.Z}, camera)
 		mdx := mousePos.X - bodyScreen.X
 		mdy := mousePos.Y - bodyScreen.Y
-		d2 := mdx*mdx + mdy*mdy
-		if d2 < hoverDistSq {
+		if d2 := mdx*mdx + mdy*mdy; d2 < hoverDistSq {
 			hoverDistSq = d2
 			hoverEnt = ent
 		}
 	}
-
-	// Draw nameplate for local player + include in hover/click detection.
+	for _, ent := range c.visibleEnts {
+		if ent.Name != "" {
+			hover(ent)
+		}
+	}
 	if p.Name != "" && !firstPerson {
-		height := c.modelHeight(p.ModelID, 1.8)
-		scale := p.Scale
-		if scale <= 0 {
-			scale = 1.0
-		}
-		worldPos := rl.Vector3{X: camera.Target.X, Y: p.Y + height*scale + 0.3, Z: camera.Target.Z}
-		screenPos := rl.GetWorldToScreen(worldPos, camera)
-		sw, sh := float32(rl.GetScreenWidth()), float32(rl.GetScreenHeight())
-		if screenPos.X >= -100 && screenPos.X <= sw+100 &&
-			screenPos.Y >= -50 && screenPos.Y <= sh+50 {
-			c.drawNameplate(screenPos, p.Name, nameColorFromByte(p.NameColor))
-
-			// Hover detection for self (same as other entities)
-			bodyScreen := rl.GetWorldToScreen(rl.Vector3{X: p.X, Y: p.Y + height*scale*0.5, Z: p.Z}, camera)
-			mdx := mousePos.X - bodyScreen.X
-			mdy := mousePos.Y - bodyScreen.Y
-			d2 := mdx*mdx + mdy*mdy
-			if d2 < hoverDistSq {
-				hoverDistSq = d2
-				hoverEnt = &gs.Player
-			}
-		}
+		hover(&gs.Player)
 	}
 
 	// --- VIInspectionWND: right-click inspect tooltip ---

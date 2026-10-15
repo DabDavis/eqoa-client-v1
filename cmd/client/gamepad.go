@@ -29,9 +29,6 @@ import (
 //   R3:          Reset camera to default position
 const (
 	gpID = int32(0) // first gamepad
-
-	// Stick dead zone — ignore small drift
-	stickDeadZone = float32(0.15)
 )
 
 // gpAvailable returns true if a gamepad is connected.
@@ -39,13 +36,26 @@ func gpAvailable() bool {
 	return rl.IsGamepadAvailable(gpID)
 }
 
-// gpStick reads a stick axis with dead zone applied, returns -1..1.
+// gpStick reads a stick axis as the PS2 does, returns -1..1. The axis is
+// taken back to the DualShock's byte (0..255, centre 127.5) and put through
+// VIPad::ScaleStick.
 func gpStick(axis int32) float32 {
 	v := rl.GetGamepadAxisMovement(gpID, axis)
-	if v > -stickDeadZone && v < stickDeadZone {
-		return 0
+	b := math.Round(float64(v+1) * 127.5)
+	return scaleStick(uint8(max(0, min(255, b))))
+}
+
+// scaleStick is VIPad::ScaleStick (vipad.cpp:136): bytes 88..167 are the dead
+// zone, and the output ramps from 0 at its edge to ±1 at the stop, in steps
+// of 1/88.
+func scaleStick(v uint8) float32 {
+	if v < 88 {
+		return float32(88-int(v)) * -0.0113636364
 	}
-	return v
+	if v >= 168 {
+		return float32(int(v)-167) * 0.0113636364
+	}
+	return 0
 }
 
 // gpPressed returns true on the frame a gamepad button is first pressed.

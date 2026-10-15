@@ -82,9 +82,19 @@ func Login(host string, port int, username, password string) (uint32, []byte, er
 		return 0, nil, fmt.Errorf("auth write failed: %w", err)
 	}
 
-	// Read 168-byte response
+	// The reply is length-prefixed. A login response is 168 bytes; Sandstorm
+	// instead refuses a real account from a VPN address with a bare 16-byte
+	// opcode 0x43 and closes, which read as "unexpected EOF".
+	head := make([]byte, 8)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		return 0, nil, fmt.Errorf("auth read failed: %w", err)
+	}
+	if op := binary.BigEndian.Uint32(head[4:8]); op == 0x43 {
+		return 0, nil, fmt.Errorf("login refused by the server (0x43): Sandstorm does not allow VPN connections")
+	}
 	response := make([]byte, 168)
-	if _, err := io.ReadFull(conn, response); err != nil {
+	copy(response, head)
+	if _, err := io.ReadFull(conn, response[8:]); err != nil {
 		return 0, nil, fmt.Errorf("auth read failed: %w", err)
 	}
 

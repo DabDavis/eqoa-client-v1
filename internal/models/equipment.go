@@ -252,10 +252,11 @@ func GetRobeTextureDictID(robeIndex byte, textSlot int) int32 {
 }
 
 // GetHairTextureDictID returns the ESF Surface DictID for a hair texture.
-// Returns HairNullTexture for bald (style >= 8) or 0 if explicitly no-hair.
+// SetHair reads Hair[hair < 8 ? hair : 7]: an index past the table is the
+// last colour, not bald.
 func GetHairTextureDictID(hairStyle byte) int32 {
 	if int(hairStyle) >= len(HairTextures) {
-		return HairNullTexture
+		return HairTextures[len(HairTextures)-1]
 	}
 	return HairTextures[hairStyle]
 }

@@ -234,6 +234,10 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 					}
 				}
 			}
+			// VICSprite::SetDefaultEntries: slots the ESF left empty are
+			// filled from their neighbours (missing attacks from 22/23 ...).
+			ApplyDefaultEntries(model)
+
 			// Pin the idle ground baseline now, from slot 0's first frame,
 			// rather than letting it latch onto whatever the first entity
 			// using this model happened to be playing. Slot 0 is idle across
@@ -457,11 +461,12 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 		if mg.TextureSlot == 7 {
 			continue // slot 7 = face/helm — already assigned by TSlotList
 		}
-		if isHairDictID(mg.SurfDictID) || mg.RawSlotID >= 9 {
+		if isHairDictID(mg.SurfDictID) || mg.RawSlotID >= 8 {
 			// Remap to TextureSlot=5 for hair rendering; RawSlotID preserved
-			// for PS2-accurate layer visibility in hairSlotVisible().
-			// Slot 8 is robe on some models but hair on others — isHairDictID
-			// disambiguates based on the default texture.
+			// for PS2-accurate layer visibility in hairSlotVisible(). Slot 8
+			// is the first facial-hair layer on every model (SetHair covers
+			// 8-18; SetRobe only ever retextures 0-4). Read as a robe mesh, it
+			// hid the dwarf male's beard.
 			mg.TextureSlot = 5
 		}
 	}
@@ -502,23 +507,9 @@ func (m *ModelManager) loadModel(modelID int32) *CharModel {
 	if override, ok := profileOverrides[modelID]; ok {
 		model.AnimProfile = override
 	}
-	// Fix death slot: some small models map CPlayList slot 15 to idle (raw 0).
-	// If slot 14 maps to a real animation, use it for death instead.
-	if model.PLSlotToRaw != nil {
-		deathSlot := int(model.AnimProfile.Death)
-		idleRaw, hasIdle := model.PLSlotToRaw[0]
-		deathRaw, hasDeath := model.PLSlotToRaw[deathSlot]
-		if hasDeath && hasIdle && deathRaw == idleRaw {
-			// Current death slot maps to idle — try the other common death slot
-			altSlot := 14
-			if deathSlot == 14 {
-				altSlot = 15
-			}
-			if altRaw, ok := model.PLSlotToRaw[altSlot]; ok && altRaw != idleRaw {
-				model.AnimProfile.Death = byte(altSlot)
-			}
-		}
-	}
+	// Death is slot 14 for every model (SetDeath → SetLocomotion(14)); a
+	// model whose 14 is idle plays idle once, as on the PS2. The swap to 15
+	// that stood here played the special idle instead.
 	if hier := getHierarchy(obj); hier != nil && len(hier.Nodes) > 0 {
 		findBones(model, obj, hier, cx, yBottom, cz, dims.Y, isHumanoid)
 		// Log root bone scale — PS2 uses this as the model's default scale.

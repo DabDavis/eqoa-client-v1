@@ -2235,12 +2235,9 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 			}
 			gs.ChannelEntity[channel] = 0
 		}
-		// Clear the state ACK for this channel so we don't send stale ACKs.
-		// If the server reassigns this channel to a new entity later, the
-		// new sequence starts at 1 and a stale high ACK would be rejected.
-		if gs.Conn != nil {
-			gs.Conn.ClearStateAck(channel)
-		}
+		// The channel's sequence and bases carry on: a channel the server
+		// reassigns continues its old sequence with a delta (114 times in
+		// four PS2 captures, never a restart), so nothing is cleared here.
 		return
 	}
 

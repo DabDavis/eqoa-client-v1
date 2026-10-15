@@ -3,7 +3,9 @@ package game
 // Port of VIParticleSystem / VIParticleEmitter from PS2 SUPPORT module.
 // See claude-notes/particle-system-re.md for decompiled struct layouts.
 //
-// Position: analytical physics pos = birthPos + vel*t + 0.5*gravity*t²
+// Position: analytical physics pos = birthPos + vel*t + 0.5*gravity*t², or the
+// friction-damped solution of the same ODE (VIParticleSystem::Render's Euler step
+// in the limit)
 // Size: startSize + growthRate*t
 // Color: gradient[(int)(age/lifespan * 31 * repeat) & 31] (PS2 hard-step)
 // Birth: nozzle→outer→inner HPR rotation order (PS2 Matrix33SetHpr)
@@ -24,6 +26,10 @@ import (
 
 const (
 	particleGravity = float32(-5.0) // PS2 default gravity when GravityOn=true
+
+	// maxParticles is the pool VIScene::Init gives VIParticleSystem::Init:
+	// an emitter births nothing once all 2,000 are in use.
+	maxParticles = 2000
 )
 
 // Particle stores birth conditions for analytical position computation.
@@ -31,9 +37,10 @@ const (
 type Particle struct {
 	BirthPos      [3]float32 // world position at birth
 	BirthVel      [3]float32 // velocity at birth
-	Gravity       float32    // 0 or -5.0
+	Gravity       float32    // m_gravity: -5.0 with GravityOn, a motif blend in between
 	Friction      float32    // velocity dampening (0.0 = none, 0.62 = heavy drag)
-	StartSize      float32 // radius at birth (already halved)
+	Frame         int32      // sprite-sheet layout (0 = whole texture), from TexConfig
+	StartSize      float32 // radius at birth (already halved); may be negative
 	GrowthRate     float32 // (endSize-startSize)/lifespan
 	GradientRepeat float32 // PS2 particle+0x1C: per-particle copy (set at birth)
 	Lifespan       float32 // seconds
@@ -50,8 +57,8 @@ type ParticleEmitter struct {
 	def        *esf.ParticleDefinition
 	particles  []Particle
 	pos        [3]float32 // emitter world position (entity pos + offset)
-	prevPos    [3]float32 // previous frame position (for velocity computation)
-	vel        [3]float32 // emitter velocity (units/sec, derived from position delta)
+	prevPos    [3]float32 // position at the last update: VIParticleEmitter::m_lastLocation
+	vel        [3]float32 // emitter velocity, (pos - prevPos) / dt, for InheritVelocity
 	offset     [3]float32 // XYZ offset from entity origin (from event Floats[0-2])
 	originPos  [3]float32 // emitter position at creation (for local-space particle rendering)
 	trackPos   [3]float32 // actor raw position (without shape offset), updated per-frame
@@ -64,15 +71,15 @@ type ParticleEmitter struct {
 	zWrite    bool  // PS2 per-def depth write (true for ~8% of defs)
 	zTest     bool  // PS2 per-def depth test (false for ~8% of defs)
 	alive     bool
-	hasPrevPos bool       // true after first SetPosition call (for velocity computation)
+	hasPrevPos bool       // prevPos holds the location at the last update (m_lastLocation)
 	maxLife    time.Duration // auto-expire if no explicit destroy
-	activeMotif *esf.ParticleAttributes // non-nil when SetEmitterMotif overrides Base
-	// Motif blender (PS2 VIMotifBlender): interpolates from one motif to another over time
-	blendFrom    *esf.ParticleAttributes // starting motif (nil = no blend active)
-	blendTo      *esf.ParticleAttributes // target motif
-	blendDurMS   float32                 // blend duration in ms
-	blendElapsed float32                 // ms elapsed since blend started
-	blendActive  bool                    // true while interpolation is in progress
+	// The motif blenders linked to this emitter (m_blenders) and the attributes
+	// they blend the definition to (m_attributes, rebuilt by BlendMotifs when a
+	// factor changes). attrs is valid once attrsInit is set.
+	blenders  []*MotifBlender
+	attrs     esf.ParticleAttributes
+	gravity   float32 // attrs' m_gravity, which blends as a float
+	attrsInit bool
 	nozzleRot    [3]float32              // HPR rotation applied to nozzle axis (zone emitters only)
 	facing       float32                // actor facing angle (radians) — PS2 direction matrix Y-rotation
 	isZone     bool       // true for zone-placed emitters (torches, lamps)
@@ -100,14 +107,20 @@ type ParticleSystem struct {
 	// PS2 VIParticleSystem: 8-frame rolling average for delta time smoothing
 	dtHistory [8]float32
 	dtIdx     int
+	deltaTime float32 // VIParticleSystem::DeltaTime, the smoothed step of the last Update
 }
 
 // NewParticleSystem creates a particle system tied to a SpellFXDB.
+// VIParticleSystem::Init seeds the delta-time history with 1/30 s.
 func NewParticleSystem(db *SpellFXDB) *ParticleSystem {
-	return &ParticleSystem{
+	ps := &ParticleSystem{
 		db:       db,
 		texCache: make(map[int32]rl.Texture2D),
 	}
+	for i := range ps.dtHistory {
+		ps.dtHistory[i] = 1.0 / 30.0
+	}
+	return ps
 }
 
 // NextTempEmitterID returns a unique negative emitter ID for projectile/temp emitters.
@@ -215,75 +228,64 @@ func (ps *ParticleSystem) CreateZoneEmitter(pd *esf.ParticleDefinition, pos, rot
 	return em
 }
 
-// SetEmitterMotif switches an emitter's active attributes to a named motif.
-// Called by SpellEventDriver for event type 6 (SetEmitterMotif).
-// motifDictID is the PD DictID from Fields[1] — it should match the emitter's PD.
-func (ps *ParticleSystem) SetEmitterMotif(pdDictID int32, motifName string) {
-	if ps == nil {
-		return
-	}
-	for _, em := range ps.emitters {
-		if em.texID == pdDictID && em.def != nil {
-			// Search motifs by name
-			for i := range em.def.Motifs {
-				if em.def.Motifs[i].Name == motifName {
-					em.activeMotif = &em.def.Motifs[i].Attributes
-					return
-				}
-			}
-			// If motif name not found, try index-based lookup from Fields[2]
-			return
-		}
+// MotifBlender is VIMotifBlender: one motif of an emitter's definition and the
+// factor it is blended in at. A SetEmitterMotif event owns one and ramps its
+// factor; the emitter's attributes are its definition plus, for every linked
+// motif, (motif - definition) * factor, so motifs STACK rather than replace.
+type MotifBlender struct {
+	motif   *esf.ParticleMotif // nil once the emitter is gone, or if no motif matched
+	factor  float32
+	changed bool
+}
+
+// Factor is VIMotifBlender::Factor.
+func (b *MotifBlender) Factor() float32 { return b.factor }
+
+// SetFactor is VIMotifBlender::SetFactor: a new value marks the blender changed,
+// which makes the emitter re-blend its attributes on its next update.
+func (b *MotifBlender) SetFactor(f float32) {
+	if b.factor != f {
+		b.factor = f
+		b.changed = true
 	}
 }
 
-// SetEmitterMotifByIndex switches an emitter's active attributes by motif index.
-func (ps *ParticleSystem) SetEmitterMotifByIndex(pdDictID int32, motifIdx int) {
+// Linked reports whether the blender still has a motif: false once its emitter
+// was destroyed (VIParticleEmitter::UnlinkAllMotifBlenders) or when the motif
+// was never found, which is how the PS2's SetEmitterMotif event knows to retire.
+func (b *MotifBlender) Linked() bool { return b != nil && b.motif != nil }
+
+// LinkMotifBlender is VIParticleEmitter::LinkMotifBlender on the emitter with
+// the given ID: the motif whose name hashes to motifHash is linked at factor 0.
+// The blender comes back unlinked when there is no such emitter or motif.
+func (ps *ParticleSystem) LinkMotifBlender(emitterID, motifHash int32) *MotifBlender {
+	b := &MotifBlender{changed: true}
 	if ps == nil {
-		return
+		return b
 	}
 	for _, em := range ps.emitters {
-		if em.texID == pdDictID && em.def != nil {
-			if motifIdx >= 0 && motifIdx < len(em.def.Motifs) {
-				em.activeMotif = &em.def.Motifs[motifIdx].Attributes
-			} else if motifIdx == -1 || motifIdx >= len(em.def.Motifs) {
-				// Reset to base
-				em.activeMotif = nil
-			}
-			return
-		}
-	}
-}
-
-// SetEmitterMotifByDictID finds the emitter by its spell event emitter ID (Fields[0]),
-// then switches its motif to the one matching the given motif hash.
-// PS2 SetEmitterMotif: Fields[0]=emitter ID, Fields[1]=motif hash/index.
-func (ps *ParticleSystem) SetEmitterMotifByDictID(emitterID, motifHash int32) {
-	if ps == nil {
-		return
-	}
-	for _, em := range ps.emitters {
-		if em.emitterID == emitterID && em.def != nil {
-			target := resolveMotif(em.def, motifHash)
-			if target != nil {
-				em.activeMotif = target
-			}
-			return
-		}
-	}
-}
-
-// resolveMotif finds a motif by DictID (VIHashResourceID of the motif name).
-func resolveMotif(def *esf.ParticleDefinition, dictID int32) *esf.ParticleAttributes {
-	for i := range def.Motifs {
-		if def.Motifs[i].Name == "" {
+		if em.emitterID != emitterID || !em.alive || em.def == nil {
 			continue
 		}
-		if viHashResourceID(def.Motifs[i].Name) == dictID {
-			return &def.Motifs[i].Attributes
+		for i := range em.def.Motifs {
+			if viHashResourceID(em.def.Motifs[i].Name) == motifHash {
+				b.motif = &em.def.Motifs[i]
+				em.blenders = append(em.blenders, b)
+				break
+			}
 		}
+		return b
 	}
-	return nil
+	return b
+}
+
+// unlinkBlenders is VIParticleEmitter::UnlinkAllMotifBlenders, run when the
+// emitter is destroyed.
+func (em *ParticleEmitter) unlinkBlenders() {
+	for _, b := range em.blenders {
+		b.motif = nil
+	}
+	em.blenders = nil
 }
 
 // viHashResourceID matches PS2 VIHashResourceID (SUPPORT 0x003EC238):
@@ -296,36 +298,6 @@ func viHashResourceID(name string) int32 {
 	return hash
 }
 
-// StartMotifBlend begins interpolating from the current motif to a target motif
-// over durationMS milliseconds. PS2 ProcessSetEmitterMotif does this per-frame.
-func (ps *ParticleSystem) StartMotifBlend(emitterID, motifHash, durationMS int32) {
-	if ps == nil || durationMS <= 0 {
-		// No duration — instant switch (handled by SetEmitterMotifByDictID)
-		ps.SetEmitterMotifByDictID(emitterID, motifHash)
-		return
-	}
-	for _, em := range ps.emitters {
-		if em.emitterID == emitterID && em.def != nil {
-			// Capture current attributes as blend source
-			from := em.getAttr()
-			fromCopy := *from // copy so it doesn't change under us
-
-			// Resolve target motif by DictID (VIHashResourceID of name)
-			target := resolveMotif(em.def, motifHash)
-			if target == nil {
-				return
-			}
-
-			em.blendFrom = &fromCopy
-			em.blendTo = target
-			em.blendDurMS = float32(durationMS)
-			em.blendElapsed = 0
-			em.blendActive = true
-			return
-		}
-	}
-}
-
 // DestroyEmitter removes the first emitter matching the given pdDictID.
 func (ps *ParticleSystem) DestroyEmitter(emitterID int32) {
 	if ps == nil {
@@ -333,10 +305,18 @@ func (ps *ParticleSystem) DestroyEmitter(emitterID int32) {
 	}
 	for i, em := range ps.emitters {
 		if em.emitterID == emitterID {
-			ps.emitters = append(ps.emitters[:i], ps.emitters[i+1:]...)
+			ps.removeAt(i)
 			return
 		}
 	}
+}
+
+// removeAt drops emitter i, which destroys it: its motif blenders unlink.
+func (ps *ParticleSystem) removeAt(i int) {
+	em := ps.emitters[i]
+	em.alive = false
+	em.unlinkBlenders()
+	ps.emitters = append(ps.emitters[:i], ps.emitters[i+1:]...)
 }
 
 // EmitterHasParticles returns true if an emitter with the given emitter ID
@@ -370,7 +350,9 @@ func (ps *ParticleSystem) DrainEmitter(emitterID int32) {
 
 // Update ticks all emitters: births new particles, ages and kills old ones.
 // Port of VIParticleEmitter::Update (0x004570E8).
-// camX/Y/Z used for distance culling — emitters beyond 150 units skip birthing and aging.
+// camX/Y/Z are for the 100-unit purge, which applies only to zone and model
+// emitters: VIParticleSprite::Raster and VICSprite::UpdateParticleEmitters purge
+// past 100, while a spell's CreateEmitter updates at any distance.
 func (ps *ParticleSystem) Update(dt float32, camX, camY, camZ float32) {
 	if ps == nil {
 		return
@@ -387,7 +369,15 @@ func (ps *ParticleSystem) Update(dt float32, camX, camY, camZ float32) {
 		dtSum += ps.dtHistory[i]
 	}
 	dt = dtSum * 0.125 // divide by 8
+	ps.deltaTime = dt
 	now := time.Now()
+
+	// The free pool: VIParticleSystem holds 2,000 particles and an emitter's
+	// births stop when they are all in use.
+	free := maxParticles
+	for _, em := range ps.emitters {
+		free -= len(em.particles)
+	}
 
 	// PS2 VIParticleSprite::Raster: 100.0f cull distance (Purge kills all particles)
 	const emitterCullDistSq = float32(100 * 100)
@@ -397,187 +387,240 @@ func (ps *ParticleSystem) Update(dt float32, camX, camY, camZ float32) {
 	for i := len(ps.emitters) - 1; i >= 0; i-- {
 		em := ps.emitters[i]
 		if !em.alive {
-			ps.emitters = append(ps.emitters[:i], ps.emitters[i+1:]...)
+			free += len(em.particles)
+			ps.removeAt(i)
 			continue
 		}
 		// Auto-expire
 		if em.maxLife > 0 && now.Sub(em.startTime) > em.maxLife {
-			em.alive = false
-			ps.emitters = append(ps.emitters[:i], ps.emitters[i+1:]...)
+			free += len(em.particles)
+			ps.removeAt(i)
 			continue
 		}
 		// Draining emitters (from DestroyEmitter event): remove when all particles dead.
 		// PS2 ProcessInactiveEvents keeps destroyed emitters alive until their
 		// resource check returns <= 0 (no more live particles).
 		if em.draining && len(em.particles) == 0 {
-			em.alive = false
-			ps.emitters = append(ps.emitters[:i], ps.emitters[i+1:]...)
+			ps.removeAt(i)
 			continue
 		}
-		// Zone emitters (torches/lamps) suppressed during daytime, except always-on (blue flames)
-		if em.isZone && !em.alwaysOn && !ps.ZoneLightsOn {
-			em.culled = true
-			continue
-		}
+		// Zone emitters burn day and night: VIParticleSprite::Raster has no
+		// time-of-day gate, only the 100-unit purge below. (The old gate hid
+		// every torch whose flame was not bluer than red until 19:00.)
 		// Distance cull — PS2 Purge() kills all particles when dist > 100.
-		if doCull {
+		if doCull && em.isZone {
 			dx := em.pos[0] - camX
 			dy := em.pos[1] - camY
 			dz := em.pos[2] - camZ
 			if dx*dx+dy*dy+dz*dz > emitterCullDistSq {
 				em.culled = true
+				free += len(em.particles)
 				em.particles = em.particles[:0] // PS2: Purge kills all particles
+				em.prevPos = em.pos            // SetLocation still ran this frame
 				continue
 			}
 			em.culled = false
 		}
-		// Advance motif blend interpolation
-		if em.blendActive {
-			em.blendElapsed += dt * 1000 // convert to ms
-			if em.blendElapsed >= em.blendDurMS {
-				// Blend complete — snap to target motif
-				em.activeMotif = em.blendTo
-				em.blendActive = false
-				em.blendFrom = nil
-				em.blendTo = nil
+		em.update(dt, &free)
+	}
+}
+
+// getAttr returns the emitter's current attributes: its definition with the
+// linked motifs blended in (VIParticleEmitter::m_attributes).
+func (em *ParticleEmitter) getAttr() *esf.ParticleAttributes {
+	if !em.attrsInit {
+		em.blendMotifs()
+	}
+	return &em.attrs
+}
+
+// gravityOf is the m_gravity ParseParticleDefinition stores: SetGravityOn
+// writes -5 or 0.
+func gravityOf(a *esf.ParticleAttributes) float32 {
+	if a.GravityOn {
+		return particleGravity
+	}
+	return 0
+}
+
+// blendMotifs is VIParticleEmitter::BlendMotifs + VIParticleDefinitionEx::
+// BlendMotifs: when a blender changed, the attributes are rebuilt as the
+// definition plus (motif - definition) * factor for each motif in definition
+// order, every motif with a nonzero factor adding its own share. A motif's
+// factor is that of the last blender linked to it.
+func (em *ParticleEmitter) blendMotifs() {
+	changed := !em.attrsInit
+	for _, b := range em.blenders {
+		if b.changed {
+			b.changed = false
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	base := &em.def.Base
+	em.attrs = *base
+	em.gravity = gravityOf(base)
+	em.attrsInit = true
+	for i := range em.def.Motifs {
+		m := &em.def.Motifs[i]
+		var f float32
+		for _, b := range em.blenders {
+			if b.motif == m {
+				f = b.factor
 			}
 		}
-		em.update(dt)
-	}
-}
-
-// getAttr returns the active particle attributes (motif override or base).
-// When a motif blend is active, returns interpolated attributes.
-func (em *ParticleEmitter) getAttr() *esf.ParticleAttributes {
-	if em.blendActive && em.blendFrom != nil && em.blendTo != nil {
-		t := em.blendElapsed / em.blendDurMS
-		if t > 1 {
-			t = 1
+		if f == 0 {
+			continue
 		}
-		blended := lerpParticleAttrs(em.blendFrom, em.blendTo, t)
-		return &blended
+		blendAttrs(&em.attrs, base, &m.Attributes, f)
+		em.gravity += (gravityOf(&m.Attributes) - gravityOf(base)) * f
 	}
-	if em.activeMotif != nil {
-		return em.activeMotif
-	}
-	return &em.def.Base
+	em.attrs.GravityOn = em.gravity < 0 // VIParticleAttributes::GravityOn
 }
 
-// lerpParticleAttrs interpolates between two ParticleAttributes by t (0-1).
-// PS2 VIMotifBlender does this per-frame during SetEmitterMotif duration.
-func lerpParticleAttrs(a, b *esf.ParticleAttributes, t float32) esf.ParticleAttributes {
-	inv := 1.0 - t
-	r := esf.ParticleAttributes{
-		Friction:        a.Friction*inv + b.Friction*t,
-		Birthrate:       a.Birthrate*inv + b.Birthrate*t,
-		BirthrateVar:    a.BirthrateVar*inv + b.BirthrateVar*t,
-		Lifespan:        a.Lifespan*inv + b.Lifespan*t,
-		LifespanVar:     a.LifespanVar*inv + b.LifespanVar*t,
-		Velocity:        a.Velocity*inv + b.Velocity*t,
-		VelocityVar:     a.VelocityVar*inv + b.VelocityVar*t,
-		StartSize:       a.StartSize*inv + b.StartSize*t,
-		StartSizeVar:    a.StartSizeVar*inv + b.StartSizeVar*t,
-		EndSize:         a.EndSize*inv + b.EndSize*t,
-		EndSizeVar:      a.EndSizeVar*inv + b.EndSizeVar*t,
-		InheritVelocity: a.InheritVelocity*inv + b.InheritVelocity*t,
-		DeltaSpawn:      a.DeltaSpawn*inv + b.DeltaSpawn*t,
-		GradientRepeat:  a.GradientRepeat*inv + b.GradientRepeat*t,
-		GravityOn:       b.GravityOn, // boolean — use target
+// blendAttrs adds one motif's share, out += (m - base) * f, field by field as
+// VIParticleDefinitionEx::BlendMotifs does. The "set" flags the PS2 recomputes
+// afterwards are the nonzero tests update() already makes.
+func blendAttrs(out, base, m *esf.ParticleAttributes, f float32) {
+	lerp := func(o *float32, b, v float32) { *o += (v - b) * f }
+	lerp(&out.Friction, base.Friction, m.Friction)
+	lerp(&out.Birthrate, base.Birthrate, m.Birthrate)
+	lerp(&out.BirthrateVar, base.BirthrateVar, m.BirthrateVar)
+	lerp(&out.Lifespan, base.Lifespan, m.Lifespan)
+	lerp(&out.LifespanVar, base.LifespanVar, m.LifespanVar)
+	lerp(&out.Velocity, base.Velocity, m.Velocity)
+	lerp(&out.VelocityVar, base.VelocityVar, m.VelocityVar)
+	lerp(&out.StartSize, base.StartSize, m.StartSize)
+	lerp(&out.StartSizeVar, base.StartSizeVar, m.StartSizeVar)
+	lerp(&out.EndSize, base.EndSize, m.EndSize)
+	lerp(&out.EndSizeVar, base.EndSizeVar, m.EndSizeVar)
+	color := func(o *esf.Color32F, b, v esf.Color32F) {
+		lerp(&o.R, b.R, v.R)
+		lerp(&o.G, b.G, v.G)
+		lerp(&o.B, b.B, v.B)
+		lerp(&o.A, b.A, v.A)
 	}
-	// Lerp color variance
-	r.StartColorVar = lerpColor32F(a.StartColorVar, b.StartColorVar, t)
-	r.EndColorVar = lerpColor32F(a.EndColorVar, b.EndColorVar, t)
-	// Lerp gradient
-	for i := 0; i < 32; i++ {
-		r.Gradient[i] = lerpColor32F(a.Gradient[i], b.Gradient[i], t)
+	for i := range out.Gradient {
+		color(&out.Gradient[i], base.Gradient[i], m.Gradient[i])
 	}
-	// Lerp offset/axis vectors
+	color(&out.StartColorVar, base.StartColorVar, m.StartColorVar)
+	color(&out.EndColorVar, base.EndColorVar, m.EndColorVar)
+	lerp(&out.InheritVelocity, base.InheritVelocity, m.InheritVelocity)
+	lerp(&out.DeltaSpawn, base.DeltaSpawn, m.DeltaSpawn)
+	lerp(&out.GradientRepeat, base.GradientRepeat, m.GradientRepeat)
 	for j := 0; j < 3; j++ {
-		r.InnerOffset[j] = a.InnerOffset[j]*inv + b.InnerOffset[j]*t
-		r.InnerHprVar[j] = a.InnerHprVar[j]*inv + b.InnerHprVar[j]*t
-		r.OuterOffset[j] = a.OuterOffset[j]*inv + b.OuterOffset[j]*t
-		r.OuterHprVar[j] = a.OuterHprVar[j]*inv + b.OuterHprVar[j]*t
-		r.NozzleAxis[j] = a.NozzleAxis[j]*inv + b.NozzleAxis[j]*t
-		r.NozzleHprVar[j] = a.NozzleHprVar[j]*inv + b.NozzleHprVar[j]*t
-	}
-	return r
-}
-
-func lerpColor32F(a, b esf.Color32F, t float32) esf.Color32F {
-	inv := 1.0 - t
-	return esf.Color32F{
-		R: a.R*inv + b.R*t,
-		G: a.G*inv + b.G*t,
-		B: a.B*inv + b.B*t,
-		A: a.A*inv + b.A*t,
+		lerp(&out.InnerOffset[j], base.InnerOffset[j], m.InnerOffset[j])
+		lerp(&out.InnerHprVar[j], base.InnerHprVar[j], m.InnerHprVar[j])
+		lerp(&out.OuterOffset[j], base.OuterOffset[j], m.OuterOffset[j])
+		lerp(&out.OuterHprVar[j], base.OuterHprVar[j], m.OuterHprVar[j])
+		lerp(&out.NozzleAxis[j], base.NozzleAxis[j], m.NozzleAxis[j])
+		lerp(&out.NozzleHprVar[j], base.NozzleHprVar[j], m.NozzleHprVar[j])
 	}
 }
 
-// update handles one emitter's per-frame logic.
-func (em *ParticleEmitter) update(dt float32) {
-	attr := em.getAttr()
+// texFrame is the sprite-sheet layout a new particle draws with, picked by
+// VIParticleEmitter::Update off the definition's texture configuration: 1 is
+// the whole texture, 2 a random half, 3 one of three quadrants, 4 one of four.
+func texFrame(config int32) int32 {
+	switch config {
+	case 2:
+		return 5 + rand.Int31n(2)
+	case 3:
+		return 1 + rand.Int31n(3)
+	case 4:
+		return 1 + rand.Int31n(4)
+	}
+	return 0
+}
 
-	// Age existing particles, apply friction, and remove dead ones
+// billboardFrameUV is the UV rectangle of each layout in BeginBillboards'
+// table (bb->m_frame = frame << 2 indexes its corners): the whole texture, the
+// four quadrants (top-left, top-right, bottom-left, bottom-right) and the
+// left and right halves.
+var billboardFrameUV = [7][4]float32{
+	{0, 0, 1, 1},
+	{0, 0, 0.5, 0.5},
+	{0.5, 0, 1, 0.5},
+	{0, 0.5, 0.5, 1},
+	{0.5, 0.5, 1, 1},
+	{0, 0, 0.5, 1},
+	{0.5, 0, 1, 1},
+}
+
+// update is one frame of an emitter. Its particles age and die here (the
+// half of VIParticleSystem::Render that moves them is Render's analytic
+// position), then, unless it is draining or purged, VIParticleEmitter::Update
+// births. free is the room left in the 2,000-particle pool.
+//
+// prevPos is m_lastLocation: the location at the previous update, however
+// many SetPositions came between. It used to be overwritten by SetPosition
+// itself, which left pos - prevPos zero at every update: DeltaSpawn never
+// added a particle and the births were never spread along the path moved.
+func (em *ParticleEmitter) update(dt float32, free *int) {
+	// Age existing particles and remove dead ones
 	for i := len(em.particles) - 1; i >= 0; i-- {
 		p := &em.particles[i]
 		p.Age += dt
 		if p.Age >= p.Lifespan {
 			em.particles[i] = em.particles[len(em.particles)-1]
 			em.particles = em.particles[:len(em.particles)-1]
+			*free++
 		}
 	}
 
-	// Birth new particles (skip if distance-culled or draining)
-	// PS2: draining emitters (isActive=false) stop birthing but keep particles alive.
-	if em.culled || em.draining || attr.Birthrate <= 0 || attr.Lifespan <= 0 {
+	// SetLocation's first call makes the last location the location.
+	if !em.hasPrevPos {
+		em.prevPos = em.pos
+		em.hasPrevPos = true
+	}
+
+	// PS2: a draining emitter (ProcessCreateEmitter with active=false) is not
+	// updated: no births, and its attributes stay as they were.
+	if em.culled || em.draining {
+		em.prevPos = em.pos
 		return
 	}
-	// PS2: birthrate with triangular random variance per-frame.
-	// Decompiled: birthrate = attrs.Birthrate + attrs.BirthrateVar * triangleRand()
-	effectiveBR := attr.Birthrate + attr.BirthrateVar*triangleRand()
-	if effectiveBR < 0 {
-		effectiveBR = 0
+	em.blendMotifs()
+	attr := &em.attrs
+
+	// n = (birthrate + VIRAND·var)·dt + |moved|·DeltaSpawn + last frame's
+	// fraction. Nothing is clamped: a negative n is carried as a debt, and a
+	// motif with no birthrate still births from movement alone (a trail).
+	move := vsub(em.pos, em.prevPos)
+	n := (attr.Birthrate + triangleRand()*attr.BirthrateVar) * dt
+	if attr.DeltaSpawn != 0 {
+		n += vlen(move) * attr.DeltaSpawn
 	}
-	em.birthAccum += effectiveBR * dt
+	n += em.birthAccum
+	births := int(n)
+	em.birthAccum = n - float32(births)
 
-	// PS2 DeltaSpawn (emitter+0x318): augment birth count by distance moved.
-	// Decompiled from VIParticleEmitter::Update at 0x004571A0-0x004571D8:
-	//   if (deltaSpawn != 0): births += length(pos - prevPos) * deltaSpawn
-	// This creates denser particle trails when the emitter moves quickly.
-	if attr.DeltaSpawn != 0 && em.hasPrevPos {
-		dx := em.pos[0] - em.prevPos[0]
-		dy := em.pos[1] - em.prevPos[1]
-		dz := em.pos[2] - em.prevPos[2]
-		dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
-		em.birthAccum += dist * attr.DeltaSpawn
+	// The emitter's velocity for InheritVelocity: (location - lastLocation)
+	// times 1/DeltaTime.
+	if dt > 0 {
+		em.vel = vscale(move, 1/dt)
 	}
 
-	births := int(em.birthAccum)
-	em.birthAccum -= float32(births)
-
-	// PS2 spawn position interpolation (0x00457458-0x00457490):
-	// PS2 always starts at lastPos and advances by (pos-lastPos)/N after each birth.
-	// Particles are distributed: lastPos, lastPos+step, ..., lastPos+(N-1)*step.
+	// The births are spread along the path: lastLocation, then a step of
+	// (location - lastLocation)/count after each.
+	spawnBaseX, spawnBaseY, spawnBaseZ := em.prevPos[0], em.prevPos[1], em.prevPos[2]
 	var spawnStepX, spawnStepY, spawnStepZ float32
-	var spawnBaseX, spawnBaseY, spawnBaseZ float32
-	if em.hasPrevPos {
-		spawnBaseX, spawnBaseY, spawnBaseZ = em.prevPos[0], em.prevPos[1], em.prevPos[2]
-		if births > 0 {
-			invB := 1.0 / float32(births)
-			spawnStepX = (em.pos[0] - em.prevPos[0]) * invB
-			spawnStepY = (em.pos[1] - em.prevPos[1]) * invB
-			spawnStepZ = (em.pos[2] - em.prevPos[2]) * invB
-		}
-	} else {
-		spawnBaseX, spawnBaseY, spawnBaseZ = em.pos[0], em.pos[1], em.pos[2]
+	if births > 0 {
+		step := vscale(move, 1/float32(births))
+		spawnStepX, spawnStepY, spawnStepZ = step[0], step[1], step[2]
 	}
+	em.prevPos = em.pos
 
-	for b := 0; b < births; b++ {
+	for b := 0; b < births && *free > 0; b++ {
+		*free--
 		p := Particle{alive: true}
 
 		// PS2 VIParticleEmitter::Update: position offset and nozzle direction.
 		// Order: nozzle HPR → outer HPR → inner HPR → world-space transform.
-		// PS2 does NOT normalize nozzle axis — length scales velocity.
+		// The axis is unit length as parsed (SetNozzleAxis normalizes); a
+		// motif blend can shorten it, and that scales the velocity.
 		nozzleDir := [3]float32{attr.NozzleAxis[0], attr.NozzleAxis[1], attr.NozzleAxis[2]}
 		posOffset := [3]float32{0, 0, 0}
 
@@ -672,25 +715,19 @@ func (em *ParticleEmitter) update(dt float32) {
 		// Friction (velocity dampening per second)
 		p.Friction = attr.Friction
 
-		// Size (halved = radius, matching PS2)
+		// Size (halved = radius, matching PS2). Not clamped: a negative size
+		// is a billboard with both axes flipped, the same size drawn upside down.
 		ss := (attr.StartSize + attr.StartSizeVar*triangleRand()) * 0.5
 		es := (attr.EndSize + attr.EndSizeVar*triangleRand()) * 0.5
-		if ss < 0 {
-			ss = 0
-		}
-		if es < 0 {
-			es = 0
-		}
 		p.StartSize = ss
 		p.GrowthRate = (es - ss) / p.Lifespan
 
 		// PS2 stores gradientRepeat per-particle at birth (particle+0x1C)
 		p.GradientRepeat = attr.GradientRepeat
 
-		// Gravity
-		if attr.GravityOn {
-			p.Gravity = particleGravity
-		}
+		// Gravity: m_gravity, -5 or 0 unless a motif blend sits between
+		p.Gravity = em.gravity
+		p.Frame = texFrame(em.def.TexConfig)
 
 		// PS2: StartColorVar/EndColorVar are used only in motif blending
 		// (VIMotifBlender), NOT per-particle. No per-particle color variance.
@@ -704,30 +741,20 @@ func (em *ParticleEmitter) update(dt float32) {
 	}
 }
 
-// SetPosition updates the emitter's world position (called each frame by spell driver).
-// The stored offset from the event floats is automatically applied.
-// Computes emitter velocity for InheritVelocity particle births.
+// SetPosition is VIParticleEmitter::SetLocation (the stored offset applied).
+// The last location is NOT taken here but at each update, so the distance an
+// update sees is the whole move since the previous one even when the spell
+// driver and the render loop both place the emitter in one frame. The first
+// location is also the last, as SetLocation's first call makes it.
 func (em *ParticleEmitter) SetPosition(x, y, z float32) {
 	if em == nil {
 		return
 	}
-	newPos := [3]float32{x + em.offset[0], y + em.offset[1], z + em.offset[2]}
-	if em.hasPrevPos {
-		// PS2 VIParticleEmitter::Update: emitterVel = (pos - lastPos) * invDeltaTime
-		// Use actual frame delta from Raylib (PS2 uses smoothed 8-frame rolling average)
-		dt := rl.GetFrameTime()
-		if dt < 0.001 {
-			dt = 0.033 // fallback
-		}
-		em.vel = [3]float32{
-			(newPos[0] - em.prevPos[0]) / dt,
-			(newPos[1] - em.prevPos[1]) / dt,
-			(newPos[2] - em.prevPos[2]) / dt,
-		}
+	em.pos = [3]float32{x + em.offset[0], y + em.offset[1], z + em.offset[2]}
+	if !em.hasPrevPos {
+		em.prevPos = em.pos
+		em.hasPrevPos = true
 	}
-	em.prevPos = newPos
-	em.hasPrevPos = true
-	em.pos = newPos
 }
 
 // SetFacing updates the emitter's direction angle (actor facing).
@@ -754,10 +781,13 @@ func (em *ParticleEmitter) SetTrackPos(x, y, z float32) {
 // Port of VIParticleSprite::Raster (0x00454FB0) — billboard rendering path.
 //
 // PS2 per-definition rendering flags (from SPELLFX.ESF survey, 332 defs):
-//   BlendMode 1 (additive): 317 (95.5%)  BlendMode 3 (alpha): 14 (4.2%)
-//   ZWrite=false: 305 (91.9%)  ZWrite=true: 27 (8.1%)
-//   ZTest=true: 305 (91.9%)  ZTest=false: 27 (8.1%)
-//   ZWrite/ZTest are anti-correlated: ZWrite=true ↔ ZTest=false (ground decals)
+//   BlendMode 1 (additive): 317  BlendMode 3 (alpha): 14  BlendMode 2: 1
+//   ZWrite=true: 27, all of them additive with ZTest=false
+//
+// The blend is the material layer's GS ALPHA (VIMaterial::ConstructTextPass):
+// 1 = Cs·As + Cd (0x48), 2 = Cd − Cs·As (0x42), 3 = (Cs − Cd)·As + Cd (0x44),
+// 4 = Cd·As (0x89). A blended layer's TEST is ATST=NEVER with AFAIL=RGB_ONLY,
+// so it never writes Z whatever ZWrite says: only blend 0 can.
 func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 	if ps == nil {
 		return
@@ -766,19 +796,17 @@ func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 	// Camera right and up vectors for billboard computation
 	camRight, camUp := billboardVectors(camera)
 
-	// Frame delta time for attractor Euler integration
-	frameDT := rl.GetFrameTime()
-	if frameDT > 0.1 {
-		frameDT = 0.1
-	}
+	// The attractor pull is integrated on the particle system's own step.
+	frameDT := ps.deltaTime
 
 	for _, em := range ps.emitters {
 		if !em.alive || em.culled || len(em.particles) == 0 {
 			continue
 		}
 
-		// Per-definition depth mask (PS2 VIParticleDefinition::ZWrite)
-		if em.zWrite {
+		// Per-definition depth mask (PS2 VIParticleDefinition::ZWrite), which
+		// only an unblended material honours.
+		if em.zWrite && em.blendMode == 0 {
 			rl.EnableDepthMask()
 		} else {
 			rl.DisableDepthMask()
@@ -793,22 +821,18 @@ func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 		case 1:
 			rl.BeginBlendMode(rl.BlendAdditive)
 		case 2:
-			rl.BeginBlendMode(rl.BlendSubtractColors)
-		default: // 0, 3, or other = standard alpha blend
+			// Cd − Cs·As. raylib's BlendSubtractColors is Cs − Cd.
+			rl.SetBlendFactors(rl.SrcAlpha, rl.One, rl.FuncReverseSubtract)
+			rl.BeginBlendMode(rl.BlendCustom)
+		case 4:
+			rl.SetBlendFactors(rl.Zero, rl.SrcAlpha, rl.FuncAdd)
+			rl.BeginBlendMode(rl.BlendCustom)
+		default: // 3; 0 is opaque with an alpha test on the PS2, approximated
 			rl.BeginBlendMode(rl.BlendAlpha)
 		}
 
 		tex, hasTex := ps.texCache[em.texID]
 		attr := em.getAttr()
-
-		// PS2 TexConfig: NOT a UV atlas selector. Disassembly of
-		// VIParticleEmitter::Update (0x004572C8) shows TexConfig selects a
-		// per-particle material palette index range for random variation:
-		//   Case 1: index=0 always (96% of PDs)
-		//   Case 4: index=random{1-4} (4% of PDs)
-		// BeginBillboards (0x00402780) hardcodes full-texture UVs.
-		// All particles use the full texture, not atlas quadrants.
-		var u0, v0, u1, v1 float32 = 0, 0, 1, 1
 
 		// Bind texture and begin batch for all particles in this emitter.
 		if hasTex && tex.ID > 0 {
@@ -822,39 +846,14 @@ func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 				continue
 			}
 
-			// Analytical position computation.
-			// PS2 uses Euler: pos += vel*dt, vel *= (1-f*dt), vel.y += g*dt.
-			// We solve the ODE exactly: dv/dt = -f*v + g (friction-damped gravity).
 			t := p.Age
-			var px, py, pz float32
-			if p.Friction > 0.001 {
-				// Exact solution for velocity with friction:
-				//   v(t) = v₀ * exp(-f*t)  (horizontal)
-				//   v_y(t) = (v₀_y + g/f) * exp(-f*t) - g/f  (vertical, with gravity)
-				// Position integrals:
-				//   p(t) = p₀ + v₀ * (1-exp(-f*t)) / f  (horizontal)
-				//   p_y(t) = p₀_y + (v₀_y + g/f) * (1-exp(-f*t))/f - g*t/f  (vertical)
-				expDecay := float32(math.Exp(float64(-p.Friction * t)))
-				oneMinusExp := 1.0 - expDecay
-				invF := 1.0 / p.Friction
-				displace := oneMinusExp * invF // = (1-exp(-f*t))/f
-				px = p.BirthPos[0] + p.BirthVel[0]*displace
-				pz = p.BirthPos[2] + p.BirthVel[2]*displace
-				// Gravity+friction: terminal velocity = g/f
-				gOverF := p.Gravity * invF
-				py = p.BirthPos[1] + (p.BirthVel[1]+gOverF)*displace - gOverF*t
-			} else {
-				t2 := t * t
-				px = p.BirthPos[0] + p.BirthVel[0]*t
-				py = p.BirthPos[1] + p.BirthVel[1]*t + 0.5*p.Gravity*t2
-				pz = p.BirthPos[2] + p.BirthVel[2]*t
-			}
+			px, py, pz := p.analyticPos()
 
 			// Attractor: PS2 Render() applies per-frame: vel += normalize(dir)*strength*dt
 			// Direction is normalized, so pull magnitude is constant regardless of distance.
 			// Since analytical physics can't integrate a changing-direction force, we
 			// Euler-accumulate attractor velocity/displacement per-particle each frame.
-			if em.attractorActive && em.attractorStrength > 0 {
+			if em.attractorActive {
 				// Current position including prior attractor displacement
 				apx := px + p.AttrDisp[0]
 				apy := py + p.AttrDisp[1]
@@ -863,6 +862,15 @@ func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 				dy := em.attractorPos[1] - apy
 				dz := em.attractorPos[2] - apz
 				dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
+				// The PS2 steps pos += vel·dt, then vel *= 1 − f·dt, then
+				// adds the pull; the pull's share of vel is damped too.
+				p.AttrDisp[0] += p.AttrVel[0] * frameDT
+				p.AttrDisp[1] += p.AttrVel[1] * frameDT
+				p.AttrDisp[2] += p.AttrVel[2] * frameDT
+				damp := 1 - p.Friction*frameDT
+				p.AttrVel[0] *= damp
+				p.AttrVel[1] *= damp
+				p.AttrVel[2] *= damp
 				if dist > 0.01 {
 					// Normalize direction (PS2 calls VIVect3::Normalize)
 					invDist := 1.0 / dist
@@ -875,10 +883,6 @@ func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 					p.AttrVel[1] += ny * pull
 					p.AttrVel[2] += nz * pull
 				}
-				// pos += attrVel * dt
-				p.AttrDisp[0] += p.AttrVel[0] * frameDT
-				p.AttrDisp[1] += p.AttrVel[1] * frameDT
-				p.AttrDisp[2] += p.AttrVel[2] * frameDT
 				px += p.AttrDisp[0]
 				py += p.AttrDisp[1]
 				pz += p.AttrDisp[2]
@@ -890,9 +894,10 @@ func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 			// emitter. Combined with short lifespans and high birthrate, this
 			// creates the effect of particles "following" the entity.
 
-			// Size
+			// Size. A negative one flips both billboard axes: the quad is the
+			// same size, its texture turned half a turn.
 			size := p.StartSize + p.GrowthRate*t
-			if size <= 0 {
+			if size == 0 {
 				continue
 			}
 
@@ -900,11 +905,7 @@ func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 			// PS2 VIParticleSystem::Render: index = (int)(age * 31.0 * gradientRepeat) & 31
 			// gradientRepeat is per-particle (stored at birth), gradient colors from emitter.
 			progress := p.Age / p.Lifespan
-			gradRepeat := p.GradientRepeat
-			if gradRepeat <= 0 {
-				gradRepeat = 1
-			}
-			gradIdx := int(progress*31.0*gradRepeat) & 31
+			gradIdx := int(progress*31.0*p.GradientRepeat) & 31
 			c := attr.Gradient[gradIdx]
 			cr := c.R
 			cg := c.G
@@ -918,14 +919,24 @@ func (ps *ParticleSystem) Render(camera rl.Camera3D) {
 				A: uint8(mathutil.ClampF(ca*255, 0, 255)),
 			}
 
-			// Skip invisible particles
-			if em.blendMode == 1 {
-				if clr.R == 0 && clr.G == 0 && clr.B == 0 {
+			// Skip particles that cannot change the frame. A multiply (4) at
+			// alpha 0 blacks the frame out, so it is always drawn.
+			switch em.blendMode {
+			case 1:
+				if (clr.R == 0 && clr.G == 0 && clr.B == 0) || clr.A == 0 {
 					continue
 				}
-			} else if clr.A == 0 {
-				continue
+			case 4:
+			default:
+				if clr.A == 0 {
+					continue
+				}
 			}
+			uv := billboardFrameUV[0]
+			if p.Frame > 0 && int(p.Frame) < len(billboardFrameUV) {
+				uv = billboardFrameUV[p.Frame]
+			}
+			u0, v0, u1, v1 := uv[0], uv[1], uv[2], uv[3]
 
 			// Billboard quad corners
 			cx, cy, cz := px, py, pz
@@ -1023,6 +1034,31 @@ func (ps *ParticleSystem) ensureTexture(dictID int32) {
 	rl.SetTextureWrap(tex, rl.WrapClamp)
 
 	ps.texCache[dictID] = tex
+}
+
+// analyticPos is where VIParticleSystem::Render's Euler step puts a particle,
+// solved exactly: pos += vel·dt, vel *= 1 − f·dt, vel.y += g·dt is, as dt → 0,
+// dv/dt = −f·v + g. Without friction that is p₀ + v₀t + ½gt²; with it the
+// velocity relaxes to the terminal g/f:
+//   p(t) = p₀ + (v₀ − g/f)·(1 − e^(−ft))/f + (g/f)·t   (g on y only)
+// The friction branch had g's sign flipped, so with friction on, gravity LIFTED
+// the particle toward −g/f (21 attribute sets in SPELLFX have both).
+func (p *Particle) analyticPos() (px, py, pz float32) {
+	t := p.Age
+	if p.Friction > 0.001 {
+		expDecay := float32(math.Exp(float64(-p.Friction * t)))
+		invF := 1.0 / p.Friction
+		displace := (1.0 - expDecay) * invF // (1 − e^(−ft))/f
+		gOverF := p.Gravity * invF
+		px = p.BirthPos[0] + p.BirthVel[0]*displace
+		py = p.BirthPos[1] + (p.BirthVel[1]-gOverF)*displace + gOverF*t
+		pz = p.BirthPos[2] + p.BirthVel[2]*displace
+		return
+	}
+	px = p.BirthPos[0] + p.BirthVel[0]*t
+	py = p.BirthPos[1] + p.BirthVel[1]*t + 0.5*p.Gravity*t*t
+	pz = p.BirthPos[2] + p.BirthVel[2]*t
+	return
 }
 
 // billboardVectors computes camera right and up vectors for billboard rendering.
