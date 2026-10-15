@@ -337,7 +337,7 @@ func (c *Client) loadWeatherTextures() {
 	c.weather.SetTextures(rain, snow, splash)
 }
 
-// worldESFName maps PS2 world IDs to ESF filenames.
+// worldESFName maps PS2 world IDs to ESF filenames: the retail table's six.
 var worldESFName = map[byte]string{
 	0: "TUNARIA.ESF",
 	1: "RATHE.ESF",
@@ -347,9 +347,29 @@ var worldESFName = map[byte]string{
 	5: "SECRETS.ESF",
 }
 
+// sandstormWorldESFName is the two worlds Sandstorm's S2 adds to the table
+// (cave 0x000FC900): 6 is data3\Underfoot.esf, which is on no disc (found
+// only if the assets folder has it), and 7 is Secrets again.
+var sandstormWorldESFName = map[byte]string{
+	6: "UNDERFOOT.ESF",
+	7: "SECRETS.ESF",
+}
+
+// worldESF is the ESF a world id loads under the active server's rules.
+func worldESF(worldID byte) (string, bool) {
+	if name, ok := worldESFName[worldID]; ok {
+		return name, true
+	}
+	if models.ActiveRules == models.RulesSandstorm {
+		name, ok := sandstormWorldESFName[worldID]
+		return name, ok
+	}
+	return "", false
+}
+
 // switchWorldTerrain unloads the current terrain and loads a new world's ESF.
 func (c *Client) switchWorldTerrain(worldID byte) {
-	esfName, ok := worldESFName[worldID]
+	esfName, ok := worldESF(worldID)
 	if !ok {
 		log.Printf("switchWorldTerrain: unknown world ID %d", worldID)
 		return
@@ -467,7 +487,7 @@ func entityEquipment(ent *game.Entity, mgr *models.ModelManager) *models.Equipme
 		Gloves:     r.ClampArmorSet(ent.Gloves),
 		Legs:       r.ClampArmorSet(ent.Legs),
 		Boots:      r.ClampArmorSet(ent.Boots),
-		Helm:       r.ClampArmorSet(ent.Helm),
+		Helm:       r.Helm(r.ClampArmorSet(ent.Helm)),
 		Robe:       r.Robe(ent.Robe),
 		ChestTint:  ent.ChestTint,
 		BracerTint: ent.BracerTint,

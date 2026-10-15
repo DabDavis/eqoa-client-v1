@@ -1984,8 +1984,13 @@ func (c *Client) drawMenuNearby(startY, contentH int32) {
 
 func (c *Client) drawMenuSocial(startY, contentH int32) {
 
-	// Sub-tab bar: Who / Group / LFG / Auction
-	innerY := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Who", "Group", "LFG", "Auction"}, &c.socialSubTab)
+	// Sub-tab bar: Who / Group / LFG / Auction. On Sandstorm the third is its
+	// player search (Register / Unregister / Search, S2's Group menu items).
+	third := "LFG"
+	if models.ActiveRules == models.RulesSandstorm {
+		third = "Search"
+	}
+	innerY := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Who", "Group", third, "Auction"}, &c.socialSubTab)
 	innerH := contentH - 26
 
 	switch c.socialSubTab {
@@ -1994,7 +1999,11 @@ func (c *Client) drawMenuSocial(startY, contentH int32) {
 	case 1:
 		c.drawMenuGroup(innerY, innerH)
 	case 2:
-		c.drawMenuLFG(innerY, innerH)
+		if models.ActiveRules == models.RulesSandstorm {
+			c.drawMenuPlayerSearch(innerY, innerH)
+		} else {
+			c.drawMenuLFG(innerY, innerH)
+		}
 	case 3:
 		c.drawMenuAuction(innerY, innerH)
 	}
@@ -2242,7 +2251,14 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	c.uiLabel(panelLeft, y, "Name:", 11, colorDim)
 	y += lineH
 	if c.auctionLevelMin == 0 { c.auctionLevelMin = 1 }
-	if c.auctionLevelMax == 0 { c.auctionLevelMax = 60 }
+	if c.auctionLevelMax == 0 {
+		// Retail's Auctions window opens on Max. Level 50; Sandstorm's S2
+		// makes it 60 (CLIENT+0x5CFE4).
+		c.auctionLevelMax = 50
+		if models.ActiveRules == models.RulesSandstorm {
+			c.auctionLevelMax = 60
+		}
+	}
 	c.uiTextInput(panelLeft, y, filterW, &c.auctionSearchName, &c.auctionSearchFocus, 20)
 	y += 24
 
@@ -2356,45 +2372,13 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	}
 }
 
-// auctionDoSearch sends an auction search with current filter settings.
+// auctionDoSearch starts an auction search with the window's settings: the
+// search text and the level range, the rest as an untouched PS2 window has it.
 func (c *Client) auctionDoSearch(gs *game.GameState) {
-	gs.AuctionItems = nil
-	gs.AuctionLastListing = 0
-	gs.AuctionSeq = 0
-	seq := gs.AuctionSessionID
-	if seq == 0 { seq = 0x04 }
-
-	// Build search filter matching PS2 format
-	var filter []byte
-	filter = append(filter, 0x01, 0x01) // flags
-
-	// Name/type filter
-	searchName := c.auctionSearchName
-	if searchName == "" {
-		// No filter: 9 zero bytes
-		filter = append(filter, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
-	} else {
-		// Type filter: uint32(charCount) + UTF-16LE(name)
-		filter = append(filter, 0x00, 0x00, 0x00, 0x00) // nameLen = 0 (no name filter)
-		runes := []rune(searchName)
-		lenBytes := make([]byte, 4)
-		lenBytes[0] = byte(len(runes))
-		filter = append(filter, lenBytes...)
-		for _, r := range runes {
-			filter = append(filter, byte(r), byte(r>>8))
-		}
-	}
-
-	// Class mask (all classes)
-	filter = append(filter, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
-
-	// Level range
-	filter = append(filter, byte(c.auctionLevelMin), byte(c.auctionLevelMax))
-
-	// Unk + max price + sort
-	filter = append(filter, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01)
-
-	c.engine.SendAuctionRequest(0x07, seq, filter)
+	f := game.DefaultAuctionFilter(c.auctionLevelMax)
+	f.Text = c.auctionSearchName
+	f.MinLevel = int32(c.auctionLevelMin)
+	c.engine.SendAuctionSearch(f)
 	c.auctionRequested = true
 	c.auctionFetchAll = false
 	c.menuScroll = 0

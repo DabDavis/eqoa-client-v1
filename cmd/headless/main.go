@@ -1797,22 +1797,14 @@ func handleCommand(engine *game.Engine, line string) {
 			fmt.Printf("Auction next page (seq=%d cursor=%d). Waiting...\n", gs.AuctionSeq, gs.AuctionLastListing)
 		} else if len(parts) >= 2 && parts[1] == "all" {
 			// Fetch all pages: send page 1, then auto-fetch remaining
-			gs.AuctionItems = nil // reset
-			seq := gs.AuctionSessionID
-			if seq == 0 { seq = 0x04 }
-			searchFilter := []byte{
-				0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-				0x02, 0x64, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01,
-			}
-			engine.SendAuctionRequest(0x07, seq, searchFilter)
+			engine.SendAuctionSearch(game.DefaultAuctionFilter(50))
 			fmt.Println("Auction: fetching page 1...")
 			// Auto-fetch remaining pages in background
 			go func() {
 				for page := 2; page <= 20; page++ {
 					time.Sleep(2 * time.Second)
 					gameMu.Lock()
-					done := gs.AuctionLastListing == 0 || len(gs.AuctionItems) >= gs.AuctionTotalCount
+					done := gs.AuctionLastListing == 0
 					cursor := gs.AuctionLastListing
 					if !done {
 						engine.SendAuctionNextPage()
@@ -1832,15 +1824,7 @@ func handleCommand(engine *game.Engine, line string) {
 		} else {
 			// Default: fetch page 1 (or show cached)
 			if len(gs.AuctionItems) == 0 {
-				gs.AuctionItems = nil
-				seq := gs.AuctionSessionID
-				if seq == 0 { seq = 0x04 }
-				searchFilter := []byte{
-					0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-					0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-					0x02, 0x64, 0x00, 0xFE, 0xA7, 0xD6, 0xB9, 0x07, 0x03, 0x01, 0x01,
-				}
-				engine.SendAuctionRequest(0x07, seq, searchFilter)
+				engine.SendAuctionSearch(game.DefaultAuctionFilter(50))
 				fmt.Println("Auction: fetching page 1...")
 			}
 		}
@@ -1856,6 +1840,31 @@ func handleCommand(engine *game.Engine, line string) {
 					i+1, ai.Item.Name, ai.Seller, ai.CurrentBid, buyoutStr)
 			}
 		}
+
+	case "auctionlv":
+		// auctionlv MIN MAX [text]: page 1 of a search over that level range,
+		// and optionally for a name.
+		if len(parts) < 3 {
+			fmt.Println("Usage: auctionlv <min> <max> [text]")
+			break
+		}
+		lo, _ := strconv.Atoi(parts[1])
+		hi, _ := strconv.Atoi(parts[2])
+		f := game.DefaultAuctionFilter(hi)
+		f.MinLevel = int32(lo)
+		if len(parts) >= 4 {
+			f.Text = strings.Join(parts[3:], " ")
+		}
+		engine.SendAuctionSearch(f)
+		fmt.Printf("Auction search: levels %d-%d text %q\n", lo, hi, f.Text)
+
+	case "auctionstat":
+		gs := engine.State
+		lo, hi := int64(1<<62), int64(-1)
+		for _, ai := range gs.AuctionItems {
+			lo, hi = min(lo, ai.Item.LevelReq), max(hi, ai.Item.LevelReq)
+		}
+		fmt.Printf("AUCTIONSTAT items=%d/%d levelReq %d..%d\n", len(gs.AuctionItems), gs.AuctionTotalCount, lo, hi)
 
 	case "lfg":
 		gs := engine.State

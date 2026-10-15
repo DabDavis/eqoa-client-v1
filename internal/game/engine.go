@@ -1426,10 +1426,35 @@ func (e *Engine) SendWhoList() {
 	log.Printf("Sent WhoList request token=%d", e.whoToken)
 }
 
-// SendAuctionRequest sends an auction browse/search request (opcode 0x1205).
-// sub: sub-command byte (e.g. 0x01=browse, 0x07=search).
-// page: pagination page number.
-// extra: optional additional filter/search bytes (nil for simple browse).
+// SendPlayerSearch is Sandstorm's search request (0x1502, its S2 cave
+// 0x000FFD80): race, class, minimum and maximum level, one byte each, 0xFF
+// for any. The results arrive as 0x1501 (clear) and 0x1500 (one each).
+func (e *Engine) SendPlayerSearch(race, class, minLevel, maxLevel byte) {
+	if e.State.Conn == nil {
+		return
+	}
+	e.State.Conn.QueueReliable(protocol.OpcodePlayerSearchRequest, []byte{race, class, minLevel, maxLevel})
+	log.Printf("Sent player search: race=%d class=%d level %d-%d", race, class, minLevel, maxLevel)
+}
+
+// SendPlayerSearchRegister lists (true) or unlists the player in Sandstorm's
+// player search: 0x1503 or 0x1504, an opcode and nothing else (the S2 Group
+// menu's Register / Unregister).
+func (e *Engine) SendPlayerSearchRegister(register bool) {
+	if e.State.Conn == nil {
+		return
+	}
+	op := protocol.OpcodePlayerSearchUnregister
+	if register {
+		op = protocol.OpcodePlayerSearchRegister
+	}
+	e.State.Conn.QueueReliable(op, nil)
+	log.Printf("Sent player search register=%v", register)
+}
+
+// SendAuctionRequest sends an auction request (opcode 0x1205): the
+// sub-command (7 = a search page, see auction.go), the request number as the
+// one zigzag byte it is in practice, and the rest.
 func (e *Engine) SendAuctionRequest(sub byte, seq byte, extra []byte) {
 	if e.State.Conn == nil {
 		return
@@ -1442,29 +1467,6 @@ func (e *Engine) SendAuctionRequest(sub byte, seq byte, extra []byte) {
 		log.Printf("WARNING: AuctionRequest send window full")
 	}
 	log.Printf("Sent AuctionRequest sub=0x%02X seq=%d extraLen=%d", sub, seq, len(extra))
-}
-
-// SendAuctionNextPage sends a page 2+ request using cursor from last listing ID.
-// PS2 format: sub=0x07 + seq(+2 each page) + cursor(zigzag lastListingID) + flag(01) + filter
-func (e *Engine) SendAuctionNextPage() {
-	gs := e.State
-	if gs.AuctionLastListing == 0 || gs.AuctionSeq == 0 {
-		log.Printf("AuctionNextPage: no previous page data")
-		return
-	}
-	// Zigzag-encode the cursor (lastListingID)
-	cursor := zigzagEncode(gs.AuctionLastListing)
-	// Page 2+ filter: cursor + 01 + 10 zeros + FF×8 + level + unk + price + sort
-	filter := make([]byte, 0, len(cursor)+30)
-	filter = append(filter, cursor...)
-	filter = append(filter, 0x01)                         // flag
-	filter = append(filter, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // 10 zeros (empty name+type filter)
-	filter = append(filter, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF) // class mask
-	filter = append(filter, 0x02, 0x64)                   // level 2-100
-	filter = append(filter, 0x00)                         // unk
-	filter = append(filter, 0xFE, 0xA7, 0xD6, 0xB9, 0x07) // max price
-	filter = append(filter, 0x03, 0x01, 0x01)             // sort
-	e.SendAuctionRequest(0x07, gs.AuctionSeq, filter)
 }
 
 // zigzagEncode encodes an int64 as zigzag varint bytes.

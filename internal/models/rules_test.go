@@ -43,6 +43,9 @@ func TestRulesClamps(t *testing.T) {
 	if RulesSandstorm.ClampArmorSet(9) != 9 || RulesSandstorm.ClampArmorSet(10) != 0 {
 		t.Error("sandstorm: set 9 is its own, 10 and up are 0")
 	}
+	if RulesSandstorm.Helm(9) != 4 || RulesSandstorm.Helm(3) != 3 || RulesRetail.Helm(9) != 9 {
+		t.Error("sandstorm: set 9's helm is set 4's plate helm; retail never sees 9")
+	}
 	if RulesSandstorm.Robe(5) != 0 || RulesSandstorm.Robe(3) != 3 {
 		t.Error("sandstorm: robes 4 and 5 fall back to 0 without ss-art.csf")
 	}

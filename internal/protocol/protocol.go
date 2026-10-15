@@ -224,7 +224,9 @@ const (
 	OpcodeBestEffortPing                GameOpcode = 0x07D0 // Ping
 	OpcodeCamera1                       GameOpcode = 0x07D1 // Camera 1
 	OpcodeCharacterModifiedDisconnect   GameOpcode = 0x07D2 // Char Modified DC
-	OpcodeServerReady                   GameOpcode = 0x07E0 // Server ready/keepalive (no payload)
+	// OpcodeServerReady is the server's connection-statistics REQUEST: the
+	// PS2 answers it with a 0x07E1 statistics text. The Go client sends none.
+	OpcodeServerReady                   GameOpcode = 0x07E0 // Stats request (no payload)
 	OpcodeFactionPage                   GameOpcode = 0x07E2 // Faction Page
 	OpcodeEntityUpdateMapPanel          GameOpcode = 0x07F0 // Entity update + map panel (server)
 	OpcodeEntityUpdateMapPanel2         GameOpcode = 0x07F1 // Same as 0x07F0
@@ -253,6 +255,13 @@ const (
 	OpcodeIgnoreList      GameOpcode = 0x1005 // Ignore List
 	OpcodeIgnoreListResult GameOpcode = 0x1102 // Ignore list display (server)
 	OpcodeAuctionRequest GameOpcode = 0x1205 // Auction Request (client)
+
+	// Sandstorm's player search (its S2 patch; claude-notes/sandstorm-s2-live-20261015.md).
+	OpcodePlayerSearchEntry      GameOpcode = 0x1500 // one result (server)
+	OpcodePlayerSearchClear      GameOpcode = 0x1501 // clear the results (server)
+	OpcodePlayerSearchRequest    GameOpcode = 0x1502 // race, class, min, max level (client)
+	OpcodePlayerSearchRegister   GameOpcode = 0x1503 // list me (client, no body)
+	OpcodePlayerSearchUnregister GameOpcode = 0x1504 // unlist me (client, no body)
 	OpcodeAuctionStuff   GameOpcode = 0x1206 // Auction Item (server)
 	OpcodeBankUI        GameOpcode = 0x124D // Bank UI
 	OpcodeRemoveBankItem GameOpcode = 0x1250 // Withdraw Bank
@@ -262,7 +271,10 @@ const (
 	OpcodeDepositBankTunar GameOpcode = 0x1255 // Deposit Tunar (client)
 	OpcodeClassMastery  GameOpcode = 0x1401 // Class Mastery (client)
 	OpcodeClassMasteryServer GameOpcode = 0x1402 // Class Mastery (server)
-	OpcodeDuelRequest   GameOpcode = 0x1501 // Duel Request
+	// OpcodeDuelRequest is a reference server's label. The retail
+	// dispatcher has no case for 0x1501; Sandstorm's S2 uses it to clear
+	// its player search (OpcodePlayerSearchClear).
+	OpcodeDuelRequest   GameOpcode = 0x1501
 )
 
 // opcodeNames maps opcode values to their human-readable names.
@@ -324,7 +336,7 @@ var opcodeNames = map[GameOpcode]string{
 	0x07B0: "ZoneTransferInit", 0x07B2: "ZoneTransferConfirm",
 	0x07B3: "GameServers", 0x07C0: "EntityUpdateDirect",
 	0x07C1: "AdminShutdown", 0x07D0: "BestEffortPing",
-	0x07D1: "Camera1", 0x07D2: "CharModifiedDC", 0x07E0: "ServerReady",
+	0x07D1: "Camera1", 0x07D2: "CharModifiedDC", 0x07E0: "StatsRequest",
 	0x07E2: "FactionPage",
 	0x07F0: "EntityUpdateMapPanel", 0x07F1: "EntityUpdateMapPanel2",
 	0x07F3: "WorldUnavailable", 0x07F4: "EntityUpdateFullUI", 0x07F5: "Camera2",
@@ -334,11 +346,12 @@ var opcodeNames = map[GameOpcode]string{
 	0x0C01: "ClientShout", 0x0D41: "MailDelivery",
 	0x0E01: "WhoList", 0x0E02: "WhoListResponse",
 	0x0F02: "WhoListFiltered", 0x1005: "IgnoreList", 0x1102: "IgnoreListResult",
+	0x1500: "PlayerSearchEntry", 0x1501: "PlayerSearchClear", 0x1502: "PlayerSearchRequest",
+	0x1503: "PlayerSearchRegister", 0x1504: "PlayerSearchUnregister",
 	0x1205: "AuctionRequest", 0x1206: "AuctionStuff", 0x124D: "BankUI", 0x1250: "RemoveBankItem",
 	0x1251: "AddBankItem", 0x1253: "ConfirmBankTunar",
 	0x1254: "BankItem", 0x1255: "DepositBankTunar",
 	0x1401: "ClassMastery", 0x1402: "ClassMasteryServer",
-	0x1501: "DuelRequest",
 }
 
 // String returns the string representation of an opcode.

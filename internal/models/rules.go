@@ -66,6 +66,17 @@ func (r Rules) ClampArmorSet(set byte) byte {
 	return set
 }
 
+// Helm maps a (clamped) helm set to the helm model drawn. Sandstorm's GetHelm
+// hook (S2) sends set 9 to set 4's plate helm (0x03B8E453) — its "36 → 16" is
+// byte offsets into $Helm — so its set-9 armour wears a helm; retail clamps
+// set 9 away before SetHelm.
+func (r Rules) Helm(set byte) byte {
+	if r == RulesSandstorm && set == 9 {
+		return 4
+	}
+	return set
+}
+
 // RobeCount is how many robes a robe byte can name: retail's $Robe holds 4;
 // Sandstorm's GetRobeTexture adds 4 and 5 (a 2×2 table its SetResources hook
 // fills from ss-art.csf). A byte past it is no robe.

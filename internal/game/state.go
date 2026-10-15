@@ -1,6 +1,7 @@
 package game
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -257,6 +258,21 @@ type WhoEntry struct {
 	ObjectID uint32
 }
 
+// PlayerSearchEntry is one 0x1500 result of Sandstorm's player search (its S2
+// cave 0x000FE4B8). Each field is read only if the message reaches it.
+type PlayerSearchEntry struct {
+	Race, Class byte   // wire ids; only the low nibble indexes the name tables
+	Level       byte   // printed as is, 0-255
+	Name        string // a fixed 12-byte ASCII slot
+	ID          uint32 // the player's handle (0 when the message stops short)
+	// The location, when the message carries it (22 bytes or more): world,
+	// grid column and row (LocationLine).
+	HasLocation      bool
+	World, Col, Row  int
+	Group            byte   // group size; 0 not grouped, 5 and up (0xFF default) no line
+	Note             string // the player's note, up to 71 ASCII
+}
+
 // LFGEntry represents a player from the group finder (opcode 0x03D5 LFG sub-type).
 type LFGEntry struct {
 	CharID    uint64
@@ -280,6 +296,11 @@ type FloatingText struct {
 	X, Y, Z  float32  // world position at spawn time
 	SpawnTime time.Time
 	IsHeal   bool      // true=green heal, false=red damage
+	// Color is the server's colour for this number, when it sends one:
+	// Sandstorm's S2 reads three optional bytes after the defender
+	// (R, G, B) and draws the text and its outline in it.
+	Color    [3]uint8
+	HasColor bool
 }
 
 // GameState holds all client-side game state.
@@ -415,10 +436,14 @@ type GameState struct {
 	AuctionSessionID   byte  // from 0x1102 sub=0x0C response
 	AuctionSeq         byte  // increments by 2 per request (4, 6, 8...)
 	AuctionLastListing int64 // last listing ID for cursor-based pagination
-	AuctionTotalCount  int   // total results from header byte[3]
+	AuctionTotalCount  int   // listings held, every page so far
+	AuctionFilter      AuctionFilter // the current search's, which every page repeats
 
 	// PS2 Hotkey Menu (parsed from MemoryDump)
 	Hotkeys []HotkeyEntry // tree-structured hotkey entries (25 default)
+
+	// Sandstorm's player search (0x1500 appends, 0x1501 clears).
+	PlayerSearch []PlayerSearchEntry
 
 	// LFG / Group Finder (from opcode 0x03D5 LFG entries)
 	LFGList       []LFGEntry
@@ -449,9 +474,6 @@ type GameState struct {
 	ZoneTransferState      int    // PS2 state machine: 0=idle, 1-5=phases
 	ZoneTransferProxyCount int    // number of zone proxies received in sub-type 2
 	PendingZoneIdx         int    // PS2 entity+0x4F0E8: zone index about to be loaded
-
-	// Quest journal (PS2 opcode 0x1206 sub-types 0x80-0x89)
-	QuestJournal []QuestJournalEntry
 
 	// Guild state (PS2 opcode 0x0468 sub-types)
 	GuildName    string        // from sub-type 1 (0x80 blob UTF-16)
@@ -682,6 +704,10 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 	// Combat/skill opcodes
 	case protocol.OpcodeDamageIndication:
 		gs.handleDamageIndication(msg)
+	case protocol.OpcodePlayerSearchEntry:
+		gs.handlePlayerSearchEntry(msg)
+	case protocol.OpcodePlayerSearchClear:
+		gs.PlayerSearch = gs.PlayerSearch[:0]
 	case protocol.OpcodeResourceUpdate:
 		gs.handleResourceUpdate(msg)
 	case protocol.OpcodeCharacterDied:
@@ -3184,6 +3210,15 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 		if reader.Remaining() >= 4 {
 			targetID, _ = reader.ReadUint32()
 		}
+		// Sandstorm's S2 (cave 0x000FBA40): three more bytes are an RGB the
+		// number is drawn in. Without them it keeps the retail colours.
+		var color [3]uint8
+		hasColor := false
+		if reader.Remaining() >= 3 {
+			rgb, _ := reader.ReadBytes(3)
+			copy(color[:], rgb)
+			hasColor = true
+		}
 
 		sourceName := gs.resolveObjectName(sourceID)
 		targetName := gs.resolveObjectName(targetID)
@@ -3227,8 +3262,53 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 			Z:         fz,
 			SpawnTime: time.Now(),
 			IsHeal:    dmg > 0,
+			Color:     color,
+			HasColor:  hasColor,
 		})
 	}
+}
+
+// handlePlayerSearchEntry appends one result of Sandstorm's player search,
+// exactly as its S2 reads it (cave 0x000FE4B8): at least 3 bytes; the
+// 12-byte name slot at 3; the id once 19 bytes are there; world, column and
+// row once 22 are; the group byte at 22 (0xFF without it); then the note, up
+// to 71 bytes.
+func (gs *GameState) handlePlayerSearchEntry(msg *protocol.Message) {
+	data := msg.Data()
+	if len(data) < 2 {
+		return
+	}
+	b := data[2:]
+	if len(b) < 3 {
+		return
+	}
+	ascii := func(p []byte, max int) string {
+		if len(p) > max {
+			p = p[:max]
+		}
+		if i := bytes.IndexByte(p, 0); i >= 0 {
+			p = p[:i]
+		}
+		return string(p)
+	}
+	e := PlayerSearchEntry{Race: b[0], Class: b[1], Level: b[2], Group: 0xFF}
+	if len(b) > 3 {
+		e.Name = ascii(b[3:], 12)
+	}
+	if len(b) >= 19 {
+		e.ID = binary.LittleEndian.Uint32(b[15:19])
+	}
+	if len(b) >= 22 {
+		e.HasLocation = true
+		e.World, e.Col, e.Row = int(b[19]), int(b[20]), int(b[21])
+	}
+	if len(b) >= 23 {
+		e.Group = b[22]
+	}
+	if len(b) > 23 {
+		e.Note = ascii(b[23:], 71)
+	}
+	gs.PlayerSearch = append(gs.PlayerSearch, e)
 }
 
 // getEquippedProcAnim returns the ProcAnim DictID from the first equipped item
@@ -4341,6 +4421,10 @@ type AuctionItem struct {
 	Item        ParsedItem // item data (same format as MemoryDump items)
 	CurrentBid  int64      // current bid in tunar
 	BuyoutPrice int64      // buyout price in tunar (0 = no buyout)
+	// The page's three per-listing arrays (VIBankControl +0x7880, +0x7888,
+	// +0x7890). Not traced: on Sandstorm they are 0, -1 and the current bid
+	// on every listing seen.
+	PageValues [3]int64
 }
 
 // parseSingleSpell reads one spell entry from the MemoryDump.

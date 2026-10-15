@@ -73,6 +73,7 @@ func (c *Client) drawWorld() {
 	// configured server's folder as it last stood.
 	if dir := c.engine.SaveDir; c.modelMgr != nil && dir != c.saveArtFor {
 		c.modelMgr.SetSaveArt(dir)
+		c.loadWords(dir)
 		c.saveArtFor = dir
 	}
 
@@ -868,6 +869,9 @@ func (c *Client) drawWorld() {
 		if ft.IsHeal {
 			clr = rl.Color{R: 60, G: 255, B: 60, A: alpha} // green for heal
 		}
+		if ft.HasColor { // the server's own colour (Sandstorm's S2)
+			clr = rl.Color{R: ft.Color[0], G: ft.Color[1], B: ft.Color[2], A: alpha}
+		}
 		fontSize := int32(18)
 		textW := c.measureText(ft.Text, fontSize)
 		c.drawText(ft.Text, int32(screenPos.X)-textW/2, int32(screenPos.Y)-int32(floatRise*progress), fontSize, clr)
@@ -1018,7 +1022,8 @@ func (c *Client) drawWorld() {
 
 	// Position + World display (top-left, above compass)
 	{
-		worldNames := map[byte]string{0: "Tunaria", 1: "Rathe", 2: "Odus", 3: "Lavastorm", 4: "Plane of Sky", 5: "Secrets"}
+		// 6 and 7 are Sandstorm's (its S2's world table).
+		worldNames := map[byte]string{0: "Tunaria", 1: "Rathe", 2: "Odus", 3: "Lavastorm", 4: "Plane of Sky", 5: "Secrets", 6: "Underfoot", 7: "Secrets"}
 		worldName := worldNames[gs.Player.World]
 		posText := fmt.Sprintf("%.0f, %.0f, %.0f  %s", p.X, p.Y, p.Z, worldName)
 		c.drawText(posText, 8, 0, 11, rl.Color{R: 200, G: 200, B: 200, A: 180})

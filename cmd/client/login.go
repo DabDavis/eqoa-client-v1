@@ -11,6 +11,8 @@ import (
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 
+	"github.com/DabDavis/eqoa-esf-tools/pkg/esf"
+
 	"github.com/eqoa/client/internal/game"
 	"github.com/eqoa/client/internal/network"
 )
@@ -61,6 +63,22 @@ func saveDir(serverIP string) string {
 		return r
 	}, serverIP)
 	return filepath.Join(base, "saves", server, network.CardFolder)
+}
+
+// loadWords loads the string table the way the patched PS2 does: the save
+// folder's WORDS.TXT when the patcher put one there, otherwise the disc's.
+func (c *Client) loadWords(dir string) {
+	if data, err := os.ReadFile(filepath.Join(dir, "WORDS.TXT")); err == nil {
+		c.words = game.ParseWords(data)
+		log.Printf("words: %d strings from %s", len(c.words), dir)
+		return
+	}
+	if c.isoPath != "" {
+		if data, err := esf.ReadISOFileRaw(c.isoPath, "WORDS.TXT"); err == nil {
+			c.words = game.ParseWords(data)
+			log.Printf("words: %d strings from the disc", len(c.words))
+		}
+	}
 }
 
 func configPath() string {

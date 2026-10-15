@@ -1544,157 +1544,6 @@ func (gs *GameState) handleNPCInteractResult(msg *protocol.Message) {
 
 // handleColoredChat — see state.go for existing implementation of 0x0A7A / 0x0A7B.
 
-// handleQuestUpdate handles PS2 quest sub-types (0x80-0x89) from opcode 0x1206.
-// PS2 FUN_00BB9D90: reads 1-byte sub-type, dispatches to quest lifecycle handlers.
-//
-// Quest context struct (entity+0x7770 area):
-//   Quest journal: collection at entity+0x1DDC*4, 800 bytes per entry
-//   Quest tracking: collection at entity+0x1DE2*4, 32 bytes per entry
-//   Quest data: entity+0x78BC (questID), +0x78C0 (quest list), +0x78C8 (state)
-func (gs *GameState) handleQuestUpdate(payload []byte) {
-	if len(payload) < 1 {
-		return
-	}
-	subType := payload[0]
-	rest := payload[1:]
-
-	switch subType {
-	case 0x80:
-		// Clear quest journal — reset all quest state
-		log.Printf("QuestUpdate: sub=0x80 CLEAR_JOURNAL")
-		gs.QuestJournal = nil
-
-	case 0x81:
-		// Quest update — reads zigzag(questID) + quest data fields
-		// PS2: reads zigzag, then checks if questID matches current,
-		// reads additional zigzag+blob fields for quest state
-		log.Printf("QuestUpdate: sub=0x81 QUEST_UPDATE (dataLen=%d)", len(rest))
-		if len(rest) > 0 {
-			reader := buffer.NewReader(rest)
-			questID, _ := reader.Read7BitEncodedInt64()
-			log.Printf("QuestUpdate: questID=%d", questID)
-			// Additional fields: zigzag(phase) + blob(objectives) + blob(rewards)
-			// Store for quest journal display
-			gs.updateQuestEntry(questID, reader)
-		}
-
-	case 0x82:
-		// Add quest to journal — reads full quest blob data
-		// PS2: blob_read → adds to journal collection at entity+0x1DDC
-		log.Printf("QuestUpdate: sub=0x82 QUEST_ADD (dataLen=%d)", len(rest))
-		if len(rest) > 0 {
-			reader := buffer.NewReader(rest)
-			gs.addQuestFromBlob(reader)
-		}
-
-	case 0x83:
-		// Remove quest from journal — reads zigzag(questID), removes from collection
-		// PS2: zigzag → search journal by ID → remove entry
-		log.Printf("QuestUpdate: sub=0x83 QUEST_REMOVE (dataLen=%d)", len(rest))
-		if len(rest) > 0 {
-			reader := buffer.NewReader(rest)
-			questID, _ := reader.Read7BitEncodedInt64()
-			log.Printf("QuestUpdate: removing questID=%d", questID)
-			gs.removeQuest(questID)
-		}
-
-	case 0x84:
-		// Add quest tracking entry — reads tracking data blob
-		// PS2: blob → adds to tracking collection at entity+0x1DE2
-		log.Printf("QuestUpdate: sub=0x84 TRACKING_ADD (dataLen=%d)", len(rest))
-
-	case 0x85:
-		// Remove quest tracking — reads zigzag(trackingID), removes
-		// PS2: zigzag → search tracking by ID → remove
-		log.Printf("QuestUpdate: sub=0x85 TRACKING_REMOVE (dataLen=%d)", len(rest))
-
-	case 0x86:
-		// Update quest tracking entry — reads tracking data, updates existing
-		log.Printf("QuestUpdate: sub=0x86 TRACKING_UPDATE (dataLen=%d)", len(rest))
-
-	case 0x87:
-		// Quest journal refresh — reads zigzag(questID) + full quest list
-		// PS2: zigzag(ID) + blob_read(list) → qsort by quest field at offset 0x2C
-		log.Printf("QuestUpdate: sub=0x87 JOURNAL_REFRESH (dataLen=%d)", len(rest))
-		if len(rest) > 0 {
-			reader := buffer.NewReader(rest)
-			questID, _ := reader.Read7BitEncodedInt64()
-			log.Printf("QuestUpdate: refresh questID=%d", questID)
-		}
-
-	case 0x88:
-		// Quest page update — reads zigzag(questID), sets page state
-		// PS2: zigzag(ID), sets entity+0x78C8=0, entity+0x78B8=1
-		log.Printf("QuestUpdate: sub=0x88 PAGE_UPDATE (dataLen=%d)", len(rest))
-		if len(rest) > 0 {
-			reader := buffer.NewReader(rest)
-			questID, _ := reader.Read7BitEncodedInt64()
-			log.Printf("QuestUpdate: page questID=%d", questID)
-		}
-
-	case 0x89:
-		// Quest completion notification
-		log.Printf("QuestUpdate: sub=0x89 QUEST_COMPLETE (dataLen=%d)", len(rest))
-		gs.addChatMessage("Quest objective updated!", ChatSystem)
-
-	default:
-		log.Printf("QuestUpdate: unknown sub-type 0x%02X (dataLen=%d)", subType, len(rest))
-	}
-}
-
-// Quest journal entry
-type QuestJournalEntry struct {
-	QuestID int64
-	Name    string
-	Phase   int
-	Data    []byte // raw quest data blob
-}
-
-func (gs *GameState) updateQuestEntry(questID int64, reader *buffer.Reader) {
-	// Find or create entry
-	for i := range gs.QuestJournal {
-		if gs.QuestJournal[i].QuestID == questID {
-			// Update existing — read remaining data
-			if reader.Remaining() > 0 {
-				data, _ := reader.ReadBytes(reader.Remaining())
-				gs.QuestJournal[i].Data = data
-			}
-			log.Printf("QuestUpdate: updated quest %d", questID)
-			return
-		}
-	}
-	// New entry
-	var data []byte
-	if reader.Remaining() > 0 {
-		data, _ = reader.ReadBytes(reader.Remaining())
-	}
-	gs.QuestJournal = append(gs.QuestJournal, QuestJournalEntry{
-		QuestID: questID,
-		Data:    data,
-	})
-	log.Printf("QuestUpdate: added quest %d", questID)
-}
-
-func (gs *GameState) addQuestFromBlob(reader *buffer.Reader) {
-	if reader.Remaining() < 4 {
-		return
-	}
-	data, _ := reader.ReadBytes(reader.Remaining())
-	// PS2 stores full quest blob at entity+0x1DDC collection
-	// For now just log the size — format needs further RE
-	log.Printf("QuestUpdate: added quest blob (%d bytes)", len(data))
-}
-
-func (gs *GameState) removeQuest(questID int64) {
-	for i := range gs.QuestJournal {
-		if gs.QuestJournal[i].QuestID == questID {
-			gs.QuestJournal = append(gs.QuestJournal[:i], gs.QuestJournal[i+1:]...)
-			log.Printf("QuestUpdate: removed quest %d", questID)
-			return
-		}
-	}
-}
-
 // handleAddBuddyFailed handles opcode 0x03D8 — add buddy failed.
 func (gs *GameState) handleAddBuddyFailed(msg *protocol.Message) {
 	log.Printf("AddBuddyFailed: could not add buddy")
@@ -1990,51 +1839,41 @@ func (gs *GameState) handleConfirmBankTunar(msg *protocol.Message) {
 //             + currentBid(zigzag) + buyoutPrice(zigzag)
 func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 4 {
+	if len(data) < 3 {
 		return
 	}
 	payload := data[2:] // skip 2-byte opcode prefix
 
-	// PS2 opcode 0x1206 is dual-purpose:
-	// Sub-types 0x80-0x89 = Quest system (PS2 retail)
-	// Sub-types < 0x80 = Auction system (Sandstorm)
-	if len(payload) >= 1 && payload[0] >= 0x80 {
-		gs.handleQuestUpdate(payload)
+	// 0x1206 is VIBankControl::Recv1206 (CLIENT 0x00BB9D90,
+	// VIBankControl.cpp:593): a sub-type byte, 0x80-0x89 into a ten-entry
+	// jump table and anything else an assert. 0x81 is a page of search
+	// results (func_00BBA2F8: "No auctions found.", "End of search
+	// results.", "Start of search results."). The other nine are not ported.
+	// They were once read as a quest journal, which was this same function
+	// under the wrong name.
+	if sub := payload[0]; sub != 0x81 {
+		log.Printf("AuctionStuff: sub-type 0x%02X (%d bytes) not handled", sub, len(payload))
 		return
 	}
 
-	hexLen := min(200, len(payload))
-	log.Printf("AuctionStuff: payloadLen=%d hex=%X", len(payload), payload[:hexLen])
-
-	// Small ack packet (<=7 bytes after opcode): status response
-	if len(payload) <= 7 {
-		if len(payload) >= 2 {
-			log.Printf("AuctionStuff: ack sub=0x%02X page=%d", payload[0], payload[1])
-		}
+	// The page, all zigzag: the request's number echoed (the PS2 drops a
+	// page whose number is not its latest request's), a field it keeps at
+	// +0x7868, then the list (func_00BBD9E8: a count and the listings), then
+	// three arrays of one value per listing (+0x7880/+0x7888/+0x7890, each a
+	// count and the values).
+	reader := buffer.NewReader(payload[1:])
+	seq, _ := reader.Read7BitEncodedInt64()
+	field, _ := reader.Read7BitEncodedInt64()
+	itemCount, err := reader.Read7BitEncodedInt64()
+	if err != nil || itemCount < 0 || itemCount > 1000 {
+		log.Printf("AuctionStuff: bad page header (count %d, %v)", itemCount, err)
 		return
 	}
-
-	// Large listing packet — PS2 func_00BBD9E8 reads zigzag(count) + items
-	// Sandstorm format from pcap: sub(1) + seq(1) + unk(1) + itemCount(1) + items...
-	sub := payload[0]
-	page := payload[1]
-	_ = payload[2] // unk
-	itemCount := int(payload[3])
-	log.Printf("AuctionStuff: sub=0x%02X page=%d itemCount=%d", sub, page, itemCount)
-
-	reader := buffer.NewReader(payload[4:])
 	items := make([]AuctionItem, 0, itemCount)
 
-	// itemCount from header is TOTAL results across pages, not items in this response.
-	// Parse until data runs out (each item is ~150-350 bytes).
-	for i := 0; i < itemCount; i++ {
+	for i := 0; i < int(itemCount); i++ {
 		var ai AuctionItem
 		startPos := reader.Position()
-
-		if reader.Remaining() < 100 {
-			// Not enough for another full item — remaining is page footer
-			break
-		}
 
 		// Auction header: 7 zigzag fields
 		ai.ListingID, _ = reader.Read7BitEncodedInt64()
@@ -2135,12 +1974,40 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 			i, ai.Seller, ai.Item.Name, ai.CurrentBid, ai.BuyoutPrice, ai.Item.LevelReq, bytesConsumed)
 	}
 
-	// Append to existing items (multi-page accumulation)
+	for k := 0; k < 3; k++ {
+		n, err := reader.Read7BitEncodedInt64()
+		if err != nil || n < 0 || n > 1000 {
+			break
+		}
+		for j := 0; j < int(n); j++ {
+			v, _ := reader.Read7BitEncodedInt64()
+			if j < len(items) {
+				items[j].PageValues[k] = v
+			}
+		}
+	}
+	log.Printf("AuctionStuff: page seq=%d field=%d listings=%d/%d left=%d",
+		seq, field, len(items), itemCount, reader.Remaining())
+
+	// An empty page ends the search. The PS2 keeps the page it had and says
+	// which; here the pages accumulate, and the paging stops.
+	if len(items) == 0 {
+		if len(gs.AuctionItems) == 0 {
+			gs.addChatMessage("No auctions found.", ChatSystem)
+		} else {
+			gs.addChatMessage("End of search results.", ChatSystem)
+		}
+		gs.AuctionLastListing = 0
+		return
+	}
 	gs.AuctionItems = append(gs.AuctionItems, items...)
-	gs.AuctionTotalCount = itemCount
-	if len(items) > 0 {
-		gs.AuctionLastListing = items[len(items)-1].ListingID
-		gs.AuctionSeq = page + 2
+	gs.AuctionTotalCount = len(gs.AuctionItems)
+	gs.AuctionLastListing = items[len(items)-1].ListingID
+	// The next request's number, as the one zigzag byte the sender writes.
+	if seq >= 0 && seq < 63 {
+		gs.AuctionSeq = byte(2 * (seq + 1))
+	} else {
+		gs.AuctionLastListing = 0
 	}
 	log.Printf("Auction: +%d items (total %d)", len(items), len(gs.AuctionItems))
 }

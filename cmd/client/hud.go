@@ -11,6 +11,7 @@ import (
 
 	"github.com/eqoa/client/internal/game"
 	"github.com/eqoa/client/internal/mathutil"
+	"github.com/eqoa/client/internal/models"
 	"github.com/eqoa/client/internal/ui"
 )
 
@@ -442,8 +443,23 @@ func (c *Client) handleChatInput() {
 		case "dance":
 			c.playEmote(animSpecialIdle, "dances")
 		default:
-			// No prefix -> use default chat mode
-			c.sendDefaultChat(text)
+			if cmd == "" {
+				// No prefix -> use default chat mode
+				c.sendDefaultChat(text)
+				break
+			}
+			// An unknown /command. Sandstorm's S2 sends the whole line,
+			// slash and all, to the server as say chat (0x000B) — its
+			// server-side commands arrive that way. Retail prints string 826
+			// as `%S "%s".` and sends nothing.
+			if models.ActiveRules == models.RulesSandstorm {
+				c.engine.SendSay(text)
+			} else {
+				gs := c.engine.State
+				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
+					Text: fmt.Sprintf("Unrecognized command \"%s\".", text), Channel: game.ChatSystem,
+				})
+			}
 		}
 		return
 	}

@@ -310,6 +310,8 @@ type Client struct {
 	weather       *game.WeatherSystem
 	zoneParticlesSpawned bool // true after zone ParticleSprites have been spawned
 	saveArtFor           string // the save folder whose art the model manager holds
+	words                game.Words   // the string table: the save folder's WORDS.TXT, else the disc's
+	playerSearch         playerSearch // Sandstorm's player search window (playersearch.go)
 
 	// GM menu (F11) — PS2 VIWndGame GM command system
 	gmMenuOpen     bool

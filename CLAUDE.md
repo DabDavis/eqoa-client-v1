@@ -76,6 +76,7 @@ cmd/client/                          # Raylib 3D client (~23k lines)
   esfont.go                          # ESF bitmap font loader (EQOA.ESF glyph atlas)
   minimap.go                         # Real-time 512x512 GPU minimap (ortho capture)
   menu.go                            # F12 in-game menu (tabbed panel)
+  playersearch.go                    # Sandstorm's Search for Player window (S2, 0x1500-0x1504)
   login.go                           # Login screen, server config
   titlescreen.go                     # Animated title (fire/ship/smoke from SETUP.ESF)
   loadingscreen.go                   # Loading screen with procedural gear texture
@@ -114,6 +115,8 @@ internal/game/
   weather.go                         # VIAtmosphere: WXTYPE 0-6, transitions, splash, lightning cycle
   lightning.go                       # VILightning: harmonics, branches, afterimage
   effectvolumes.go                   # VIEffectVolume: fog/dust/leaves/shafts/flock, actor-local
+  auction.go                         # VIBankControl's search: AuctionFilter, 0x1205 pages
+  words.go / zones.go                # WORDS.TXT string table; world names + CLIENT's zone grids
 
 internal/terrain/
   terrain.go                         # ESF zone loading, ZoneTerrain, EffectVolumes, PointLights
@@ -524,11 +527,36 @@ Sandstorm's address → `sandstorm`, anything else → `retail`, and `"rules"` i
 |---|---|---|
 | tints | 15, ≥15 → 0 (`SetArmorSlot`) | 30, own table, 15 is clear (alpha 0) |
 | armour set clamp | ≥9 → 0 | ≥10 → 0; set 9 = CHAR.ESF's shadowed plate (= `ArmorSetOrnatePlate`) |
+| helm | `Helm[set]` | set 9 wears set 4's (plate) helm, S2's GetHelm `36 → 16` |
 | robes | 0–3 | 0–5; 4/5 from `ss-art.csf`, robe 0 when it is missing |
+| Social, third tab | LFG | **Search for Player** (`playersearch.go`): Register/Unregister `0x1503`/`0x1504`, search `0x1502`, results `0x1501` + `0x1500`, Location/Group lines, Tell, Invite |
+| unknown `/command` | `Unrecognized command "…".` locally (string 826) | sent to the server as say `0x000B`, slash and all (Sandstorm's server-side commands) |
+| worlds | 0–5 | 6 = `UNDERFOOT.ESF` (not on the disc; the assets folder), 7 = `SECRETS.ESF` |
+| Auctions window | opens on Max. Level 50 | opens on 60 |
 
 Applied where the server's bytes enter (`entityEquipment`); transmog runs after, so its
-own sets 9/10 are never clamped. Other S2 features (the /who window, opcodes
-0x1500–0x1504, coloured floating text, the world-entry 19) are not ported.
+own sets 9/10 are never clamped. DamageIndication's optional trailing RGB tints the
+floating number on either server (`FloatingText.Color`). **S2's identity and telemetry
+layer is deliberately NOT ported**: DiscVersion 21 with a hardware address and a card
+install id, the 11 bytes of pad timing on UseSkill, the `0x07E1` heap lines and the
+`0x1505`/`0x1507` crash reports. Go sends the retail DiscVersion 18 and UseSkill, and
+Sandstorm serves everything above to it. All of it, with the wire layouts, is in
+`claude-notes/sandstorm-s2-live-20261015.md`.
+
+**`WORDS.TXT`** (`game.Words`): string id N is line N, counted from 1. It is read from the
+save folder when the patcher put one there, else off the disc. The player search's
+Location line uses it, with CLIENT's per-world zone grids (`internal/game/zones.go`;
+Tunaria is 13 × 16 — the crawler's 12 × 15 copy is wrapped wrong).
+
+**The auction (`internal/game/auction.go`, `handleAuctionStuff`)** follows the decomp, not
+a capture. A search is `0x1205` sub 7: the request number, a cursor (−1 new, else the last
+listing's id), the direction 1, then `AuctionFilter` exactly as `func_00BB4A80` writes it
+(flags byte, 8-bit string, UTF-16 search text, two u32 masks, six zigzag fields, a byte).
+Every page repeats the search's filter. `0x1206` is `VIBankControl::Recv1206` and sub-type
+`0x81` is a results page: echoed request number, a value, the listings, then three
+per-listing arrays. **0x1206 is not a quest message** — the old handler that read it as
+one swallowed every page. An empty page ends the paging ("No auctions found." /
+"End of search results.").
 
 **The patcher** (`internal/network/patcher.go`) is SETUP's `PatcherAPI`: the VerantPatcher
 manifest off port 7000, then each entry against the **save folder**
