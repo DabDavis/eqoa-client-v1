@@ -1,9 +1,0 @@
-{
-  "version": "20260403-2e06bd2",
-  
-  "linux_url": "https://texturepacks.art/eqoa/eqoa-client",
-  "linux_sha256": "9033376b69f2a7296df96be42cfadec5b3be4e4da26d24b90d7872f2a4e64ff8",
-  "windows_url": "https://texturepacks.art/eqoa/eqoa-client.exe",
-  "windows_sha256": "0073192aa57b978e3fbb3eec723a58c677135a132f2314c6f4a98b49bef2976b",
-  "changelog": "- Gate F11 GM menu behind gmEnabled() — no-op in stable builds\n- Fix F11 freeze in stable build: stub closes GM menu immediately\n- Split dev/stable builds: GM tools, pprof, gridrunner behind build tag\n- Disable camera terrain/wall collision clamping\n- Fix rain speed, suppress weather indoors, increase weather range"
-}

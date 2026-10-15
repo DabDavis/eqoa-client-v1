@@ -24,43 +24,45 @@ import (
 
 )
 
-// BuildVersion is set at compile time via -ldflags.
-// Example: go build -ldflags "-X main.BuildVersion=abc123"
-var BuildVersion = "dev"
+// BuildVersion and UpdateChannel are set at compile time via -ldflags by the
+// release workflow (.github/workflows/release.yml):
+//
+//	-X main.BuildVersion=v2026.10.15 -X main.UpdateChannel=stable   (a v* tag)
+//	-X main.BuildVersion=dev-1a2b3c4 -X main.UpdateChannel=dev      (a push to master)
+//
+// A build without them is a local one: it shows "local" and never replaces
+// itself with a release. That matters now that releases need no login: a
+// plain `go build` would otherwise download the release over itself.
+var (
+	BuildVersion  = "local"
+	UpdateChannel = ""
+)
 
 const (
-	updateBaseURL   = "https://texturepacks.art/eqoa"
-	manifestURL     = updateBaseURL + "/manifest.json"
+	// Releases are GitHub release assets. Stable follows "latest", which is
+	// GitHub's own redirect to the newest release that is not a prerelease;
+	// dev names the rolling prerelease whose tag the workflow moves on every
+	// push, because "latest" never points at a prerelease.
+	releasesURL     = "https://github.com/DabDavis/eqoa-client-v1/releases"
+	devReleaseTag   = "client-dev"
 	updateTimeout   = 15 * time.Second
 	downloadTimeout = 5 * time.Minute
 )
 
-// updateUser/updatePass are the update-server HTTP Basic Auth credentials.
-// They are injected at build time via -ldflags (see scripts/deploy.sh), not
-// hardcoded here — this keeps them out of source control and lets them be
-// rotated without a code change. Empty by default (e.g. a local `go build`),
-// in which case setUpdateAuth sends no Authorization header.
-//
-// NOTE: build-time injection only removes the creds from git. They are still
-// embedded in the shipped binary and remain strings-extractable. Because the
-// client must authenticate to what is effectively a public download endpoint,
-// this Basic Auth is a soft gate against casual scraping, not a real secret.
-// Actual update integrity comes from the SHA-256 check (and future binary
-// signing — see the open #6 item).
-var (
-	updateUser string
-	updatePass string
-)
-
-// setUpdateAuth attaches the update-server Basic Auth header when credentials
-// were injected at build time. With empty creds it sends no header.
-func setUpdateAuth(req *http.Request) {
-	if updateUser != "" || updatePass != "" {
-		req.SetBasicAuth(updateUser, updatePass)
+// manifestURL is where a channel publishes its manifest.json, or "" for a
+// build that follows no channel.
+func manifestURL(channel string) string {
+	switch channel {
+	case "stable":
+		return releasesURL + "/latest/download/manifest.json"
+	case "dev":
+		return releasesURL + "/download/" + devReleaseTag + "/manifest.json"
 	}
+	return ""
 }
 
-// updateManifest is the JSON served by the update server.
+// updateManifest is the manifest.json the release workflow publishes beside
+// the binaries.
 type updateManifest struct {
 	Version   string         `json:"version"`
 	LinuxURL  string         `json:"linux_url"`
@@ -209,7 +211,7 @@ func (c *Client) runUpdateCheck() {
 			c.drawCenteredText(errMsg, screenHeight/2+40, 12, rl.Color{R: 255, G: 100, B: 100, A: 200})
 		}
 
-		c.drawCenteredText(fmt.Sprintf("v%s", BuildVersion), screenHeight-20, 10, colorDim)
+		c.drawCenteredText(BuildVersion, screenHeight-20, 10, colorDim)
 
 		rl.EndDrawing()
 	}
@@ -314,16 +316,6 @@ func (c *Client) runUpdateCheck() {
 	}
 }
 
-// authGet performs an HTTP GET with Basic Auth credentials.
-func authGet(httpClient *http.Client, url string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	setUpdateAuth(req)
-	return httpClient.Do(req)
-}
-
 func checkForUpdate(state *updateState, assetsDir string) {
 	defer state.setDone()
 
@@ -333,10 +325,17 @@ func checkForUpdate(state *updateState, assetsDir string) {
 		state.setStatus("Dev build")
 		return
 	}
+	url := manifestURL(UpdateChannel)
+	if url == "" {
+		log.Println("Local build — skipping auto-update check")
+		state.setStatus("Local build")
+		return
+	}
 
-	// Fetch manifest
+	// Fetch manifest. Before the first stable release exists, "latest" is a
+	// 404, which lands in the not-200 branch as "No updates available".
 	client := &http.Client{Timeout: updateTimeout}
-	resp, err := authGet(client, manifestURL)
+	resp, err := client.Get(url)
 	if err != nil {
 		log.Printf("Update check failed: %v", err)
 		state.setStatus("Update server unreachable")
@@ -371,7 +370,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 		return
 	}
 
-	log.Printf("Update: local=%s remote=%s", BuildVersion, manifest.Version)
+	log.Printf("Update: local=%s remote=%s (%s channel)", BuildVersion, manifest.Version, UpdateChannel)
 
 	// Sync extra files (overlays, etc.) regardless of binary version.
 	if len(manifest.Files) > 0 {
@@ -407,7 +406,7 @@ func checkForUpdate(state *updateState, assetsDir string) {
 	log.Printf("Update: downloading %s", downloadURL)
 
 	dlClient := &http.Client{Timeout: downloadTimeout}
-	dlResp, err := authGet(dlClient, downloadURL)
+	dlResp, err := dlClient.Get(downloadURL)
 	if err != nil {
 		log.Printf("Update download failed: %v", err)
 		state.setErr("Download failed, continuing with current version...")
@@ -587,7 +586,7 @@ func syncExtraFiles(state *updateState, files []manifestFile, assetsDir string) 
 		log.Printf("Update: downloading %s", f.Path)
 
 		dlClient := &http.Client{Timeout: downloadTimeout}
-		resp, err := authGet(dlClient, f.URL)
+		resp, err := dlClient.Get(f.URL)
 		if err != nil {
 			log.Printf("Update: download %s failed: %v", f.Path, err)
 			continue

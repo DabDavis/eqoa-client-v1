@@ -1,0 +1,129 @@
+name: Release
+
+# A push to master refreshes the rolling dev prerelease (tag client-dev); a v*
+# tag cuts a stable release that is never rewritten afterwards. A built client
+# follows the channel it was built for (cmd/client/updater.go): stable reads
+# releases/latest/download/manifest.json, dev reads the client-dev release's.
+
+on:
+  push:
+    branches: [ "master" ]
+    tags: [ "v*" ]
+    # Docs alone are not a new client, and a dev build is offered to every
+    # dev-channel player. GitHub does not evaluate path filters for tag pushes
+    # at all, so a v* tag still builds whatever it points at.
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  # A newer push supersedes a dev build in flight; a release is never cancelled.
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+permissions:
+  contents: write
+
+env:
+  CHANNEL: ${{ github.ref_type == 'tag' && 'stable' || 'dev' }}
+  RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'client-dev' }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    # The Linux build targets glibc 2.31 through zig, so the runner's own glibc
+    # does not leak into the binary; the runner only supplies headers.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: go-eqoa-client-v1
+    steps:
+      - name: Checkout the client
+        uses: actions/checkout@v4
+        with:
+          path: go-eqoa-client-v1
+          # All history and tags: a stable release's changelog is every
+          # commit since the previous v* tag.
+          fetch-depth: 0
+
+      - name: Read the pinned dependencies
+        run: grep -E '^[A-Z_]+=' scripts/deps.env >> "$GITHUB_ENV"
+
+      # go.mod's replace directives name sibling directories, so the two
+      # dependencies are checked out beside the client, as on the dev machine.
+      - name: Checkout esf-tools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ESF_TOOLS_REPO }}
+          ref: ${{ env.ESF_TOOLS_REF }}
+          path: go-eqoa-esf-tools-v1
+      - name: Checkout raylib-go
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RAYLIB_GO_REPO }}
+          ref: ${{ env.RAYLIB_GO_REF }}
+          path: raylib-go
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-eqoa-client-v1/go.mod
+          cache-dependency-path: go-eqoa-client-v1/go.sum
+
+      - name: Install the toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 libgl1-mesa-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libxkbcommon-dev libwayland-dev
+          # The zig the release has always been built with.
+          curl -sSfL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+
+      # Tests that need the game ISO skip without it; the rest gate the release.
+      - name: Test
+        run: go test ./...
+
+      - name: Name the build
+        run: |
+          # A tag names itself. The rolling build is a different program every
+          # push, so it is named after the commit.
+          if [ "$CHANNEL" = stable ]; then VERSION="$GITHUB_REF_NAME"; else VERSION="dev-$(git rev-parse --short HEAD)"; fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: scripts/ci-build.sh "$VERSION" "$CHANNEL" "$RUNNER_TEMP/out"
+
+      - name: Write the manifest and release notes
+        run: scripts/ci-manifest.sh "$VERSION" "$CHANNEL" "$RELEASE_TAG" "$RUNNER_TEMP/out"
+
+      # Drafted until every asset is up: "latest" must never name a release
+      # whose manifest.json is not there yet. --latest because GitHub would
+      # otherwise pick the "latest" release by its own rules.
+      - name: Publish the stable release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          gh release create "$RELEASE_TAG" --draft --verify-tag \
+            --title "EQOA client $RELEASE_TAG" --notes-file "$OUT/notes.md" \
+            "$OUT/eqoa-client" "$OUT/eqoa-client.exe" "$OUT/manifest.json"
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+
+      # The tag is moved rather than added to, so the prerelease always
+      # describes the tip of master and nothing else.
+      - name: Publish the dev build
+        if: github.ref_type != 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          git tag --force "$RELEASE_TAG" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$RELEASE_TAG"
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --prerelease \
+              --title "EQOA client (latest dev build)" --notes-file "$OUT/notes.md"
+          # The binaries first and the manifest last: a client that reads the
+          # new manifest must find the binaries it names already in place.
+          gh release upload --clobber "$RELEASE_TAG" "$OUT/eqoa-client" "$OUT/eqoa-client.exe"
+          gh release upload --clobber "$RELEASE_TAG" "$OUT/manifest.json"
+          gh release edit "$RELEASE_TAG" --notes-file "$OUT/notes.md"

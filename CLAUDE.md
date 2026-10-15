@@ -163,37 +163,62 @@ go build -o headless ./cmd/headless/ && ./headless
 pkill -f './client'; sleep 1; ./client > /tmp/client.log 2>&1 &
 ```
 
-## Deployment & Auto-Update
+## Deployment & Auto-Update (GitHub releases)
 
-Client has a built-in auto-updater (`cmd/client/updater.go`) that checks `https://texturepacks.art/eqoa/manifest.json` on every launch before showing the title screen.
+**Repo: [github.com/DabDavis/eqoa-client-v1](https://github.com/DabDavis/eqoa-client-v1) — PUBLIC.**
+Releases are built by CI (`.github/workflows/release.yml`), the same scheme as the
+Perfect Dark mod: there is no deploy script to run.
 
-### Update Server (`texturepacks.art` / `10.8.0.1`)
+| You do | CI publishes | Clients that follow it |
+|---|---|---|
+| push to `master` | the rolling **dev** prerelease, tag `client-dev` (moved every push), version `dev-<sha>` | builds downloaded from the dev release |
+| push a `v*` tag (`git tag v2026.10.15 && git push origin v2026.10.15`) | a **stable** release, never rewritten, version = the tag | builds downloaded from a stable release |
 
-Nginx serves from `/home/sdg/www/tpacks.art/eqoa/eqoa/`:
-- `manifest.json` — version + platform URLs + SHA-256 hashes
-- `eqoa-client` — Linux amd64 binary
-- `eqoa-client.exe` — Windows amd64 binary
+Each release carries `eqoa-client`, `eqoa-client.exe` and `manifest.json` (version,
+channel, commit, per-platform URL + SHA-256, changelog: the last 5 commits for dev,
+everything since the previous `v*` tag for stable). A push that touches only `*.md`
+builds nothing. `go test ./...` gates every release (ISO tests skip in CI).
 
-### Deploy Workflow
+**The updater** (`cmd/client/updater.go`) follows the channel compiled into the binary:
+`-X main.UpdateChannel=stable` reads `releases/latest/download/manifest.json` (GitHub's
+redirect to the newest non-prerelease), `dev` reads `releases/download/client-dev/manifest.json`.
+It updates when the manifest's `version` differs from `BuildVersion`, verifying SHA-256.
+**A build without `UpdateChannel` (any local `go build`) never updates itself** and shows
+"local"; GM builds (`-tags dev`) skip the check too. A tester switches channel by
+downloading a binary from the other release once.
 
-**Always use `deploy.sh`** for normal updates. It builds both platforms, generates the manifest, and pushes to the update server in one step.
+### The two dependencies are pinned in `scripts/deps.env`
 
-Update-server Basic Auth creds are **injected at build time** (`-ldflags -X main.updateUser/updatePass`), not hardcoded. Set them via the git-ignored secrets file before deploying:
+`go.mod`'s replace directives point at `../go-eqoa-esf-tools-v1` (branch `client-v1` of
+the public `DabDavis/eqoa-esf-tools`) and `../raylib-go` (branch `eqoa` of the public fork
+`DabDavis/raylib-go`, three commits over upstream adding `GetVideoModes`). CI checks each
+out beside the client at the SHA in `scripts/deps.env`. **After committing in either one:
+push it, run `scripts/pin-deps.sh`, and commit `deps.env`** — otherwise CI keeps building
+the old pin. The script refuses a dirty or unpushed sibling.
+
+### Moving the pre-GitHub testers over
+
+Builds from before the switch (version like `20260802-d919518`) poll
+`texturepacks.art/eqoa/manifest.json` with Basic Auth and nothing else. After the first
+stable release, run once (needs the VPN and `scripts/.deploy-secrets`):
 
 ```bash
-cd /home/sdg/claude-eqoa/go-eqoa-client-v1
-cp scripts/.deploy-secrets.example scripts/.deploy-secrets   # first time only, then edit
-source scripts/.deploy-secrets
-./scripts/deploy.sh
+source scripts/.deploy-secrets && scripts/bridge-legacy.sh   # latest stable, or pass a v-tag
 ```
 
-The scripts fail fast if `EQOA_UPDATE_USER`/`EQOA_UPDATE_PASS` are unset. Note: the creds still end up embedded in the shipped binary (strings-extractable) — the client authenticates to a public download endpoint, so this Basic Auth is a soft scraping gate, not a real secret. Real integrity = SHA-256 check (+ future signing).
+It re-hosts that release on texturepacks.art byte for byte, so each legacy client updates
+once into a build that follows GitHub. It refuses a dev build.
 
-The client is a single binary — all assets are read from the EQOA Frontiers ISO at runtime. No fonts, asset folders, or archives needed.
+### What a release build does NOT carry
 
-### Build Version
+No credentials: a release is a public download. So **presence** (the "X is online"
+heartbeat to `texturepacks.art/eqoa/presence`, Basic Auth) is OFF in release builds; it
+runs only in a build given `-X main.presenceUser=… -X main.presencePass=…`. The world map
+image on texturepacks.art is public and still downloads. The old update password and the
+dev account password were scrubbed from the whole history when the repo went public
+(pre-scrub backup: `../backups/go-eqoa-client-v1-prescrub-20261015.bundle`).
 
-Embedded at compile: `-ldflags "-X main.BuildVersion=20260306-abc1234"`. Generated automatically by `deploy.sh` from date + git hash. Default `"dev"` without ldflags.
+The client is a single binary — all assets are read from the EQOA Frontiers ISO at runtime.
 
 Server IP: config `server_ip` > default `5.161.217.188` (Sandstorm).
 
@@ -201,10 +226,13 @@ Server IP: config `server_ip` > default `5.161.217.188` (Sandstorm).
 
 | File | Purpose |
 |------|---------|
-| `cmd/client/updater.go` | Auto-updater (manifest fetch, download, SHA-256 verify, self-replace) |
-| `scripts/deploy.sh` | Build + manifest + push to update server + download links |
-| `scripts/deploy-dev.sh` | Dev build deploy variant |
-| `scripts/build-dev.sh` | Dev build with pprof enabled |
+| `.github/workflows/release.yml` | Test, build both platforms, publish the dev or stable release |
+| `scripts/ci-build.sh` | Linux (zig cc, glibc 2.31) + Windows (mingw) builds; runs locally too |
+| `scripts/ci-manifest.sh` | `manifest.json` + release notes |
+| `scripts/deps.env` / `scripts/pin-deps.sh` | The esf-tools and raylib-go commits CI builds against |
+| `scripts/bridge-legacy.sh` | One-time move of pre-GitHub testers onto GitHub releases |
+| `scripts/build-dev.sh` | Local GM build (`-tags dev`: F11 GM menu, pprof) — never released |
+| `cmd/client/updater.go` | Auto-updater (channel, manifest fetch, download, SHA-256 verify, self-replace) |
 | `cmd/client/login.go` | `loginConfig` with `ServerIP`, `ISOPath` fields |
 
 ## Terrain Rendering
@@ -494,7 +522,7 @@ Verified zero data races under `-race` vs Sandstorm. Future edits must preserve:
 - **World switch closes the old terrain loader**: `switchWorldTerrain` calls `terrain.Loader.Close()`, which stops the load-worker goroutine THEN closes the world ESF file handle + overlays. Skipping it leaks a goroutine + OS file handle per continent switch.
 - **Zone eviction unloads GPU textures**: `renderer.go resetZoneSlot` must `rl.UnloadTexture` the slot's `texCache` (not just meshes) or VRAM grows monotonically while streaming.
 - **Headless tool serializes GameState with `gameMu`** (`cmd/headless/main.go`): tick loop + all command handlers hold it; hold it around any GameState access but NEVER across a `time.Sleep` (blocking commands release it). The visual client doesn't need this — its Tick + reads are all on the render goroutine.
-- **Update creds are build-injected, never hardcoded**: `-ldflags -X main.updateUser/updatePass` from git-ignored `scripts/.deploy-secrets` (see Deploy Workflow).
+- **No credential in source or in a release**: the repo and its releases are public. Tools read the game account password from `$EQOA_PASSWORD`; presence creds are `-ldflags` only, never in CI (see Deployment).
 
 ## DRDP Protocol Client (`internal/network/`)
 
@@ -566,8 +594,9 @@ Byte 0 = update counter, bytes 1-4 = ObjectID (0 = removed). NameColor byte 142:
 
 ## Dependencies
 
-- `github.com/gen2brain/raylib-go/raylib` — 3D rendering (local replace → `../raylib-go/raylib`)
-- `github.com/DabDavis/eqoa-esf-tools` — ESF file parsing (local replace → `../go-eqoa-esf-tools-v1`)
+- `github.com/gen2brain/raylib-go/raylib` — 3D rendering (local replace → `../raylib-go/raylib`; fork `DabDavis/raylib-go` branch `eqoa`)
+- `github.com/DabDavis/eqoa-esf-tools` — ESF file parsing (local replace → `../go-eqoa-esf-tools-v1`; branch `client-v1`)
+- Both pinned for CI in `scripts/deps.env` — see Deployment
 - `github.com/mattn/go-sqlite3` v1.14.34 — SQLite for crawler/statharvest tools
 
 ## TODO

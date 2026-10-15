@@ -13,8 +13,18 @@ import (
 )
 
 const (
-	presenceURL      = updateBaseURL + "/presence/heartbeat"
+	presenceURL      = "https://texturepacks.art/eqoa/presence/heartbeat"
 	presenceInterval = 30 * time.Second
+)
+
+// presenceUser/presencePass are the presence server's HTTP Basic Auth
+// credentials, injected with -ldflags "-X main.presenceUser=... -X
+// main.presencePass=..." into a build that should show who else is online.
+// Release builds are public downloads, so they carry neither and never start
+// the heartbeat: anything baked into them is readable by anyone.
+var (
+	presenceUser string
+	presencePass string
 )
 
 // presenceState tracks online testers and notifications.
@@ -37,6 +47,9 @@ var presence = &presenceState{known: make(map[string]bool)}
 
 // startPresence begins the heartbeat loop. Call after login.
 func startPresence(username string) {
+	if presenceUser == "" && presencePass == "" {
+		return
+	}
 	presence.mu.Lock()
 	if presence.running {
 		presence.mu.Unlock()
@@ -69,7 +82,7 @@ func presencePing(username string) {
 	if err != nil {
 		return
 	}
-	setUpdateAuth(req)
+	req.SetBasicAuth(presenceUser, presencePass)
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -8,12 +8,12 @@ Built as a 1:1 port of the PS2 client's VI engine — movement, collision, anima
 
 ## Download
 
-Single binary — no installer, no dependencies:
+Single binary — no installer, no dependencies. From [Releases](https://github.com/DabDavis/eqoa-client-v1/releases):
 
-- [Linux (amd64)](https://texturepacks.art/eqoa-client/eqoa-client)
-- [Windows (amd64)](https://texturepacks.art/eqoa-client/eqoa-client.exe)
+- **Stable** — the [latest release](https://github.com/DabDavis/eqoa-client-v1/releases/latest): `eqoa-client` (Linux amd64) or `eqoa-client.exe` (Windows amd64)
+- **Dev** — the [latest dev build](https://github.com/DabDavis/eqoa-client-v1/releases/tag/client-dev), rebuilt on every push to `master`; ahead of stable and less tested
 
-Auto-updates on every launch. Requires an EQOA Frontiers ISO disc image (SLUS-20744) — all game assets are read directly from the ISO at runtime.
+Auto-updates on every launch, staying on the channel it was downloaded from. Requires an EQOA Frontiers ISO disc image (SLUS-20744) — all game assets are read directly from the ISO at runtime.
 
 ## Features
 
