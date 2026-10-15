@@ -24,6 +24,7 @@ import (
 	rl "github.com/gen2brain/raylib-go/raylib"
 
 	"github.com/eqoa/client/internal/game"
+	"github.com/eqoa/client/internal/models"
 )
 
 // Report a Problem: the F3 key, the same thing Dab's Mod has.
@@ -875,6 +876,7 @@ func (c *Client) reportDump(now time.Time) string {
 		f("mode: not connected (login screen)")
 	}
 	f("server: %s", c.serverIP)
+	f("rules: %s", models.ActiveRules)
 	var gs *game.GameState
 	if c.engine != nil {
 		gs = c.engine.State

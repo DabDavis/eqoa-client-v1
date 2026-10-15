@@ -346,7 +346,8 @@ let `getTexture` and `getEquipmentTexture` shadow each other. See
 | `ArmorTextures[9][5]` | 8 sets × 5 slots | CHARCUST.CSF (DictIDs from VIRaster pool) |
 | `HairTextures[8]` | 8 styles | CHARCUST.CSF |
 | `HairNullTexture` | bald | CHARCUST.CSF |
-| `RobeTextures[4][2]` | 4 styles × 2 parts | CHARCUST.CSF |
+| `RobeTextures[6][2]` | 4 retail robes + Sandstorm's 4/5 × 2 parts | CHARCUST.CSF; 4/5 from `ss-art.csf` in the save folder |
+| `Tints[30]` | 15 retail + 15 Sandstorm | `$Tints`; 15–29 read out of Sandstorm's S2 (`0x000FCD00`) |
 | `HelmModelDictIDs[9]` | 8 helm 3D models | CHARCUST.CSF SimpleSprites |
 | `FaceTextures[9][8]` | 9 races × 4 faces × 2 sexes | CHARFACE.CSF + CHAR.ESF |
 
@@ -511,6 +512,35 @@ ISO Prompt → Title Screen → Login → Character Select → [Create/Delete] �
 
 `cmd/client/charsave.go`: Per-character JSON state files mirror PS2 memory card saves. Stores position/facing/zone, identity, appearance, equipment. Used to preserve 3D model in character select.
 
+## Server Rules and the Patcher
+
+**Two rule sets** (`internal/models/rules.go`). Sandstorm's players run the retail disc
+with its S2 patch, which changes what retail fixes; a server of our own talks to the
+retail disc. `models.ActiveRules` is chosen at startup by `RulesFor(server_ip, rules)`:
+Sandstorm's address → `sandstorm`, anything else → `retail`, and `"rules"` in
+`client.json` overrides. They differ in:
+
+| | retail | sandstorm (S2) |
+|---|---|---|
+| tints | 15, ≥15 → 0 (`SetArmorSlot`) | 30, own table, 15 is clear (alpha 0) |
+| armour set clamp | ≥9 → 0 | ≥10 → 0; set 9 = CHAR.ESF's shadowed plate (= `ArmorSetOrnatePlate`) |
+| robes | 0–3 | 0–5; 4/5 from `ss-art.csf`, robe 0 when it is missing |
+
+Applied where the server's bytes enter (`entityEquipment`); transmog runs after, so its
+own sets 9/10 are never clamped. Other S2 features (the /who window, opcodes
+0x1500–0x1504, coloured floating text, the world-entry 19) are not ported.
+
+**The patcher** (`internal/network/patcher.go`) is SETUP's `PatcherAPI`: the VerantPatcher
+manifest off port 7000, then each entry against the **save folder**
+`saves/<server>/BASLUS-20744EQONLINE/` beside the binary — the memory card's game folder,
+one per server. Delete entries are removed; a file is fetched when missing or its size
+differs (the PS2's test) or, under `UseCRC`, its CRC32; every download is checked
+against the manifest's size and CRC and written through a `.part`. LocalNames that leave
+the folder are refused. It runs in the startup I/O (`Engine.SaveDir`), non-fatally;
+`headless -save DIR` runs it too. The model manager then reads the folder's art
+(`SetSaveArt`: `ss-art.csf`, `addart.csf`) after the disc's. Offline mode reads the
+configured server's folder as it last stood.
+
 ## Offline Mode
 
 `./client --offline` enters the world with no server: no auth, patch, update check or presence, and no save written. It is how rendering and client-side systems are checked without a session.
@@ -607,7 +637,7 @@ Verified zero data races under `-race` vs Sandstorm. Future edits must preserve:
 ## DRDP Protocol Client (`internal/network/`)
 
 ### Connection Lifecycle
-Auth → patch → server list → world entry. Handshake completes on GuaranteedAck (fast) or 5-packet count (fallback).
+Auth → patch (the patcher, into the save folder) → server list → world entry. Handshake completes on GuaranteedAck (fast) or 5-packet count (fallback).
 
 ### State Channels
 A message at or below the channel's rx is dropped and the channel re-acked with rx; a delta whose reference base is missing (or > 4,096 ahead) discards the WHOLE datagram, unacked. Acks repeat twice, uncapped. Bases are pruned wrap-safely. A reassigned channel keeps its sequence (`ClearStateAck` is a no-op).

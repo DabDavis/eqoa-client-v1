@@ -46,6 +46,7 @@ func main() {
 	autoConnect := flag.Bool("auto-connect", true, "Auto-connect to first game server")
 	autoSelect := flag.Int("auto-select", 0, "Auto-select character N (1-indexed, 0=disabled)")
 	assetsDir := flag.String("assets", "", "Assets directory for SPELLFX.CSF/ESF (optional)")
+	saveDir := flag.String("save", "", "Save folder for the patcher (the memory card's game folder); empty = manifest check only")
 	cmdPortFlag := flag.Int("cmd-port", 7778, "TCP command port for agent control")
 	flag.Parse()
 
@@ -67,6 +68,7 @@ func main() {
 	engine := game.NewEngine(*serverIP, *gamePort, *authPort, *patchPort, *username, *password)
 	engine.AutoConnect = *autoConnect
 	engine.AssetsDir = *assetsDir
+	engine.SaveDir = *saveDir
 
 	// Auto-select is handled on the tick goroutine below (folded in so it no
 	// longer races the tick loop's GameState writes).

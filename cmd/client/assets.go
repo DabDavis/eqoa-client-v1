@@ -457,14 +457,18 @@ func (c *Client) drawNameplate(screenPos rl.Vector2, name string, clr rl.Color) 
 // entityEquipment builds an EquipmentState from an Entity's armor/appearance bytes.
 // mgr is used to read the ESF Race from the loaded CSprite (PS2 VICSprite::GetRace).
 func entityEquipment(ent *game.Entity, mgr *models.ModelManager) *models.EquipmentState {
+	// The server's bytes go through its client's rules (SetArmorSlot's set
+	// clamp, Sandstorm's robes); transmog is applied after, so its own sets
+	// are not clamped.
+	r := models.ActiveRules
 	return &models.EquipmentState{
-		Chest:      ent.Chest,
-		Bracer:     ent.Bracer,
-		Gloves:     ent.Gloves,
-		Legs:       ent.Legs,
-		Boots:      ent.Boots,
-		Helm:       ent.Helm,
-		Robe:       ent.Robe,
+		Chest:      r.ClampArmorSet(ent.Chest),
+		Bracer:     r.ClampArmorSet(ent.Bracer),
+		Gloves:     r.ClampArmorSet(ent.Gloves),
+		Legs:       r.ClampArmorSet(ent.Legs),
+		Boots:      r.ClampArmorSet(ent.Boots),
+		Helm:       r.ClampArmorSet(ent.Helm),
+		Robe:       r.Robe(ent.Robe),
 		ChestTint:  ent.ChestTint,
 		BracerTint: ent.BracerTint,
 		GlovesTint: ent.GlovesTint,

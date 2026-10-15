@@ -87,10 +87,12 @@ type TintColor struct {
 	R, G, B, A uint8
 }
 
-// Tints maps tint index to RGBA color: VICSpriteCust::Tints[15]. Index 14 is
-// yellow; with only 14 entries it fell through to white. SetArmorSlot turns
-// any index of 15 or more into 0, as GetTintColor does.
-var Tints = [15]TintColor{
+// Tints maps tint index to RGBA color. 0-14 are VICSpriteCust::Tints[15]
+// (index 14 is yellow; with only 14 entries it fell through to white); 15-29
+// are Sandstorm's, read out of its S2 patch (the table at 0x000FCD00 its
+// GetTintColor returns). Which ones a server may use is ActiveRules.TintCount:
+// retail turns 15 or more into 0.
+var Tints = [30]TintColor{
 	{0xFF, 0xFF, 0xFF, 0xFF}, // 0 = White
 	{0x5A, 0x5A, 0x5A, 0xFF}, // 1 = DarkGray
 	{0x00, 0xB4, 0xFF, 0xFF}, // 2 = Cyan
@@ -106,22 +108,46 @@ var Tints = [15]TintColor{
 	{0x00, 0xC8, 0xB4, 0xFF}, // 12 = Teal
 	{0x96, 0x00, 0x3C, 0xFF}, // 13 = Purple
 	{0xF0, 0xF0, 0x00, 0xFF}, // 14 = Yellow
+	// Sandstorm's (S2):
+	{0x00, 0x00, 0x00, 0x00}, // 15 = Clear: alpha 0, so the tinted layer is not drawn
+	{0x15, 0x00, 0x00, 0xFF}, // 16 = Black Red
+	{0x40, 0x00, 0x40, 0xFF}, // 17 = Dark Purple
+	{0xA5, 0x05, 0x01, 0xFF}, // 18 = Crimson
+	{0x50, 0x64, 0x00, 0xFF}, // 19 = Olive (as 7)
+	{0x80, 0x00, 0xFF, 0xFF}, // 20 = Violet
+	{0xFF, 0x40, 0xA0, 0xFF}, // 21 = Pink
+	{0xFF, 0x00, 0xFF, 0xFF}, // 22 = Magenta
+	{0x80, 0xFF, 0x00, 0xFF}, // 23 = Lime
+	{0x00, 0xFF, 0x80, 0xFF}, // 24 = Spring Green
+	{0x00, 0x80, 0xFF, 0xFF}, // 25 = Azure
+	{0x40, 0x20, 0x00, 0xFF}, // 26 = Dark Brown
+	{0xC0, 0xC0, 0xC0, 0xFF}, // 27 = Light Gray
+	{0x40, 0x40, 0x80, 0xFF}, // 28 = Slate
+	{0xFF, 0xD7, 0x00, 0xFF}, // 29 = Golden
 }
 
 // TintNames labels each entry of Tints for UI.
 var TintNames = [len(Tints)]string{
 	"White", "Dark Gray", "Cyan", "Brown", "Navy", "Green", "Gold",
 	"Olive", "Red", "Ice Blue", "Silver", "Tan", "Teal", "Purple", "Yellow",
+	"Clear", "Black Red", "Dark Purple", "Crimson", "Olive", "Violet", "Pink",
+	"Magenta", "Lime", "Spring Green", "Azure", "Dark Brown", "Light Gray",
+	"Slate", "Golden",
 }
 
 // RobeTextures maps [robeStyle] to ESF Surface DictIDs.
 // Each robe has 2 textures: [0]=chest, [1]=legs.
 // Source: PS2 $Robe table at 0x004FBB48, pool indices resolved from EE dump.
-var RobeTextures = [4][2]int32{
+// Robes 4 and 5 are Sandstorm's: the DictIDs its S2 SetResources hook
+// (cave 0x000FD7A0) looks up in ss-art.csf for the table at 0x000FD6A0,
+// [robe-4][chest, legs].
+var RobeTextures = [6][2]int32{
 	{1163857248, 2111470074},    // robe 0: pool[199,200]
 	{-1466178805, 222590899},    // robe 1: pool[201,202]
 	{1563400161, 1163725733},    // robe 2: pool[203,204]
 	{656438062, -1236576364},    // robe 3: pool[205,206]
+	{-559038737, -889275714},    // robe 4: 0xDEADBEEF, 0xCAFEBABE (Sandstorm's ss-art.csf)
+	{-559038722, -889275669},    // robe 5: 0xDEADBEFE, 0xCAFEBAEB (Sandstorm's ss-art.csf)
 }
 
 // HelmTextures maps helm index to ESF Surface DictID in CHARCUST.CSF.
@@ -238,7 +264,7 @@ func GetArmorTexture(armorSet byte, textSlot int) (dictID int32, fromCharESF boo
 // textSlot 0 (chest) → base robe texture, textSlot 3 (legs) → overlay.
 // Returns 0 for other slots or invalid robe index.
 func GetRobeTextureDictID(robeIndex byte, textSlot int) int32 {
-	if int(robeIndex) >= len(RobeTextures) {
+	if int(robeIndex) >= ActiveRules.RobeCount() {
 		return 0
 	}
 	switch textSlot {
@@ -323,10 +349,10 @@ func GetHelmModelDictID(helmIndex byte) int32 {
 	return HelmModelDictIDs[helmIndex]
 }
 
-// GetTintColor returns the RGBA tint color for a tint index.
-// Returns white (index 0) if out of range.
+// GetTintColor returns the RGBA tint color for a tint index, under the
+// active server's rules: past ActiveRules.TintCount it is white (index 0).
 func GetTintColor(tintIndex byte) TintColor {
-	if int(tintIndex) >= len(Tints) {
+	if int(tintIndex) >= ActiveRules.TintCount() {
 		return Tints[0]
 	}
 	return Tints[tintIndex]

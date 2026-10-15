@@ -215,6 +215,9 @@ func (c *Client) newOfflineEngine() *game.Engine {
 	e.AssetsDir = c.assetsDir
 	e.ISOPath = c.isoPath
 	e.Audio = c.audioSys
+	// No patcher runs offline, but the configured server's save folder is
+	// read as it last stood, so its art (Sandstorm's robes) still shows.
+	e.SaveDir = saveDir(c.serverIP)
 
 	gs := e.State
 	gs.PlayerObjectID = 1

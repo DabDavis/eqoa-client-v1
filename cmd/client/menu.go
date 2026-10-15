@@ -1252,7 +1252,7 @@ func (c *Client) drawMenuAppearance(startY, contentH int32) {
 	if t.TintSet {
 		tintIdx := int(t.Tint)
 		c.uiLabel(x, y, "Tint", 11, colorDim)
-		if c.uiSliderInt(x+40, y, 160, &tintIdx, 0, len(models.Tints)-1) {
+		if c.uiSliderInt(x+40, y, 160, &tintIdx, 0, models.ActiveRules.TintCount()-1) {
 			t.Tint = byte(tintIdx)
 		}
 		tc := models.GetTintColor(t.Tint)

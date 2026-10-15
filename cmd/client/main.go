@@ -309,6 +309,7 @@ type Client struct {
 	effectVolumes *game.EffectVolumeSystem
 	weather       *game.WeatherSystem
 	zoneParticlesSpawned bool // true after zone ParticleSprites have been spawned
+	saveArtFor           string // the save folder whose art the model manager holds
 
 	// GM menu (F11) — PS2 VIWndGame GM command system
 	gmMenuOpen     bool
@@ -605,7 +606,9 @@ func runClient() {
 		if cfg.ServerIP != "" {
 			client.serverIP = cfg.ServerIP
 		}
+		models.ActiveRules = models.RulesFor(client.serverIP, cfg.Rules)
 	}
+	log.Printf("rules: %s (server %s)", models.ActiveRules, client.serverIP)
 
 	// Check for updates before showing title/login. Offline mode reaches no
 	// server at all, the update server included.

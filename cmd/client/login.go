@@ -34,12 +34,33 @@ type loginConfig struct {
 	SFXVolume    float32 `json:"sfx_volume,omitempty"`
 	BGMVolume    float32 `json:"bgm_volume,omitempty"`
 	ServerIP     string  `json:"server_ip,omitempty"`
+	// Rules is "retail" or "sandstorm": the PS2 client the server is built
+	// for (models.Rules). Empty means Sandstorm's rules on Sandstorm's
+	// address and retail's everywhere else.
+	Rules string `json:"rules,omitempty"`
 	AssetsDir    string  `json:"assets_dir,omitempty"`
 	ISOPath      string  `json:"iso_path,omitempty"`
 	// The F3 report's credit name, and a report server other than the
 	// default (report.go).
 	ReportName   string `json:"report_name,omitempty"`
 	ReportServer string `json:"report_server,omitempty"`
+}
+
+// saveDir is a server's save folder: the stand-in for the PS2 memory card's
+// game folder (network.CardFolder), beside the binary under saves/<server>/.
+// One per server, because each server's patcher fills its own.
+func saveDir(serverIP string) string {
+	base := "."
+	if exePath, err := os.Executable(); err == nil {
+		base = filepath.Dir(exePath)
+	}
+	server := strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r == ':' || r < ' ' {
+			return '_'
+		}
+		return r
+	}, serverIP)
+	return filepath.Join(base, "saves", server, network.CardFolder)
 }
 
 func configPath() string {
@@ -262,6 +283,7 @@ func (c *Client) attemptLogin() {
 		)
 		engine.AssetsDir = assetsDir
 		engine.ISOPath = isoPath
+		engine.SaveDir = saveDir(serverIP) // the patcher's card folder
 		engine.Audio = audio
 		engine.State.DebugEntityMovement = true
 

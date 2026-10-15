@@ -15,8 +15,10 @@ headless-race
 *.db
 
 # What a run writes beside the binary: its log and the last run's, crash
-# reports waiting to be sent, and F3 traces.
+# reports waiting to be sent, F3 traces, and each server's save folder (what
+# its patcher downloaded).
 client.log
 client.prev.log
 /crashes/
 /traces/
+/saves/

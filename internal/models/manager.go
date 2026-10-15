@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -554,6 +555,7 @@ type ModelManager struct {
 	skinShader         rl.Shader        // GPU-skinned alpha cutoff shader
 	skinClothingShader rl.Shader        // GPU-skinned clothing composite shader
 	clothTintLoc       [2]int32         // clothTint in clothingShader, skinClothingShader
+	saveArt            []*esf.ObjFile   // the save folder's art (SetSaveArt), searched after the disc
 	bodySlots       map[int32]bool                    // DictIDs of body-slot textures (slots 0-4) needing dilation
 	animStates      animStateMap                      // per-entity animation state
 	boneLogCounter  int                               // throttle bone debug logging
@@ -1040,7 +1042,7 @@ func (m *ModelManager) DrawEntity(modelID int32, x, y, z, facing, scale float32,
 						// override wins over the robe in resolveSlotTexture, and
 						// a hidden robe's slot holds armor.
 						isRobe := equip.slotOverride(mg.TextureSlot) == 0 &&
-							equip.Robe < 4 && !equip.HideRobe &&
+							equip.Robe < byte(ActiveRules.RobeCount()) && !equip.HideRobe &&
 							GetRobeTextureDictID(equip.Robe, mg.TextureSlot) != 0
 						// Armor and robes alike: two-pass rendering (skin base +
 						// tinted overlay). SetRobe writes the robe into the same
@@ -2476,7 +2478,7 @@ func (m *ModelManager) getEquipmentTexture(dictID int32, src texSource) rl.Textu
 	if tex, ok := m.texCache[key]; ok {
 		return tex
 	}
-	search := []*esf.ObjFile{m.custFile, m.faceFile, m.file}
+	search := append([]*esf.ObjFile{m.custFile, m.faceFile, m.file}, m.saveArt...)
 	if src == texSrcCharESF {
 		search = []*esf.ObjFile{m.file}
 	}
@@ -2509,6 +2511,58 @@ func (m *ModelManager) getEquipmentTexture(dictID int32, src texSource) rl.Textu
 	return tex
 }
 
+// saveArtFiles are the art files a patcher may put in the save folder: Sandstorm's
+// ss-art.csf (its robes 4/5), and retail's addart.csf (SOE's own patch-art path,
+// which CLIENT reads off the card).
+var saveArtFiles = []string{"ss-art.csf", "addart.csf"}
+
+// SetSaveArt hands the model manager the art the patcher put in a server's
+// save folder. Its surfaces are searched after the disc's, as the PS2
+// registers them in the same dictionary; a file that is absent or does not
+// parse is skipped. Called once per server, on the main goroutine.
+func (m *ModelManager) SetSaveArt(dir string) {
+	m.saveArt = nil
+	for _, name := range saveArtFiles {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		if len(data) >= 4 && string(data[:4]) == "CESF" {
+			if data, err = esf.DecompressCSFBytes(data); err != nil {
+				log.Printf("models: %s: %v", name, err)
+				continue
+			}
+		}
+		f, err := esf.OpenBytes(data)
+		if err != nil {
+			log.Printf("models: %s: %v", name, err)
+			continue
+		}
+		m.saveArt = append(m.saveArt, f)
+		log.Printf("models: save art %s (%d bytes)", name, len(data))
+	}
+	// Sandstorm's robes 4 and 5 need all four of their surfaces.
+	saveRobeArt = len(m.saveArt) > 0
+	for _, row := range RobeTextures[4:6] {
+		for _, id := range row {
+			if !m.hasSaveSurface(id) {
+				saveRobeArt = false
+			}
+		}
+	}
+}
+
+func (m *ModelManager) hasSaveSurface(id int32) bool {
+	for _, f := range m.saveArt {
+		if obj, err := f.FindObject(id); err == nil {
+			if s, ok := obj.(*esf.Surface); ok && s != nil && s.Image != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // resolveSlotTexture returns the replacement DictID for a given TextureSlot and
 // the file it must be read from. Handles armor (0-4), hair (5), face (6), and
 // helm (7).
@@ -2521,7 +2575,7 @@ func (m *ModelManager) resolveSlotTexture(equip *EquipmentState, slot int) (int3
 			return dictID, texSrcCharESF
 		}
 		// Armor slots 0-4: robe overrides chest (0) and legs (3) unless hidden.
-		if equip.Robe < 4 && !equip.HideRobe {
+		if equip.Robe < byte(ActiveRules.RobeCount()) && !equip.HideRobe {
 			if dictID := GetRobeTextureDictID(equip.Robe, slot); dictID != 0 {
 				return dictID, texSrcAuto
 			}

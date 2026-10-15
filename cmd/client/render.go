@@ -68,6 +68,14 @@ func (c *Client) drawWorld() {
 	gs := c.engine.State
 	p := gs.Player
 
+	// The save folder's art, once the patcher has been through it: in world
+	// means the startup I/O, patcher included, has finished. Offline reads the
+	// configured server's folder as it last stood.
+	if dir := c.engine.SaveDir; c.modelMgr != nil && dir != c.saveArtFor {
+		c.modelMgr.SetSaveArt(dir)
+		c.saveArtFor = dir
+	}
+
 	// VIWorld::StreamLeaf: a zone streams in once its box is within 900
 	// (VIScene::Init's m_p2A48[1]) and out only past 950 ([0]), in 3D. The
 	// gap is the hysteresis; the old 500 both ways put the load radius
