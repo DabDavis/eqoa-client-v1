@@ -83,6 +83,8 @@ cmd/client/                          # Raylib 3D client (~23k lines)
   menu.go                            # F12 in-game menu (tabbed panel)
   playersearch.go                    # Sandstorm's Search for Player window (S2, 0x1500-0x1504)
   login.go                           # Login screen, server config
+  patchscreen.go                     # SETUP's patch step: VIWndPatcher, the per-server module loaded on demand
+  isopath.go                         # A file off the disc by its ISO 9660 path (data\psvrpath.dat)
   titlescreen.go                     # Animated title (fire/ship/smoke from SETUP.ESF)
   loadingscreen.go                   # Loading screen with procedural gear texture
   charselect.go                      # Character select (3D preview, delete, BGM)
@@ -152,7 +154,14 @@ internal/models/
 internal/network/
   connection.go                      # DRDP protocol client (reliable, state channels, XOR delta)
   packet.go                          # Packet construction, CRC, segment assembly
-  auth.go                            # Auth/patch TCP flow
+  auth.go                            # Auth TCP flow
+
+internal/patcher/                    # SETUP's Verant patcher, ported from decomp/modules/setup
+  api.go downloader.go distinfo.go   # PatcherAPI_Impl, the downloader tree, distribution info + notes
+  httpget.go vurl.go pullxml.go xml.go  # Http_get, VUrl (the PS2's exact HTTP), the manifest readers
+  card.go image.go run.go check.go   # the save folder as the card; RunPatcher's patch half; Check + module record
+
+internal/sspatch/                    # Sandstorm's S2, applied as its SS stub applies it; the feature readers
 
 internal/audio/
   audio.go                           # Sound system: 3D positional, looping, distance attenuation
@@ -505,7 +514,7 @@ Body meshes use opaque shader (forces alpha=1.0) for slots 0-4. Prevents alpha c
 ## Client Screens & Flow
 
 ```
-ISO Prompt → Title Screen → Login → Character Select → [Create/Delete] → Loading → In-World
+ISO Prompt → Title Screen → Patch (or the module, loaded) → Login → Character Select → [Create/Delete] → Loading → In-World
                                                                                       ↓
                                                                               F12 Menu, Minimap,
                                                                               HUD, Gamepad input
@@ -524,11 +533,18 @@ ISO Prompt → Title Screen → Login → Character Select → [Create/Delete] �
 
 ## Server Rules and the Patcher
 
-**Two rule sets** (`internal/models/rules.go`). Sandstorm's players run the retail disc
-with its S2 patch, which changes what retail fixes; a server of our own talks to the
-retail disc. `models.ActiveRules` is chosen at startup by `RulesFor(server_ip, rules)`:
-Sandstorm's address → `sandstorm`, anything else → `retail`, and `"rules"` in
-`client.json` overrides. They differ in:
+**The rules are the patch's** (`internal/models/rules.go`). Sandstorm's players run the
+retail disc with Sandstorm's S2 applied over the patch server, and S2 changes things
+retail fixes; a server that sends no S2 talks to retail. So `models.ActiveRules` is read
+off the S2 in the server's save folder — `RulesFor(dir, setting)`, by `internal/sspatch`,
+which validates and applies it exactly as Sandstorm's SS stub does and then reads each
+feature at the address S2 hooks (tint table, set clamp, helm remap, robes and their
+DictIDs, art file, world table, auction level, and the search / damage-colour /
+`/command` hooks; the table is in `claude-notes/go-client-patcher-20261016.md`). A hook
+that is absent or not the expected shape leaves that feature retail. `"rules"` in
+`client.json` can force `retail`, or `sandstorm` (the built-in set, which
+`TestSandstormRulesAreTheLiveS2s` pins to Sandstorm's live S2). Our own server serves an
+S2 too (clamp 11: its set 10 is `ArmorSetTemplarPlate`). Read off Sandstorm's S2:
 
 | | retail | sandstorm (S2) |
 |---|---|---|
@@ -543,7 +559,8 @@ Sandstorm's address → `sandstorm`, anything else → `retail`, and `"rules"` i
 
 Applied where the server's bytes enter (`entityEquipment`); transmog runs after, so its
 own sets 9/10 are never clamped. DamageIndication's optional trailing RGB tints the
-floating number on either server (`FloatingText.Color`). **S2's identity and telemetry
+floating number (`FloatingText.Color`) only under a patch that reads it
+(`GameState.DamageRGB`); retail stops at the defender. **S2's identity and telemetry
 layer is deliberately NOT ported**: DiscVersion 21 with a hardware address and a card
 install id, the 11 bytes of pad timing on UseSkill, the `0x07E1` heap lines and the
 `0x1505`/`0x1507` crash reports. Go sends the retail DiscVersion 18 and UseSkill, and
@@ -565,16 +582,41 @@ per-listing arrays. **0x1206 is not a quest message** — the old handler that r
 one swallowed every page. An empty page ends the paging ("No auctions found." /
 "End of search results.").
 
-**The patcher** (`internal/network/patcher.go`) is SETUP's `PatcherAPI`: the VerantPatcher
-manifest off port 7000, then each entry against the **save folder**
-`saves/<server>/BASLUS-20744EQONLINE/` beside the binary — the memory card's game folder,
-one per server. Delete entries are removed; a file is fetched when missing or its size
-differs (the PS2's test) or, under `UseCRC`, its CRC32; every download is checked
-against the manifest's size and CRC and written through a `.part`. LocalNames that leave
-the folder are refused. It runs in the startup I/O (`Engine.SaveDir`), non-fatally;
-`headless -save DIR` runs it too. The model manager then reads the folder's art
-(`SetSaveArt`: `ss-art.csf`, `addart.csf`) after the disc's. Offline mode reads the
-configured server's folder as it last stood.
+**The patcher** (`internal/patcher`) is SETUP's, ported from the decomp
+(`decomp/modules/setup/src`, 454 of 462 byte-exact): `PatcherAPI_Impl`, the downloader
+tree, `Http_get`, and `VUrl` sending the PS2's exact request. Its rules are the PS2's:
+
+- Content-Length or failure;
+- every file gzipped (an uncompressed one is a 0-byte image);
+- a file judged by SIZE unless the distribution says `UseCRC`, and the CRC always checked
+  after a download;
+- deletes after downloads;
+- nothing written unless the whole patch succeeds.
+
+The save folder `saves/<server>/BASLUS-20744EQONLINE/` beside the binary is the card's game
+folder (`VISetup::ReadPatchData`/`WritePatchData`, `card.go`); the manifest path comes off
+the disc's `data\psvrpath.dat`. `TestLiveServer` (`EQOA_LIVE_PATCH=5.161.217.188`) runs it
+against a real server.
+
+**Each server's folder is a patch module, loaded on demand.** A PS2 has one card folder and
+patches it over to change servers; this client keeps one per server.
+
+- `patcher.Check` is the patcher's own decision with nothing written. It runs in the
+  background while the title is up.
+- On Play (`patchscreen.go`):
+  - a module that is current loads with no patch window;
+  - a server whose patch port does not answer loads its saved module, and the login screen
+    says so;
+  - otherwise SETUP's patch window runs (`VIWndPatcher`: status words, bar, release notes
+    that open by themselves when files changed, the cancel box, the failure box).
+- Only a loaded module goes on to the login. Back, or a failed patch's Restart, is the title
+  again.
+- A finished patch writes `saves/<server>/patch.json` (server, manifest, when, files and
+  CRCs), which the F3 report names.
+- `applyPatch(dir)` then sets the rules, the save art (`SetSaveArt`: the S2's art file, then
+  `addart.csf`) and `WORDS.TXT`.
+- `headless -save DIR` patches at its start and goes on if it fails.
+- Offline reads the configured server's module as it last stood.
 
 ## Offline Mode
 
@@ -663,7 +705,7 @@ These are Dab's Mod's crash reports (`port/src/crashreport.c`), in two halves.
 Verified zero data races under `-race` vs Sandstorm. Future edits must preserve:
 
 - **Packet handling is panic-guarded**: `engine.go dispatchIncoming` wraps every message in `recover()`. Handlers index into variable-length wire data — a short/malformed packet must not crash the client. Also bounds-check before indexing (e.g. HP reads in `state.go` guard `len(data) >= 28`).
-- **Startup I/O runs off-thread, results applied on the main goroutine**: `runStartupIO` (blocking auth/patch/connect) touches ONLY its args, never GameState; `applyStartupResult` (called from `Tick`) writes `Phase`/`Conn`/`StatusMsg`/`AccountID`. Never write those fields from the startup goroutine — that races the game loop. Same pattern for login: goroutine → `loginResultCh` → `pollLoginResult` on the main goroutine.
+- **Startup I/O runs off-thread, results applied on the main goroutine**: `runStartupIO` (blocking auth/connect) touches ONLY its args, never GameState; `applyStartupResult` (called from `Tick`) writes `Phase`/`Conn`/`StatusMsg`/`AccountID`. Never write those fields from the startup goroutine — that races the game loop. Same pattern for login: goroutine → `loginResultCh` → `pollLoginResult` on the main goroutine.
 - **World switch closes the old terrain loader**: `switchWorldTerrain` calls `terrain.Loader.Close()`, which stops the load-worker goroutine THEN closes the world ESF file handle + overlays. Skipping it leaks a goroutine + OS file handle per continent switch.
 - **Zone eviction unloads GPU textures**: `renderer.go resetZoneSlot` must `rl.UnloadTexture` the slot's `texCache` (not just meshes) or VRAM grows monotonically while streaming.
 - **Headless tool serializes GameState with `gameMu`** (`cmd/headless/main.go`): tick loop + all command handlers hold it; hold it around any GameState access but NEVER across a `time.Sleep` (blocking commands release it). The visual client doesn't need this — its Tick + reads are all on the render goroutine.
@@ -672,7 +714,7 @@ Verified zero data races under `-race` vs Sandstorm. Future edits must preserve:
 ## DRDP Protocol Client (`internal/network/`)
 
 ### Connection Lifecycle
-Auth → patch (the patcher, into the save folder) → server list → world entry. Handshake completes on GuaranteedAck (fast) or 5-packet count (fallback).
+Patch (before the login, `patchscreen.go`) → auth → server list → world entry. Handshake completes on GuaranteedAck (fast) or 5-packet count (fallback).
 
 ### The receive loop (`dispatchIncoming` = CLIENT's `VIClient::PumpMessages`)
 One switch on the DRDP message type, as CLIENT's (`internal/game/intake_routing.go`):
