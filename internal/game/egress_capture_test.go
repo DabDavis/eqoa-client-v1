@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/eqoa/client/internal/network"
+	"github.com/eqoa/client/internal/protocol"
 )
 
 // What a real PS2 SENT, read back out of the captures: the oracle for every
@@ -151,14 +152,35 @@ func egressFromCapture(t *testing.T, name string) (msgs []egressMsg, undecoded i
 	}()
 
 	for _, port := range order {
-		c, err := network.NewConnection("127.0.0.1", 9, 0xFFFE)
-		if err != nil {
-			t.Fatal(err)
-		}
+		// One Connection per DRDP connection, each of which numbers its
+		// messages from 1: the login endpoint's, the game server's, and the
+		// promoted session's (addressed to the client's own endpoint; it keeps
+		// the game server's instance but starts its sequence again, so a
+		// shared Connection drops its first messages, 0x0014 and 0x000E, as
+		// duplicates). A connection is its destination plus its instance; a
+		// segment without an instance belongs to its destination's last one.
+		conns := map[uint64]*network.Connection{}
+		inst := map[uint16]uint32{}
 		for i, d := range byPort[port] {
 			pkt, err := network.ParsePacket(d.data, nil)
 			if err != nil || pkt.Body == nil {
 				continue
+			}
+			dst := pkt.RemoteEndpoint
+			if pkt.Header.Flags&protocol.SegmentFlagHasInstance != 0 {
+				inst[dst] = pkt.Header.Instance
+			}
+			key := uint64(dst)<<32 | uint64(inst[dst])
+			c := conns[key]
+			if c == nil {
+				if c, err = network.NewConnection("127.0.0.1", 9, 0xFFFE); err != nil {
+					t.Fatal(err)
+				}
+				conns[key] = c
+				// A Connection takes a segment of a foreign instance only
+				// from a session change; the promoted session's first
+				// segment does not announce one, so it is marked here.
+				pkt.Header.Flags |= protocol.SegmentFlagNewInstance
 			}
 			for _, m := range c.ProcessIncoming(pkt) {
 				data := append([]byte(nil), m.Data()...)
@@ -169,7 +191,9 @@ func egressFromCapture(t *testing.T, name string) (msgs []egressMsg, undecoded i
 				msgs = append(msgs, em)
 			}
 		}
-		c.Close()
+		for _, c := range conns {
+			c.Close()
+		}
 	}
 	undecoded = strings.Count(logs.String(), "does not exist, segment dropped")
 	return msgs, undecoded
