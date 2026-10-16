@@ -300,7 +300,7 @@ A port of `VIRadialFloraSystem` (`internal/terrain/flora.go`): a 3×3 grid of 40
 
 **Sky** (`internal/sky/sky.go`): the "sky" dome only, unrotated ("EQOA_Skydome_360" is the Plane of Sky's), its layers from the ESF material: layer 0 scrolling at 0.009/s, layer 1 ×3 at 0.05/s, blend 3. Every layer is the sky colour (`SetupTimeOfDaySky`, the renderer's `SkyColor`) × texture; `ProcessTransitions` rebuilds the dome under weather (DarkClouds). Sun, Corona and Moon are found by NAME, drawn 8/24/4 at 35 units, additive, hidden under overcast. 128 stars from `sStarNoise` with twinkle, plus a shooting star. 14 additive lightning patches during a flash. `render.go` feeds it `WeatherSystem.SkyAtmosphere()` each frame.
 
-**Game clock**: one game day is 60 real minutes, `h = mod(ts2 + elapsed, 3.6e6)/3.6e6 × 24` (CLIENT `0x00BC7B70`).
+**Game clock**: `h = mod(ts2 + elapsed, 3.6e6)/3.6e6 × 24` (CLIENT `0x00BC7B70`) in VITimer ticks, which run at **983.04 a second, not 1,000** (SUPPORT `vitimer.cpp`: BUSCLK/16, compare 18,750, +2), so a game day is 61.04 real minutes; `internal/game/ps2clock.go`. A later 0x0013 is blended in over 60,000 ticks (`VISyncTime`), never jumped to.
 
 **Weather** (`internal/game/weather.go`): a VIAtmosphere port. WXTYPE 0 clear, 1–3 rain and 4–6 snow at intensities {0, .15, .5, 1, .15, .5, 1}. Opcode **0xC5 fades over 30 s, 0xC7 is instant** (the server's `ps2opcodes.go` comments were swapped too). Particles ray-test the ground, so rain stops at a roof; there is no indoor switch. The outdoors factor is the baked sun gate 15 below the camera.
 
@@ -724,7 +724,7 @@ Quantising: `(v − lo)` clamped to the range, × 2^(8n), ÷ range, truncated, h
 add/sub/mul chop, but **the divide rounds to nearest**: with a chopping divide 23 captured
 position axes are unreachable from any float32. Velocity y 0 is `0xF739`.
 
-**Cadence** (`VIClient::Process`, 0x00BC7F40): written every +0x7578 ms (100 from the
+**Cadence** (`VIClient::Process`, 0x00BC7F40): written every +0x7578 VITimer ticks (100 = 101.7 ms, from the
 constructor; 0x07B2 sets it; no capture carries one), and the frame's flush with it — the
 captures' intervals are 100 and 133 ms. **A state equal to the last is not sent at all**
 (`connection_send_state`'s iSame): no capture has two equal 0x40s in a row, and a PS2
@@ -764,6 +764,12 @@ index 7 is the current HP), 0x43 effects (u32 count ≤ 8, 132-byte records: ico
   fight from there. `AutoAttackTick` plays the swing's own effect in reach (GetSwing:
   Attack1-4 / Range1-4, 3-6 s) and sends nothing; out of reach the character swings, **0x00D8**
   (bare) goes out and the next try waits 2 s.
+- **Live on Sandstorm (2026-10-16):** a TAP does not start a melee fight — the server's first
+  swing comes ~7 s after the 0x000F and finds byte 36 back at 0 — but a HELD button does (13
+  hits in 25 s), and once the NPC fights back the server keeps the fight going after the
+  release, as in `ps2_main_capture`. That is the PS2's own behaviour under the retail option
+  (`VIGameOptions::m_x95` off); with the option on, a press toggles auto-attack and byte 36
+  stays 1.
 - **Targets**: every change is 0x0010 {u32 0, u32 target} and turns auto-attack off
   (`SetTarget`, `SelectTarget`, `CycleTarget` — Tab the scene by screen-centre score, ` the
   party); `ClearTarget` (Escape) sends nothing. A target that leaves the scene stays targeted.
