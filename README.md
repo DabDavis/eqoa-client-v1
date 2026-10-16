@@ -100,7 +100,7 @@ All animation IDs are ESF CPlayList slot numbers. `PLSlotToRawPair` maps slots t
 Full implementation of EQOA's custom UDP protocol:
 
 - Reliable messaging with per-message retransmit and RTT-based RTO
-- 29 state channels (self + 28 entities) with XOR delta compression
+- CLIENT's receive loop: 24 entity slots on state channels 0x00-0x17 (the player among them), stats, effects and group channels, XOR delta compression
 - Arrival history bitmap for duplicate/out-of-order detection
 - Fragment reassembly with orphan timeout
 - Position updates at ~3.3 Hz (0x40 opcode, 41 bytes)
