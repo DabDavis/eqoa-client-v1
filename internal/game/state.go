@@ -198,6 +198,11 @@ type Entity struct {
 	// NPCType from state channel offsets 145-146 (uint16 LE).
 	// 0x8000=NPC, 0x8100=merchant, 0x8006=quest giver, 0x8008=guild board, etc.
 	NPCType uint16
+	// NPCFlags is VICreatureEntity +0x25A, state channel bytes 146-147 (byte
+	// 145 is a byte of its own, +0x259). InteractWithTarget: 1 merchant
+	// (0x004C), 2 bank (0x124D), 8 blacksmith (0x0061); 0x80 cannot be
+	// auto-attacked (ToggleAutoAttack). NPCType&0x0100 is NPCFlags&1.
+	NPCFlags uint16
 
 	// Experience from StatsUpdate opcode 0x0790.
 	// PS2: stored at entity+0x4F0F0 (int64) and +0x4F100 (int64 max).
@@ -457,9 +462,10 @@ type GameState struct {
 	GroupInviteID uint32 // pending invite group ID (0 = none)
 	GroupInviter  string // name of inviter
 
-	// Reverse map: channel index (1-28) → objectID currently on that channel.
+	// Reverse map: entity channel (0x00-0x17) → objectID currently on it.
 	// Avoids O(n) entity scans in decodeEntityState.
 	ChannelEntity [29]uint32
+	RoutingState // the pump's and the state channels' own state (intake_routing.go)
 
 	// Quest tracker (from opcodes 0x0045/0x007B/0x007F)
 	QuestTrackerID    uint32   // active tracked quest ID (0xFFFFFFFF = none)
@@ -535,7 +541,7 @@ type GameState struct {
 	// Debug: entity movement tracking (enabled by headless 'watch' command)
 	DebugEntityMovement bool
 	DebugStateDiffs     bool       // log byte-level diffs on self state channel
-	prevChannelState    [29][]byte // previous state bytes per channel for diff (0=self, 1-28=entities)
+	prevChannelState    [29][]byte // previous state bytes per entity channel (0x00-0x17) for diff
 	LastInterpDebug     time.Time  // last time interpolation debug was printed
 }
 
@@ -564,7 +570,8 @@ func NewGameState(host string, gamePort, authPort, patchPort int, username strin
 	return gs
 }
 
-// HandleMessage dispatches a received message to the appropriate handler.
+// HandleMessage is the guaranteed message (0xFB) dispatcher, CLIENT's
+// VIClient::ProcessMessage (0x00BD0DC8): one switch on the u16 opcode.
 func (gs *GameState) HandleMessage(msg *protocol.Message) {
 	// Extract opcode from message data for reliable messages
 	opcode := msg.Opcode
@@ -581,8 +588,6 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 	switch opcode {
 	case protocol.OpcodeDiscVersion:
 		gs.handleDiscVersion(msg)
-	case protocol.OpcodeGameServers:
-		gs.handleGameServers(msg)
 	case protocol.OpcodeCamera1:
 		gs.handleCamera1(msg)
 	case protocol.OpcodeCamera2:
@@ -595,6 +600,7 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 	case protocol.OpcodeTime:
 		gs.handleTime(msg)
 	case protocol.OpcodeMemoryDump:
+		gs.noteSelf(msg)
 		gs.handleMemoryDump(msg)
 	case protocol.OpcodeTeleport:
 		gs.handleTeleport(msg)
@@ -851,12 +857,13 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 	}
 }
 
-// HandleStateChannel processes a decoded state channel update.
+// HandleStateChannel is VIClient::ProcessStateChannel (0x00BD3C18): channels
+// 0x00-0x17 are the 24 entities (the player's own among them), 0x40 the
+// group, 0x42 the stats, 0x43 the active effects and 0x44-0x6B forty records.
+// Every other channel is read by nothing. An empty message still counts: it
+// empties an entity slot or a record.
 func (gs *GameState) HandleStateChannel(channel byte, msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) == 0 {
-		return
-	}
 
 	// Debug: log first state channel delivery per channel
 	gs.stateChannelCount[channel]++
@@ -870,9 +877,9 @@ func (gs *GameState) HandleStateChannel(channel byte, msg *protocol.Message) {
 			channel, msg.Sequence, msg.XORByte, len(data), count, data[:hexLen])
 	}
 
-	// State channel byte-diff monitor: log changes on self (0x00) and entity (1-28) channels.
+	// State channel byte-diff monitor: log changes on the entity channels.
 	// Always active — critical for combat RE. Tracks previous bytes per channel.
-	if (channel == 0 || (channel >= 1 && channel <= 28)) && len(data) > 0 {
+	if channel < 24 && len(data) > 0 {
 		chIdx := int(channel)
 		if gs.prevChannelState[chIdx] == nil {
 			gs.prevChannelState[chIdx] = make([]byte, len(data))
@@ -888,8 +895,11 @@ func (gs *GameState) HandleStateChannel(channel byte, msg *protocol.Message) {
 			if len(diffs) > 0 {
 				// For entity channels, include the entity name
 				label := "self"
-				if channel > 0 {
-					objID := gs.ChannelEntity[channel]
+				var objID uint32
+				if len(data) >= 5 {
+					objID = binary.LittleEndian.Uint32(data[1:5])
+				}
+				if objID != gs.PlayerObjectID {
 					if ent, ok := gs.Entities[objID]; ok {
 						label = ent.Name
 					} else {
@@ -903,20 +913,20 @@ func (gs *GameState) HandleStateChannel(channel byte, msg *protocol.Message) {
 	}
 
 	switch {
-	case channel == 0:
-		// Channel 0 = player self (201 bytes)
-		gs.decodePlayerState(data)
-	case channel >= 1 && channel <= 28:
-		// Channels 1-28 = nearby entities
-		gs.decodeEntityState(channel, data)
+	case channel < 24:
+		gs.channelEntity(channel, data)
+	case channel == 0x40:
+		gs.decodeGroupPositions(data)
 	case channel == 0x42:
-		// Stat channel
 		gs.decodeStatUpdate(data)
 	case channel == 0x43:
-		// Buff/effect channel
 		gs.decodeBuffUpdate(data)
+	case channel >= 0x44 && channel < 0x6C:
+		gs.decodeChannelRec(channel, data)
 	default:
-		log.Printf("State channel 0x%02X: %d bytes (unhandled)", channel, len(data))
+		if count == 1 {
+			log.Printf("State channel 0x%02X: %d bytes (CLIENT reads nothing here)", channel, len(data))
+		}
 	}
 }
 
@@ -942,7 +952,28 @@ func (gs *GameState) handleDiscVersion(msg *protocol.Message) {
 	}
 }
 
+// clientLanguage is the language the shard list is filtered on. VIShardInfo
+// compares each entry's language byte with its own (+0x10); the Go client
+// speaks English, 0.
+const clientLanguage = 0
+
+// handleGameServers is the shard list, 0x07B3, which CLIENT reads only off a
+// best-effort (0xFC) message and only before a shard is chosen
+// (ProcessMessageFC: client state 0 or 1). VIShardInfo::Read (0x00BFC208):
+// the count is ZIGZAG (VIMemStreamArray.h's ReadSigned), then per entry an
+// 88-byte record from func_00CBBB40 -- a wide name (u32 length; 32
+// characters or more leaves it empty), a "recommended" byte, an 8-byte id
+// (the endpoint, port and reversed IP Go splits it into) and a signed
+// language byte. func_00BFC290 then keeps only the entries in the client's
+// language. Sandstorm's raw count byte 4 is two entries of the six it sends,
+// languages 0 and 1, of which an English client shows one.
 func (gs *GameState) handleGameServers(msg *protocol.Message) {
+	switch gs.Phase {
+	case PhaseConnecting, PhaseAuth, PhaseServerList:
+	default:
+		log.Printf("GameServers: ignored in phase %v (CLIENT reads a list only before a shard is chosen)", gs.Phase)
+		return
+	}
 	data := msg.Data()
 	if len(data) < 3 {
 		log.Printf("GameServers: short data (%d bytes)", len(data))
@@ -952,8 +983,10 @@ func (gs *GameState) handleGameServers(msg *protocol.Message) {
 	// Skip opcode (2 bytes)
 	reader := buffer.NewReader(data[2:])
 
-	// Server count (raw byte)
-	count, _ := reader.ReadByte()
+	count, err := reader.Read7BitEncodedInt64()
+	if err != nil || count < 0 {
+		count = 0
+	}
 	log.Printf("GameServers: %d servers", count)
 
 	gs.Servers = nil
@@ -963,8 +996,12 @@ func (gs *GameState) handleGameServers(msg *protocol.Message) {
 		if err != nil {
 			break
 		}
-		name, err := reader.ReadStringUnicode(int(nameLen))
-		if err != nil {
+		var name string
+		if nameLen+1 <= 32 {
+			if name, err = reader.ReadStringUnicode(int(nameLen)); err != nil {
+				break
+			}
+		} else if err = reader.Advance(int(nameLen) * 2); err != nil {
 			break
 		}
 
@@ -976,14 +1013,19 @@ func (gs *GameState) handleGameServers(msg *protocol.Message) {
 		ip3, _ := reader.ReadByte()
 		ip2, _ := reader.ReadByte()
 		ip1, _ := reader.ReadByte()
-		ip0, _ := reader.ReadByte()
-
-		language, _ := reader.ReadByte()
+		ip0, err := reader.ReadByte()
+		language, err2 := reader.ReadInt8()
+		if err != nil || err2 != nil {
+			break
+		}
 
 		ipStr := fmt.Sprintf("%d.%d.%d.%d", ip0, ip1, ip2, ip3)
 
 		log.Printf("Server[%d]: '%s' recommended=%d endpoint=0x%04X port=%d ip=%s lang=%d",
 			i, name, recommended, endpointID, port, ipStr, language)
+		if language != clientLanguage {
+			continue
+		}
 
 		gs.Servers = append(gs.Servers, ServerInfo{
 			Name:       name,
@@ -2240,42 +2282,17 @@ func (gs *GameState) decodePlayerState(data []byte) {
 	gs.Player.IsPlayer = true
 }
 
-// decodeEntityState decodes a nearby entity state (channels 1-28).
-func (gs *GameState) decodeEntityState(channel byte, data []byte) {
+// decodeEntityState reads another entity's state off its channel, once
+// channelEntity has decided the slot holds it; created is a slot that has
+// just made a new entity. The layout is VIEntity's reader (0x00CC4CC8:
+// position, heading, pitch, world, a u64, two bytes, model, a u32, scale,
+// to byte 40) and then VICreatureEntity's (0x00CC2DB0, to byte 162).
+func (gs *GameState) decodeEntityState(channel byte, data []byte, created bool) {
 	if len(data) < 16 {
 		return
 	}
 
-	// 162-byte Sandstorm format. Byte 0 is an update counter (NOT an active flag).
-	// Sandstorm entities have byte0=0x00 on first appearance, incrementing with each update.
-	// Only objectID=0 means the channel is empty.
 	objectID := uint32(data[1]) | uint32(data[2])<<8 | uint32(data[3])<<16 | uint32(data[4])<<24
-
-	if objectID == 0 {
-		// Entity removed from this channel — clear via reverse map (O(1))
-		oldID := gs.ChannelEntity[channel]
-		if oldID != 0 {
-			if ent, ok := gs.Entities[oldID]; ok && ent.Channel == int(channel) {
-				log.Printf("Entity removed: ch=%d %q objID=0x%08X", channel, ent.Name, oldID)
-				gs.removeEntity(oldID)
-			}
-			gs.ChannelEntity[channel] = 0
-		}
-		// The channel's sequence and bases carry on: a channel the server
-		// reassigns continues its old sequence with a delta (114 times in
-		// four PS2 captures, never a restart), so nothing is cleared here.
-		return
-	}
-
-	// If this channel was previously assigned to a different entity, remove the old one.
-	// The server reassigns channels when entities enter/leave visibility range.
-	oldID := gs.ChannelEntity[channel]
-	if oldID != 0 && oldID != objectID {
-		if old, ok := gs.Entities[oldID]; ok && old.Channel == int(channel) {
-			log.Printf("Entity replaced: ch=%d %q objID=0x%08X → 0x%08X", channel, old.Name, oldID, objectID)
-			gs.removeEntity(oldID)
-		}
-	}
 	gs.ChannelEntity[channel] = objectID
 
 	ent, exists := gs.Entities[objectID]
@@ -2289,7 +2306,7 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 	ent.Channel = int(channel)
 	prevUpdate := ent.LastUpdate // save for elapsed time computation
 	ent.LastUpdate = time.Now()
-	wasNew := !exists
+	wasNew := !exists || created
 
 	// Track average update interval (exponential moving average)
 	if !prevUpdate.IsZero() {
@@ -2345,14 +2362,16 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 
 	// Decode velocity from state channel offsets 40-42 (signed bytes).
 	// Sandstorm velocity bytes encode direction with magnitude ~30 for walking NPCs.
-	// PS2 pcap verified: world_velocity = byte_velocity / 6.0 (NPC walk speed ~5.0 u/s).
+	// VICreatureEntity's reader (0x00CC2DB0) scales them by 21/128 (func_00CC2890:
+	// byte × scale × 1/128) into +0x218. Bytes 43-44, 45-47 and 48-49 follow the
+	// same way at 8, 63 and 32 (two, three and two components).
 	if len(data) >= 43 {
 		rawVX := float32(int8(data[40]))
 		rawVY := float32(int8(data[41]))
 		rawVZ := float32(int8(data[42]))
 		mag := float32(math.Sqrt(float64(rawVX*rawVX + rawVY*rawVY + rawVZ*rawVZ)))
 		if mag > 0.5 {
-			const velScale = float32(1.0 / 6.0)
+			const velScale = float32(21.0 / 128.0)
 			ent.VelX = rawVX * velScale
 			ent.VelY = rawVY * velScale
 			ent.VelZ = rawVZ * velScale
@@ -2570,6 +2589,9 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte) {
 	if len(data) >= 147 {
 		ent.NPCType = uint16(data[145]) | uint16(data[146])<<8
 	}
+	if len(data) >= 148 {
+		ent.NPCFlags = uint16(data[146]) | uint16(data[147])<<8
+	}
 
 	// Log new and changed entities
 	if wasNew {
@@ -2742,79 +2764,66 @@ func decodeMediumBE(b []byte) float32 {
 	return float32(val) / 128.0
 }
 
-// decodeStatUpdate decodes the stat channel (0x42) data.
-// PS2 EE memory layout (verified from memory scan):
-//   +0x00 STR, +0x04 STA, +0x08 AGI, +0x0C DEX, +0x10 WIS, +0x14 INT, +0x18 CHA
-//   +0x20 MaxHP, +0x24 CurrentPower, +0x28 MaxPower
-//   +0x38 AC
-//   +0x58 Poison, +0x5C Disease, +0x60 Fire, +0x64 Ice, +0x68 Lightning, +0x6C Arcane
+// decodeStatUpdate is the stat channel (0x42), Channel42 → ReadStats
+// (0x00BDCB30): 29 u32 stats, 29 u32 base stats and one byte, 233 bytes,
+// read in that order. A message that runs short leaves every field after the
+// break as it was (VIMemStream's error is sticky). Index 7 is the current HP
+// (GetHP), 8 max HP, 9 power, 10 max power; the named fields below are the
+// same values under their old offsets. claude-notes/sandstorm-stat-channel.md
+// has the field map. Its "BaseAC" (base index 8, offset 148) is index 8 of the
+// base block, which GetStatTotal reads as stat 8's base: the base max HP.
 func (gs *GameState) decodeStatUpdate(data []byte) {
-	if len(data) < 28 {
-		return // not enough for stats, silently skip
+	p := 0
+	read := func(dst *int32) bool {
+		if p+4 > len(data) {
+			p = len(data) + 1
+			return false
+		}
+		*dst = int32(binary.LittleEndian.Uint32(data[p:]))
+		p += 4
+		return true
+	}
+	ok := true
+	for i := range gs.PlayerStats {
+		if ok = read(&gs.PlayerStats[i]); !ok {
+			break
+		}
+	}
+	for i := range gs.PlayerBaseStats {
+		if !ok {
+			break
+		}
+		ok = read(&gs.PlayerBaseStats[i])
+	}
+	if ok && p < len(data) {
+		gs.PlayerStatTail = data[p]
 	}
 
-	readI32 := func(off int) int32 {
-		return int32(binary.LittleEndian.Uint32(data[off : off+4]))
-	}
+	st, base := &gs.PlayerStats, &gs.PlayerBaseStats
+	gs.Player.Str, gs.Player.Sta, gs.Player.Agi, gs.Player.Dex = st[0], st[1], st[2], st[3]
+	gs.Player.Wis, gs.Player.Int, gs.Player.Cha = st[4], st[5], st[6]
+	hp, maxHP, power, maxPower := st[7], st[8], st[9], st[10]
 
-	// Base stats (offsets 0-27)
-	gs.Player.Str = readI32(0)
-	gs.Player.Sta = readI32(4)
-	gs.Player.Agi = readI32(8)
-	gs.Player.Dex = readI32(12)
-	gs.Player.Wis = readI32(16)
-	gs.Player.Int = readI32(20)
-	gs.Player.Cha = readI32(24)
+	// Block 1 combat fields (offsets 44-56): 0 on Sandstorm except 56.
+	gs.Player.OffMod = st[12]   // offset 48
+	gs.Player.DefMod = st[13]   // offset 52
+	gs.Player.HPFactor = st[14] // offset 56 (1703 on Zaknafein)
 
-	// HP/Power (PS2 offsets: +0x20 MaxHP, +0x24 CurPower, +0x28 MaxPower)
-	var maxHP, power, maxPower int32
-	if len(data) >= 44 {
-		maxHP = readI32(32)   // +0x20
-		power = readI32(36)   // +0x24
-		maxPower = readI32(40) // +0x28
-	}
+	// Resist additions, offsets 88-108 (order per the note: uncertain).
+	gs.Player.FireRAdd = st[22]
+	gs.Player.LightningRAdd = st[23]
+	gs.Player.ColdRAdd = st[24]
+	gs.Player.ArcaneRAdd = st[25]
+	gs.Player.PoisonRAdd = st[26]
+	gs.Player.DiseaseRAdd = st[27]
 
-	// Block 1 combat fields (offsets 44-56)
-	if len(data) >= 60 {
-		// offset 44 = 0 on Sandstorm (SOE: field_100=always 100)
-		gs.Player.OffMod = readI32(48)   // OFF_MOD (total) — 0 on Sandstorm
-		gs.Player.DefMod = readI32(52)   // DEF_MOD (total) — 0 on Sandstorm
-		gs.Player.HPFactor = readI32(56) // HP_FACTOR (1703 on Zaknafein)
-	}
-
-	// Resists (offsets 88-112, matches SOE EE layout +184 relative to stat block)
-	// Raw dump: [84]=5 [88]=5 [92]=5 [96]=5 [100]=0 [104]=35 [108]=0 [112]=0
-	// 7 resist slots at 88-112, but byte 84 is also non-zero — could be 7th resist or gap field
-	// SOE order: Fire, Lightning, Cold, Arcane, Poison, Disease, Unknown
-	if len(data) >= 112 {
-		gs.Player.FireRAdd = readI32(88)
-		gs.Player.LightningRAdd = readI32(92)
-		gs.Player.ColdRAdd = readI32(96)
-		gs.Player.ArcaneRAdd = readI32(100)
-		gs.Player.PoisonRAdd = readI32(104)
-		gs.Player.DiseaseRAdd = readI32(108)
-	}
-
-	// Base stats (offsets 116-140, matches SOE EE layout +212)
-	if len(data) >= 144 {
-		gs.Player.BaseStr = readI32(116)
-		gs.Player.BaseSta = readI32(120)
-		gs.Player.BaseAgi = readI32(124)
-		gs.Player.BaseDex = readI32(128)
-		gs.Player.BaseWis = readI32(132)
-		gs.Player.BaseInt = readI32(136)
-		gs.Player.BaseCha = readI32(140)
-	}
-
-	// Block 2 combat fields (offsets 148+, matches SOE EE layout +244)
-	if len(data) >= 152 {
-		gs.Player.BaseAC = readI32(148)
-		gs.Player.AC = gs.Player.BaseAC // AC for display (offset 44 is 0 on Sandstorm)
-	}
-	if len(data) >= 172 {
-		gs.Player.BaseOffMod = readI32(164)
-		gs.Player.BaseDefMod = readI32(168)
-	}
+	// Base stats, offsets 116-140.
+	gs.Player.BaseStr, gs.Player.BaseSta, gs.Player.BaseAgi, gs.Player.BaseDex = base[0], base[1], base[2], base[3]
+	gs.Player.BaseWis, gs.Player.BaseInt, gs.Player.BaseCha = base[4], base[5], base[6]
+	gs.Player.BaseAC = base[8] // offset 148: the base max HP (see above), kept under its old name
+	gs.Player.AC = gs.Player.BaseAC
+	gs.Player.BaseOffMod = base[12] // offset 164
+	gs.Player.BaseDefMod = base[13] // offset 168
 
 	// Total resists = base (48) + additions from channel
 	const baseResist = int32(48)
@@ -2825,9 +2834,7 @@ func (gs *GameState) decodeStatUpdate(data []byte) {
 	gs.Player.LightningR = baseResist + gs.Player.LightningRAdd
 	gs.Player.ArcaneR = baseResist + gs.Player.ArcaneRAdd
 
-	// Store raw int32 values for stats display
-	// PS2 layout has MaxHP at +0x20, no explicit CurrentHP in stat channel.
-	// CurrentHP comes from entity state channel 0x00 (byte HP field).
+	gs.Player.HPInt = hp
 	gs.Player.MaxHPInt = maxHP
 	gs.Player.PowerInt = power
 	gs.Player.MaxPowerInt = maxPower
@@ -2835,10 +2842,6 @@ func (gs *GameState) decodeStatUpdate(data []byte) {
 	// Scale to 0-255 byte range for HUD display.
 	gs.Player.MaxHP = 255
 	gs.Player.MaxPower = 255
-	if maxHP > 0 {
-		// Use HP byte from state channel 0x00 for current HP ratio
-		gs.Player.HPInt = int32(gs.Player.HP) * maxHP / 255
-	}
 	if maxPower > 0 {
 		gs.Player.Power = byte(power * 255 / maxPower)
 	} else {
@@ -2846,60 +2849,71 @@ func (gs *GameState) decodeStatUpdate(data []byte) {
 	}
 }
 
-// decodeBuffUpdate decodes the buff state channel (0x43) data.
-// Format: 4-byte header + N × 66-byte buff slots (variable count).
-// Header: [0] update counter, [1-3] padding.
-// Each slot: int32(spellHash) + int32(nameLen) + UTF-16LE name (padded to 58 bytes, max 29 chars).
+// decodeBuffUpdate is the active effects channel (0x43), Channel43
+// (0x00BD3D18): a u32 count, clamped to 8 (a negative one shows none), then
+// one 132-byte record per effect from offset 4: the icon (u32) and a wide
+// string (u32 length, UTF-16), which a name of 32 characters or more leaves
+// empty (ReadString's 64-byte limit). A record short of data stops the read,
+// and every later field keeps its old value (the error is sticky).
 func (gs *GameState) decodeBuffUpdate(data []byte) {
-	if len(data) < 4 {
-		return
-	}
-
-	const slotSize = 66
-	const headerSize = 4
-
-	numSlots := (len(data) - headerSize) / slotSize
-
-	// Resize slice to match channel (server can grow or shrink it)
-	if len(gs.Buffs) < numSlots {
-		gs.Buffs = append(gs.Buffs, make([]BuffSlot, numSlots-len(gs.Buffs))...)
-	} else if len(gs.Buffs) > numSlots {
-		gs.Buffs = gs.Buffs[:numSlots]
-	}
-
-	changed := false
-	for i := 0; i < numSlots; i++ {
-		offset := headerSize + i*slotSize
-		if offset+8 > len(data) {
-			break
+	p, bad := 0, false
+	take := func(n int) []byte {
+		if bad || p < 0 || p+n > len(data) {
+			bad = true
+			return nil
 		}
-
-		spellHash := int32(binary.LittleEndian.Uint32(data[offset : offset+4]))
-		nameLen := int(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
-
-		var name string
-		if spellHash != 0 && nameLen > 0 && nameLen <= 29 && offset+8+nameLen*2 <= len(data) {
-			nameBytes := data[offset+8 : offset+8+nameLen*2]
-			runes := make([]uint16, nameLen)
-			for j := 0; j < nameLen; j++ {
-				runes[j] = binary.LittleEndian.Uint16(nameBytes[j*2 : j*2+2])
+		b := data[p : p+n]
+		p += n
+		return b
+	}
+	if b := take(4); b != nil {
+		gs.effectCount = int32(binary.LittleEndian.Uint32(b))
+	}
+	if gs.effectCount > 8 {
+		gs.effectCount = 8
+	}
+	for i := 0; i < int(gs.effectCount); i++ {
+		if b := take(4); b != nil {
+			gs.effectIcon[i] = binary.LittleEndian.Uint32(b)
+		}
+		if b := take(4); b != nil {
+			n := binary.LittleEndian.Uint32(b)
+			if n+1 <= 32 {
+				if w := take(int(n) * 2); w != nil {
+					u := make([]uint16, n)
+					for j := range u {
+						u[j] = binary.LittleEndian.Uint16(w[2*j:])
+					}
+					gs.effectName[i] = string(utf16.Decode(u))
+				} else if old := []rune(gs.effectName[i]); int(n) < len(old) {
+					gs.effectName[i] = string(old[:n]) // the read failed; dst[n] = 0 still runs
+				}
+			} else {
+				take(int(n) * 2)
+				gs.effectName[i] = ""
 			}
-			name = string(utf16.Decode(runes))
 		}
+		p = 4 + (i+1)*132
+	}
 
-		old := gs.Buffs[i]
-		if old.SpellHash != spellHash || old.Name != name {
+	n := int(gs.effectCount)
+	if n < 0 {
+		n = 0
+	}
+	buffs := make([]BuffSlot, n)
+	changed := len(buffs) != len(gs.Buffs)
+	for i := range buffs {
+		buffs[i] = BuffSlot{SpellHash: int32(gs.effectIcon[i]), Name: gs.effectName[i]}
+		if !changed && gs.Buffs[i] != buffs[i] {
 			changed = true
-			gs.Buffs[i] = BuffSlot{SpellHash: spellHash, Name: name}
 		}
 	}
+	gs.Buffs = buffs
 
 	if changed {
 		var active []string
 		for _, b := range gs.Buffs {
-			if b.SpellHash != 0 && b.Name != "" {
-				active = append(active, fmt.Sprintf("%s (hash=0x%08X)", b.Name, uint32(b.SpellHash)))
-			}
+			active = append(active, fmt.Sprintf("%s (icon=0x%08X)", b.Name, uint32(b.SpellHash)))
 		}
 		if len(active) > 0 {
 			log.Printf("BuffUpdate: %s", strings.Join(active, ", "))

@@ -667,6 +667,20 @@ Verified zero data races under `-race` vs Sandstorm. Future edits must preserve:
 ### Connection Lifecycle
 Auth → patch (the patcher, into the save folder) → server list → world entry. Handshake completes on GuaranteedAck (fast) or 5-packet count (fallback).
 
+### The receive loop (`dispatchIncoming` = CLIENT's `VIClient::PumpMessages`)
+One switch on the DRDP message type, as CLIENT's (`internal/game/intake_routing.go`):
+0xFB → the opcode dispatcher (`HandleMessage`); **0xFC reads only the shard list 0x07B3**,
+and only before a shard is chosen; 0xF9 (the 0x12 keepalive) is read and kept nowhere;
+0xFF (the server opened the session: `ProcessIncoming` queues it ahead of the promoted
+session's first messages) resets the world; 0xFD (the connection ended:
+`Connection.TakeTerminate`, polled by `DrainIncoming`) maps its byte 1→1, 14→16, 15→15,
+else 10, and shows the disconnect status; below 0xF8, the state channels. Every message
+carries `Src`, the sender's endpoint id; **the MemoryDump's is the self id**
+(`Msg000D: m_selfId = (int)src`), and until it arrives every entity message is dropped.
+
+The shard list's count is ZIGZAG and its entries are filtered to the client's language:
+Sandstorm's raw count byte 4 is two of its six entries, one of them English.
+
 ### State Channels
 A message at or below the channel's rx is dropped and the channel re-acked with rx; a delta whose reference base is missing (or > 4,096 ahead) discards the WHOLE datagram, unacked. Acks repeat twice, uncapped. Bases are pruned wrap-safely. A reassigned channel keeps its sequence (`ClearStateAck` is a no-op).
 
@@ -702,8 +716,21 @@ A message at or below the channel's rx is dropped and the channel re-acked with 
 
 **World entry**: All 4 reliable opcodes + first 0x40 in ONE packet. Then idle heartbeat every 3 ticks (~3.3/s).
 
-### Sandstorm Entity State (channels 1-28, 162 bytes)
-Byte 0 = update counter, bytes 1-4 = ObjectID (0 = removed). NameColor byte 142: 0=NPC, 2=Player.
+### Entity state channels (0x00-0x17, 162 bytes) — `ChannelEntity` (0x00BD41B8)
+**24 slots, channel 0 an ordinary one**: the player's own entity is the one whose id is the
+self id, on whatever channel. 0x18 and up are read by nothing (the Go server's 24-28 are
+invisible to a PS2). Header: byte 0 a flag, 1-4 the id, 5 the type (0x81 `VIEntity`, 40
+bytes read; 0x82 `VICreatureEntity`, 162; any other makes the PS2 assert). Under 5 bytes
+empties the slot. A slot keeps its entity only if type and id match **and the flag is set**;
+otherwise the old one is deleted and a new one made only if the flag is set — so **flag 0 on
+the slot's own entity is the server removing it** (Sandstorm's first message on a channel
+carries 0 and makes the entity because the slot is empty). Velocity bytes 40-42 are ×21/128.
+Byte 145 is its own byte; bytes 146-147 are `m_npcFlags` (1 merchant, 2 bank, 8 blacksmith,
+0x80 not attackable). NameColor byte 142: 0=NPC, 2=Player (CLIENT's interact also takes 3).
+
+Other channels: 0x40 group positions (13-byte records), 0x42 stats (29 + 29 u32 + a byte;
+index 7 is the current HP), 0x43 effects (u32 count ≤ 8, 132-byte records: icon, wide name),
+0x44-0x6B forty `VIChannelRec`s.
 
 ## Combat System (verified on Sandstorm)
 

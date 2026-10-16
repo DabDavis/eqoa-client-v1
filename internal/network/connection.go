@@ -186,6 +186,15 @@ type Connection struct {
 	// (time_last_flush + 240000) - current_time < 1 (offset 0xa4). Set when exceeded.
 	timedOut bool
 
+	// The two notices the DRDP library hands the application itself rather
+	// than off the wire. connectPending: a session the server opened has
+	// begun (MESSAGE_TYPE_CONNECT, 0xFF, queued ahead of its first segment's
+	// messages). terminatePending/terminateReason: the connection has ended
+	// (MESSAGE_TYPE_DISCONNECT, 0xFD, connection_terminate_reason's byte).
+	connectPending   bool
+	terminatePending bool
+	terminateReason  byte
+
 	// Lobby session: pre-promotion game server connection that Sandstorm keeps
 	// alive alongside the promoted session. Without periodic ACKs, Sandstorm
 	// times out the lobby session after ~60 seconds and tears down the connection.
@@ -473,6 +482,12 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 	body := pkt.Body
 	header := pkt.Header
 
+	// message_get_src: every message is from the segment's sender, whose
+	// endpoint id a session the server opened carries in its header.
+	for _, m := range body.Messages {
+		m.Src = pkt.SessionID
+	}
+
 	c.mu.Lock()
 
 	// Debug: log first 20 packets to understand header structure
@@ -581,6 +596,9 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 		if !c.didServerInit || c.sessionID != pkt.SessionID {
 			log.Printf("ProcessIncoming: server-initiated session, sessionID=%d (ObjectID)", pkt.SessionID)
 			c.arrivals = nil // Clear any partial fragments from pre-session
+			// connection_parse_segment_body: the first segment of a connection
+			// the far end opened carries MESSAGE_TYPE_CONNECT ahead of its own.
+			c.connectPending = true
 			// Reset ALL reliable tracking for the new promoted session.
 			// The server creates a new Connection with fresh counters.
 			// Both incoming (recvReliable) and outgoing (sendReliable) must reset.
@@ -599,6 +617,7 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 			c.serverShort = false
 			c.ackFlushDeadline = time.Time{}
 			c.timedOut = false
+			c.terminatePending = false
 			c.lastFlushTime = time.Time{} // Reset for new session (PS2 0x200 flag cleared)
 			c.rttSamples = [16]time.Duration{}
 			c.rttSampleIdx = 0
@@ -875,6 +894,11 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 			}
 		}
 	}
+	if c.connectPending {
+		c.connectPending = false
+		connect := &protocol.Message{Type: protocol.MessageTypeConnect, Src: pkt.SessionID}
+		messages = append([]*protocol.Message{connect}, messages...)
+	}
 
 	c.mu.Unlock()
 	return messages
@@ -974,7 +998,7 @@ func (c *Connection) joinArrivals(last *protocol.Message) *protocol.Message {
 	for _, p := range pieces {
 		data = append(data, p.Data()...)
 	}
-	msg := &protocol.Message{Type: last.Type, Sequence: pieces[0].Sequence}
+	msg := &protocol.Message{Type: last.Type, Sequence: pieces[0].Sequence, Src: last.Src}
 	if len(data) >= 2 && last.Type != protocol.MessageTypePing {
 		msg.Opcode = protocol.GameOpcode(uint16(data[0]) | uint16(data[1])<<8)
 	}
@@ -1224,6 +1248,33 @@ func (c *Connection) TimedOut() bool {
 	return c.timedOut
 }
 
+// terminateLocked ends the connection, once: connection_terminate_reason
+// latches, and the reason byte goes to the application in the notice
+// TakeTerminate returns. Must be called with c.mu held.
+func (c *Connection) terminateLocked(reason byte) {
+	if c.timedOut {
+		return
+	}
+	c.timedOut = true
+	c.terminatePending = true
+	c.terminateReason = reason
+}
+
+// TakeTerminate returns the connection's MESSAGE_TYPE_DISCONNECT (0xFD), one
+// reason byte, the first time it is asked after the connection has ended,
+// and nil otherwise. CLIENT's pump turns it into Disconnect.
+func (c *Connection) TakeTerminate() *protocol.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.terminatePending {
+		return nil
+	}
+	c.terminatePending = false
+	m := &protocol.Message{Type: protocol.MessageTypeDisconnect}
+	m.SetData([]byte{c.terminateReason})
+	return m
+}
+
 // Flush sends any pending outgoing messages.
 func (c *Connection) Flush() {
 	c.mu.Lock()
@@ -1235,7 +1286,7 @@ func (c *Connection) Flush() {
 	if !c.lastFlushTime.IsZero() && time.Since(c.lastFlushTime) >= 240*time.Second {
 		if !c.timedOut {
 			log.Printf("DRDP: connection timeout — 240s since last flush (PS2 assert)")
-			c.timedOut = true
+			c.terminateLocked(10)
 		}
 		c.mu.Unlock()
 		return
@@ -1248,7 +1299,7 @@ func (c *Connection) Flush() {
 		if !c.timedOut {
 			log.Printf("DRDP: server silent for 60s (last recv %v ago), marking stale",
 				time.Since(c.lastRecvTime).Round(time.Second))
-			c.timedOut = true
+			c.terminateLocked(2) // connection.cpp: outstanding and silent past the warn time
 		}
 		c.mu.Unlock()
 		return
@@ -1320,7 +1371,7 @@ func (c *Connection) Flush() {
 			if age >= 60*time.Second {
 				log.Printf("RETRANSMIT: message seq=%d aged out (%v > 60s), killing connection (PS2 error 3)",
 					msg.Sequence, age)
-				c.timedOut = true
+				c.terminateLocked(3) // connection.cpp: a message older than the fail time
 				c.mu.Unlock()
 				return
 			}
@@ -1587,6 +1638,9 @@ func (c *Connection) SwitchToGameServer(endpointID uint16) {
 	c.serverShort = false
 	c.ackFlushDeadline = time.Time{}
 	c.timedOut = false
+	c.terminatePending = false
+	c.terminateReason = 0
+	c.connectPending = false
 	c.lastFlushTime = time.Time{} // Reset for new session (PS2 0x200 flag cleared)
 	c.rttSamples = [16]time.Duration{}
 	c.rttSampleIdx = 0

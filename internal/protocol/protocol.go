@@ -367,16 +367,28 @@ func (op GameOpcode) String() string {
 // ========================================================================
 
 // MessageType represents the type of a network message.
+//
+// Below 0xF8 a type is a state channel's index (connection.cpp's
+// CONNECTION_STATE_CHANNEL_COUNT is 248). Above it the DRDP library has its
+// own (drdp.h): 0xF9 MESSAGE_TYPE_SYSTEM, 0xFA MESSAGE_TYPE_FRAGMENT, 0xFB
+// MESSAGE_TYPE_GUARANTEED, 0xFC best effort, 0xFD MESSAGE_TYPE_DISCONNECT and
+// 0xFF MESSAGE_TYPE_CONNECT. 0xF8, 0xFD and 0xFF never cross the wire: the
+// library makes them locally (a connectionless packet, a terminated
+// connection, a connection the far end opened), and CLIENT's receive loop
+// (VIClient::PumpMessages, 0x00BD4C10) dispatches on all of them.
 type MessageType byte
 
 const (
 	MessageTypeClientUpdate    MessageType = 0x40
 	MessageTypeStatUpdate      MessageType = 0x42
 	MessageTypeBuffUpdate      MessageType = 0x43
-	MessageTypePing            MessageType = 0xF9
+	MessageTypeConnectionless  MessageType = 0xF8 // drdp_process_connectionless: a packet for no connection
+	MessageTypePing            MessageType = 0xF9 // MESSAGE_TYPE_SYSTEM: guaranteed, one byte (the 0x12 keepalive)
 	MessageTypeSegmentReliable MessageType = 0xFA
 	MessageTypeReliable        MessageType = 0xFB
 	MessageTypeUnreliable      MessageType = 0xFC
+	MessageTypeDisconnect      MessageType = 0xFD // MESSAGE_TYPE_DISCONNECT: the terminate notice, one reason byte
+	MessageTypeConnect         MessageType = 0xFF // MESSAGE_TYPE_CONNECT: the far end opened a connection
 )
 
 // IsReliable returns true if the message type requires reliable delivery.
@@ -409,8 +421,12 @@ type Message struct {
 	Opcode   GameOpcode
 	Sequence uint16
 	XORByte  byte
-	data     []byte
-	size     int
+	// Src is message_get_src's low word: the far end's endpoint id. On a
+	// session the server opened it is the player's own entity id -- CLIENT
+	// takes its self id from the MemoryDump's (Msg000D: m_selfId = (int)src).
+	Src  uint32
+	data []byte
+	size int
 }
 
 // Data returns the message data.

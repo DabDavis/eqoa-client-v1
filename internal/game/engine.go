@@ -448,9 +448,17 @@ func (e *Engine) applyStartupResult(res startupResult) {
 // ACKs are included in the regular Flush with the 0x40 state channel message,
 // matching PS2 behavior (PS2 never sends empty packets).
 func (e *Engine) DrainIncoming() {
+	conn := e.State.Conn
+	// A connection that has ended says so once, as the DRDP library's
+	// terminate notice (0xFD) after everything that arrived before it.
+	defer func() {
+		if m := conn.TakeTerminate(); m != nil {
+			e.State.dispatchIncoming(m)
+		}
+	}()
 	for {
 		select {
-		case pkt, ok := <-e.State.Conn.Incoming:
+		case pkt, ok := <-conn.Incoming:
 			if !ok {
 				return
 			}
@@ -473,13 +481,25 @@ func (gs *GameState) dispatchIncoming(msg *protocol.Message) {
 		}
 	}()
 
-	if msg.Type.IsStateChannel() && !msg.Type.IsReliable() {
-		// State channel message — already XOR-decoded by ProcessIncoming.
-		gs.HandleStateChannel(byte(msg.Type), msg)
-		return
+	// VIClient::PumpMessages (0x00BD4C10): one switch on the DRDP type.
+	switch t := msg.Type; {
+	case t == protocol.MessageTypeConnect:
+		gs.resetWorld()
+	case t == protocol.MessageTypeConnectionless:
+		gs.handleConnectionless(msg)
+	case t == protocol.MessageTypeDisconnect:
+		gs.handleDRDPDisconnect(msg)
+	case t == protocol.MessageTypeUnreliable:
+		gs.handleBestEffort(msg)
+	case t == protocol.MessageTypeReliable:
+		gs.HandleMessage(msg)
+	case t == protocol.MessageTypePing, t == 0xFE:
+		// 0xF9: ProcessMessageF9 reads its byte (the 0x12 keepalive) and
+		// keeps nothing. 0xFE: nothing at all.
+	case t.IsStateChannel():
+		// Already XOR-decoded by ProcessIncoming.
+		gs.HandleStateChannel(byte(t), msg)
 	}
-	// Reliable/unreliable game message.
-	gs.HandleMessage(msg)
 }
 
 // ProcessPacket handles a single received packet.
