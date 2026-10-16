@@ -104,224 +104,95 @@ func (gs *GameState) handleEntityUpdateDirect(msg *protocol.Message) {
 }
 
 // =============================================================================
-// Quest System (0x0045/7B/7D/7F/0036)
+// Quests, the pet, assist, the profanity filter, training points
+// (0x0045/7B/7D/7F/0036). The old reading of these as one "quest chain" that
+// fell through from case to case is refuted: each is its own short case.
 // =============================================================================
 
-// handleQuestDialogueResp handles opcode 0x0045 — quest dialogue response.
-// PS2: zigzag option ID → func_BDB820 builds formatted string with msg 550/551.
+// handleQuestDialogueResp is 0x0045 (Msg0045, 0x00BDB820): the profanity
+// filter's state, a zigzag, shown as "Profanity Filter: On" / "Off".
 func (gs *GameState) handleQuestDialogueResp(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
+	s := newSocialStream(msg)
+	on := s.zigzag()
+	if s.err {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-	optionID, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		return
+	gs.ProfanityFilter = on != 0
+	text := gs.socialWord(550) + ": "
+	if on != 0 {
+		text += gs.socialWord(551)
+	} else {
+		text += gs.socialWord(552)
 	}
-	log.Printf("QuestDialogueResp: optionID=%d", optionID)
-
-	// Read remaining quest text if present
-	gs.parseQuestTail(reader, "QuestDialogueResp")
+	gs.socialShowText(text)
 }
 
-// handleUpdateQuestProgress handles opcode 0x007B — quest progress update.
-// PS2: quest ID, 256-char quest text (ring buffer, 8 entries), progress zigzag, float values.
+// handleUpdateQuestProgress is 0x007B (Msg007B): the target an assist found,
+// a u32. 0xFFFFFFFF is "There is no target for assisting." (string 838, a
+// notice box on the PS2). Any other id becomes the target and the PS2 sends
+// 0x0010 for it; here it waits in AssistTarget for the client to take.
 func (gs *GameState) handleUpdateQuestProgress(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
+	s := newSocialStream(msg)
+	id := s.u32()
+	if s.err {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-
-	// Read quest ID
-	questID, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		log.Printf("UpdateQuestProgress: failed to read quest ID: %v", err)
+	if id == 0xFFFFFFFF {
+		gs.socialShowWord(838)
 		return
 	}
-
-	// Read quest text (string)
-	questText := ""
-	if reader.Remaining() > 4 {
-		text, err := readStringFromReader(reader)
-		if err == nil {
-			questText = text
-		}
-	}
-
-	// Read progress value (zigzag)
-	progress := int64(0)
-	if reader.Remaining() >= 1 {
-		progress, _ = reader.Read7BitEncodedInt64()
-	}
-
-	// Read float values
-	var floats [4]float32
-	for i := 0; i < 4 && reader.Remaining() >= 4; i++ {
-		bits, err := reader.ReadUint32()
-		if err != nil {
-			break
-		}
-		floats[i] = math.Float32frombits(bits)
-	}
-
-	// Store in ring buffer
-	gs.QuestTrackerID = uint32(questID)
-	if questText != "" {
-		gs.QuestTexts[gs.QuestTextIndex%8] = questText
-		gs.QuestTextIndex++
-	}
-	gs.QuestProgress = progress
-	gs.QuestProgressF = floats
-
-	log.Printf("UpdateQuestProgress: questID=%d text=%q progress=%d floats=%v",
-		questID, questText, progress, floats)
-
-	gs.parseQuestTail(reader, "UpdateQuestProgress")
+	gs.AssistTarget = id
+	gs.AssistTargetPending = true
+	log.Printf("Assist: target 0x%08X", id)
 }
 
-// handleDeleteQuest handles opcode 0x007D — remove quest from journal.
+// handleDeleteQuest is 0x007D (Msg007D): a u32 (VIClient+0x2BB0C), then a
+// zigzag index into the quest log. Below 8, the titles above it move down
+// one and the log is one shorter. (The PS2 checks the index against 8 only,
+// not against the count; the count is kept from going negative here.)
 func (gs *GameState) handleDeleteQuest(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
+	s := newSocialStream(msg)
+	stamp := s.u32()
+	i := int(s.zigzag())
+	if s.err {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-	questID, err := reader.Read7BitEncodedInt64()
-	if err != nil {
+	gs.QuestLogStamp = stamp
+	if i >= 8 {
 		return
 	}
-	log.Printf("DeleteQuest: questID=%d", questID)
-	if gs.QuestTrackerID == uint32(questID) {
-		gs.QuestTrackerID = 0xFFFFFFFF
+	if i >= 0 && i < len(gs.QuestTitles) {
+		gs.QuestTitles = append(gs.QuestTitles[:i], gs.QuestTitles[i+1:]...)
+	} else if len(gs.QuestTitles) > 0 {
+		gs.QuestTitles = gs.QuestTitles[:len(gs.QuestTitles)-1]
 	}
+	log.Printf("DeleteQuest: index %d, %d in the log", i, len(gs.QuestTitles))
 }
 
-// handleClearQuestTracker handles opcode 0x007F — clears active quest tracker.
-// PS2: sets +0x2BE50=0xFFFFFFFF, zeroes +0x2BE54. Then shared string+message tail.
+// handleClearQuestTracker is 0x007F: no pet (VIClient+0x2BE50 = 0xFFFFFFFF,
+// its name cleared). Not a quest message; 0x007E sets the pet.
 func (gs *GameState) handleClearQuestTracker(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	gs.QuestTrackerID = 0xFFFFFFFF
-	log.Printf("ClearQuestTracker: quest tracker cleared")
-
-	reader := buffer.NewReader(data[2:])
-	gs.parseQuestTail(reader, "ClearQuestTracker")
+	gs.PetID = 0xFFFFFFFF
+	log.Printf("Pet: none")
 }
 
-// handleQuestStageComplete handles opcode 0x0036 — quest stage reward.
-// PS2 (0x00BD26CC): stageIndex(u8) + stageCounter(zigzag) + xpReward(zigzag)
-//   + subStageA(u8) + subStageB(u8) + 3×uint32 + float3 + rewardA(u32) + rewardB(u32)
-//   + stageType(u8) + additional(u32) → shared tail
+// handleQuestStageComplete is 0x0036: training points. A byte (a sound
+// when set), then the new count of unspent training points (zigzag, the
+// player record's +0x40, which 0x001D lowers when they are spent). When the
+// count changes the PS2 shows "You have received more training points!" as
+// a dialog. It grants no experience.
 func (gs *GameState) handleQuestStageComplete(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
+	s := newSocialStream(msg)
+	flag := s.u8()
+	tp := int64(s.zigzag())
+	if s.err {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-
-	// Stage index (uint8)
-	stageIndex := byte(0)
-	if reader.Remaining() >= 1 {
-		stageIndex, _ = reader.ReadByte()
-	}
-
-	// Stage counter (zigzag)
-	stageCounter := int64(0)
-	if reader.Remaining() >= 1 {
-		stageCounter, _ = reader.Read7BitEncodedInt64()
-	}
-
-	// XP reward (zigzag)
-	xpDelta, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		return
-	}
-
-	// Sub-stages (2 bytes)
-	subStageA, subStageB := byte(0), byte(0)
-	if reader.Remaining() >= 2 {
-		subStageA, _ = reader.ReadByte()
-		subStageB, _ = reader.ReadByte()
-	}
-
-	// Position/reward data (3×uint32 = 12 bytes)
-	if reader.Remaining() >= 12 {
-		reader.ReadBytes(12) // position/reward data (not yet used)
-	}
-
-	// Camera position (3×float32 = 12 bytes)
-	if reader.Remaining() >= 12 {
-		reader.ReadBytes(12) // camera position (not yet used)
-	}
-
-	// Reward values (2×uint32 = 8 bytes)
-	rewardA, rewardB := uint32(0), uint32(0)
-	if reader.Remaining() >= 8 {
-		rewardA, _ = reader.ReadUint32()
-		rewardB, _ = reader.ReadUint32()
-	}
-
-	// Stage type (uint8, 22-way jump table in PS2)
-	stageType := byte(0)
-	if reader.Remaining() >= 1 {
-		stageType, _ = reader.ReadByte()
-	}
-
-	// Additional value (uint32)
-	if reader.Remaining() >= 4 {
-		reader.ReadUint32()
-	}
-
-	log.Printf("QuestStageComplete: stage=%d counter=%d xp=%d subA=%d subB=%d rewardA=%d rewardB=%d type=%d",
-		stageIndex, stageCounter, xpDelta, subStageA, subStageB, rewardA, rewardB, stageType)
-
-	if xpDelta > 0 {
-		gs.Player.XPRaw += xpDelta
-		gs.Player.XPPct = xpLevelPct(int(gs.Player.Level), gs.Player.XPRaw)
-		gs.addChatMessage(fmt.Sprintf("Quest stage %d complete! +%d XP", stageIndex, xpDelta), ChatSystem)
-	}
-
-	// Tunar reward
-	if rewardA > 0 {
-		gs.addChatMessage(fmt.Sprintf("Received %d tunar", rewardA), ChatSystem)
-	}
-
-	// Drain shared tail
-	if reader.Remaining() > 0 {
-		gs.parseQuestTail(reader, "QuestStageComplete")
-	}
-}
-
-// parseQuestTail reads the shared tail of quest cascade opcodes:
-// string(64) + byte + entity ref data.
-func (gs *GameState) parseQuestTail(reader *buffer.Reader, source string) {
-	// Try to read NPC name string (64 bytes)
-	if reader.Remaining() >= 64 {
-		nameBytes, err := reader.ReadBytes(64)
-		if err == nil {
-			name := ""
-			for i, b := range nameBytes {
-				if b == 0 {
-					name = string(nameBytes[:i])
-					break
-				}
-			}
-			if name != "" {
-				log.Printf("%s tail: npcName=%q", source, name)
-			}
-		}
-	}
-
-	// Read type byte
-	if reader.Remaining() >= 1 {
-		typeByte, _ := reader.ReadByte()
-		if typeByte != 0 {
-			log.Printf("%s tail: type=%d", source, typeByte)
-		}
+	old := gs.TrainingPoints
+	gs.TrainingPoints = tp
+	log.Printf("TrainingPoints: %d -> %d (flag %d)", old, tp, flag)
+	if tp != old {
+		gs.socialShowDialog(0, gs.socialWord(625))
 	}
 }
 
@@ -355,16 +226,46 @@ func (gs *GameState) handleWorldEntry(msg *protocol.Message) {
 	gs.createFailed(269)
 }
 
-// handleGuildWorldEntry handles opcode 0x0579 — full world entry with guild init.
-// PS2: inits 6 subsystems, enables UI panels 1662+676, audio reset, entity update.
+// handleGuildWorldEntry is 0x0579 (VIClientPart2EF24::Recv0579, 0x00BEF788):
+// why a guild command failed. Not a world entry. Two bytes, the command and
+// the reason; a reason of 0 says nothing.
+//
+//	1 create:  563, then 565 / 566 / 567 (the Tunar it costs) / 568 for 1/2/6/7
+//	2 disband: 564, then 546 / 570 for 5/8
+//	3-7, 11, 12: 546 / 570 / 584 / 745 for 5/8/11/12
 func (gs *GameState) handleGuildWorldEntry(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("GuildWorldEntry: full world entry with guild, dataLen=%d", len(data))
-	gs.Phase = PhaseEnteringWorld
-
-	if len(data) > 2 {
-		reader := buffer.NewReader(data[2:])
-		gs.parseWorldEntryAppearance(reader)
+	s := newSocialStream(msg)
+	cmd := s.u8()
+	why := s.u8()
+	if s.err || why == 0 {
+		return
+	}
+	log.Printf("GuildCommand: command %d failed, reason %d", cmd, why)
+	switch cmd {
+	case 1:
+		gs.socialShowWord(563)
+		switch why {
+		case 1:
+			gs.socialShowWord(565)
+		case 2:
+			gs.socialShowWord(566)
+		case 6:
+			gs.socialShowText(socialFormat(gs.socialWord(567), guildCreateCost))
+		case 7:
+			gs.socialShowWord(568)
+		}
+	case 2:
+		gs.socialShowWord(564)
+		switch why {
+		case 5:
+			gs.socialShowWord(546)
+		case 8:
+			gs.socialShowWord(570)
+		}
+	case 3, 4, 5, 6, 7, 11, 12:
+		if w, ok := map[byte]int{5: 546, 8: 570, 11: 584, 12: 745}[why]; ok {
+			gs.socialShowWord(w)
+		}
 	}
 }
 
@@ -542,85 +443,27 @@ func (gs *GameState) handleItemListUpdate(msg *protocol.Message) {
 	gs.createFailed(828)
 }
 
-// handleNPCMessage handles opcode 0x00D3 — NPC/server say message.
-// PS2 (0x00BD2C48): string(64) npcName + byte messageType + dialogue display
-//   + byte optionA + byte optionB + string(24) speakerName → UTF-16 → shared tail
+// handleNPCMessage is 0x00D3 (Msg00D3, 0x00BDB0E8): someone asks to summon
+// the player (byte 0) or to resurrect them (any other): a name of at most 63
+// characters and the byte. The PS2 asks with a yes/no prompt, its text the
+// name and string 610 or 611 run together (the separating space is copied
+// into a one-character buffer and lost). Kept in Summon; the question is a
+// chat line here, there being no prompt to answer it with.
 func (gs *GameState) handleNPCMessage(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
+	s := newSocialStream(msg)
+	name := s.str8(64)
+	c := s.u8()
+	if s.err {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-
-	// Read NPC name (64-byte fixed buffer)
-	npcName := ""
-	if reader.Remaining() >= 64 {
-		nameBytes, err := reader.ReadBytes(64)
-		if err == nil {
-			for i, b := range nameBytes {
-				if b == 0 {
-					npcName = string(nameBytes[:i])
-					break
-				}
-			}
-		}
+	word := 610
+	if c != 0 {
+		word = 611
 	}
-
-	// Read type byte
-	msgType := byte(0)
-	if reader.Remaining() >= 1 {
-		msgType, _ = reader.ReadByte()
-	}
-
-	// Read message text (variable-length string from Sandstorm)
-	msgText := ""
-	if reader.Remaining() > 4 {
-		text, err := readStringFromReader(reader)
-		if err == nil {
-			msgText = text
-		}
-	}
-
-	// PS2: optionA and optionB bytes (dialogue choice buttons)
-	optionA, optionB := byte(0), byte(0)
-	if reader.Remaining() >= 2 {
-		optionA, _ = reader.ReadByte()
-		optionB, _ = reader.ReadByte()
-	}
-
-	// PS2: speakerName (24 bytes → UTF-16)
-	speakerName := ""
-	if reader.Remaining() >= 24 {
-		spkBytes, err := reader.ReadBytes(24)
-		if err == nil {
-			for i, b := range spkBytes {
-				if b == 0 {
-					speakerName = string(spkBytes[:i])
-					break
-				}
-			}
-		}
-	}
-
-	log.Printf("NPCMessage: name=%q type=%d text=%q optA=%d optB=%d speaker=%q",
-		npcName, msgType, msgText, optionA, optionB, speakerName)
-
-	// Use speaker name if NPC name is empty
-	displayName := npcName
-	if displayName == "" && speakerName != "" {
-		displayName = speakerName
-	}
-
-	if displayName != "" && msgText != "" {
-		gs.addChatMessage(fmt.Sprintf("%s says, '%s'", displayName, msgText), ChatSay)
-	} else if msgText != "" {
-		gs.addChatMessage(msgText, ChatSystem)
-	}
-
-	// If options present, show as dialogue
-	if optionA != 0 || optionB != 0 {
-		log.Printf("NPCMessage: dialogue options A=%d B=%d", optionA, optionB)
-	}
+	gs.Summon = &SummonRequest{Name: name, Resurrect: c != 0}
+	text := name + gs.socialWord(word)
+	log.Printf("Summon: %s", text)
+	gs.socialShowText(text)
 }
 
 // handleHPResourceUpdate is 0x00D9 (the dispatcher's case): one raw u32,
@@ -652,73 +495,139 @@ func (gs *GameState) handleChatMessage(msg *protocol.Message) {
 }
 
 // =============================================================================
-// Social / Lists (0x0D41/0x0F02/0x1102)
+// Mail, fishing and tradeskills (0x0D41/0x0F02/0x1102)
 // =============================================================================
 
-// handleMailDelivery handles opcode 0x0D41 — mail system.
+// handleMailDelivery is 0x0D41, VIClientPart2EFD0::Recv0D41 (0x00BF5670): a
+// sub-type byte. 1-4 answer a request the PS2 made, and each is read only
+// while that request is the one waiting (MailWait), a result byte first:
+//
+//	1 sent:    1 is "Your mail has been sent." (839); 9-12 fail -1..-4, else -5
+//	2 list:    2, then a zigzag count of headers (100 at most); else -6
+//	3 message: 3, then the message's id (zigzag) and, when it is the one
+//	           asked for, its text (511 characters at most); else -7
+//	4 deleted: 13 is "Message deleted." (840); else -8
+//
+// 5 says new mail is waiting. With no mail window nothing sets MailWait, so
+// only 5 does anything here, as on a PS2 that never opened its mail.
 func (gs *GameState) handleMailDelivery(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("MailDelivery: dataLen=%d", len(data))
-
-	// Extract any strings for logging
-	strs := extractUTF16Strings(data)
-	for _, s := range strs {
-		log.Printf("MailDelivery: string=%q", s)
-	}
-
-	if len(strs) >= 2 {
-		mail := MailMessage{
-			Sender:  strs[0],
-			Subject: strs[1],
+	s := newSocialStream(msg)
+	sub := s.u8()
+	switch sub {
+	case 1:
+		if gs.MailWait != 3 {
+			return
 		}
-		if len(strs) >= 3 {
-			mail.Body = strs[2]
+		switch code := s.u8(); {
+		case code == 1:
+			gs.socialShowWord(839)
+			gs.MailWait = 0
+		case code >= 9 && code <= 12:
+			gs.MailWait = 8 - int32(code)
+		default:
+			gs.MailWait = -5
 		}
-		gs.MailMessages = append(gs.MailMessages, mail)
-		gs.addChatMessage(fmt.Sprintf("Mail from %s: %s", mail.Sender, mail.Subject), ChatSystem)
+	case 2:
+		if gs.MailWait != 1 {
+			return
+		}
+		if s.u8() != 2 {
+			gs.MailWait = -6
+			return
+		}
+		gs.MailNew = false
+		gs.MailWait = 0
+		n := int(s.zigzag())
+		gs.MailHeaders = gs.MailHeaders[:0]
+		for i := 0; i < n && i < 100; i++ {
+			var h MailHeader
+			h.A, h.B, h.C = s.u32(), s.u32(), s.u32()
+			h.Sender = s.str8(24)
+			h.Subject = s.str16(128)
+			h.Year = uint16(s.u8()) | uint16(s.u8())<<8
+			h.Month, h.Day = s.u8(), s.u8()
+			h.Hour, h.Minute, h.Second = s.u8(), s.u8(), s.u8()
+			h.Read = s.u8() != 0
+			if s.err {
+				break
+			}
+			gs.MailHeaders = append(gs.MailHeaders, h)
+		}
+		log.Printf("Mail: %d headers", len(gs.MailHeaders))
+	case 3:
+		if gs.MailWait != 2 {
+			return
+		}
+		if s.u8() != 3 {
+			gs.MailWait = -7
+			return
+		}
+		gs.MailWait = 0
+		id := s.zigzag()
+		if id != gs.MailWantID {
+			return
+		}
+		for i := range gs.MailHeaders {
+			if int32(gs.MailHeaders[i].A) == id {
+				gs.MailHeaders[i].Read = true
+			}
+		}
+		gs.MailBody = s.str16(1024)
+	case 4:
+		if gs.MailWait != 4 {
+			return
+		}
+		if s.u8() == 13 {
+			gs.socialShowWord(840)
+			gs.MailWait = 0
+		} else {
+			gs.MailWait = -8
+		}
+	case 5:
+		gs.MailNew = true
+		log.Printf("Mail: new mail waiting")
 	}
 }
 
-// handleWhoListFiltered handles opcode 0x0F02 — filtered who results.
+// handleWhoListFiltered is 0x0F02, VIClientPart3FC10::Recv0F02 (0x00BEB900):
+// fishing, not a who list. A sub-type byte, 1-10: start ("Let's go fishing!",
+// 1431), stop, the catch (an item list, then into the inventory), "You caught
+// something!" (1434), "You fail to catch anything" (1435), "The fish got away
+// with your bait" (1436), "You damaged your pole" (1437). All but the last go
+// to the fishing window, which this client does not have; the last is also a
+// chat line.
 func (gs *GameState) handleWhoListFiltered(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("WhoListFiltered: dataLen=%d", len(data))
-	// Same format as WhoListResponse — delegate to existing handler
-	gs.handleWhoListResponse(msg)
+	s := newSocialStream(msg)
+	sub := s.u8()
+	log.Printf("Fishing: sub-type %d (%d bytes)", sub, len(msg.Data()))
+	if sub == 10 {
+		gs.socialShowWord(1437)
+	}
 }
 
-// handleIgnoreListResult handles opcode 0x1102 — dual purpose:
-// 1. Ignore list display (when no auction session active)
-// 2. Auction init response (sub=0x0C open ack, sub=0x0F category ack)
-// The first byte after opcode determines the sub-type.
+// handleIgnoreListResult is 0x1102, VIClientPart3834C::Recv1102 (0x00BFE118):
+// tradeskills, not an ignore list and not the auction. A sub-type byte, 1-16.
+// Ported: 1, a recipe scribed (1544); 5, "You have not yet recovered." in
+// (1, .25, .25); 12, a combine's result. Each carries the session's u32
+// (+0x78C0). 12's results 2 and 3 ("The items you chose do not make anything."
+// 1599, "Your tradeskill level is not high enough..." 1598) go to the
+// tradeskill window, which this client does not have.
 func (gs *GameState) handleIgnoreListResult(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 3 {
-		return
-	}
-	payload := data[2:] // skip opcode
-	sub := payload[0]
-
-	log.Printf("0x1102: sub=0x%02X payloadLen=%d hex=%X", sub, len(payload), payload)
-
-	switch {
-	case sub == 0x0C:
-		// Auction open response — contains session/request ID
-		if len(payload) >= 2 {
-			gs.AuctionSessionID = payload[1]
-			log.Printf("AuctionOpen: sessionID=%d (byte[1]=0x%02X)", gs.AuctionSessionID, gs.AuctionSessionID)
-		}
-	case sub == 0x0F:
-		// Auction category ack
-		log.Printf("AuctionCategoryAck: payload=%X", payload)
+	s := newSocialStream(msg)
+	sub := s.u8()
+	switch sub {
+	case 1:
+		gs.TradeskillSerial = s.u32()
+		gs.socialShowWord(1544)
+	case 5:
+		gs.TradeskillSerial = s.u32()
+		gs.socialLine(gs.socialWord(1567), ChatError, socialRed)
+	case 12:
+		result := s.u8()
+		gs.TradeskillSerial = s.u32()
+		log.Printf("Tradeskill: combine result %d", result)
 	default:
-		// Ignore list
-		strs := extractUTF16Strings(data)
-		gs.IgnoreList = gs.IgnoreList[:0]
-		for _, s := range strs {
-			gs.IgnoreList = append(gs.IgnoreList, s)
-		}
-		log.Printf("IgnoreListResult: %d entries", len(gs.IgnoreList))
+		log.Printf("Tradeskill: sub-type %d not ported (%d bytes)", sub, len(msg.Data()))
 	}
 }
 
@@ -733,16 +642,8 @@ func (gs *GameState) handleForceDisconnect(msg *protocol.Message) {
 	gs.handleServerDisconnect(msg)
 }
 
-// handleStubNOP handles opcode 0x006E — deprecated stub (NOP).
-// PS2: func_BDB8F0 = 2-instruction return, then falls through to quest chain.
+// handleStubNOP is 0x006E: Msg006E is an empty function. Nothing follows it.
 func (gs *GameState) handleStubNOP(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	// Falls through to quest progress chain — parse quest tail
-	reader := buffer.NewReader(data[2:])
-	gs.parseQuestTail(reader, "StubNOP")
 }
 
 // handleEquipItemConfirm handles opcode 0x003F, Msg003F (CLIENT 0x00BCB2F0):
@@ -987,54 +888,104 @@ func (gs *GameState) handleOutMatched(msg *protocol.Message) {
 	}
 }
 
-// handleGuildInviteStuff handles opcode 0x057A — guild invite.
+// handleGuildInviteStuff is 0x057A, VIClientPart2EF24::Recv057A (0x00BEF6D8),
+// guild invitations, by sub-type:
+//
+//	1  an invitation: a zigzag the PS2 does not keep, the inviter's id (u32)
+//	   and name, the guild's name (wide). Busy, the PS2 says so (650) and
+//	   answers 0x0578 {10, id, 2}; already in a guild it answers {10, id, 4};
+//	   otherwise it asks. The question is a chat line here (535 is the
+//	   window's title), the invitation kept in GuildInvite.
+//	2  a zigzag and a name: "%s has accepted your invitation." (557)
+//	3  a byte and a name: why an invitation failed (558 for 1 and anything
+//	   unknown; 559, 560, 576, 587, 589, 642 for 2-7)
 func (gs *GameState) handleGuildInviteStuff(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("GuildInviteStuff: dataLen=%d", len(data))
-	strs := extractUTF16Strings(data)
-	if len(strs) > 0 {
-		gs.addChatMessage(fmt.Sprintf("Guild invite from %s", strs[0]), ChatSystem)
+	s := newSocialStream(msg)
+	switch sub := s.u8(); sub {
+	case 1:
+		s.zigzag()
+		id := s.u32()
+		name := s.str8(24)
+		guild := s.str16(128)
+		if s.err {
+			return
+		}
+		reply := func(why byte) {
+			p := append([]byte{10}, binary.LittleEndian.AppendUint32(nil, id)...)
+			gs.socialSend(protocol.GameOpcode(0x0578), append(p, why))
+			gs.GuildInvite = nil
+		}
+		switch {
+		case gs.socialBusy():
+			gs.socialShowText(socialFormat(gs.socialWord(650), name))
+			reply(2)
+		case gs.InGuild:
+			reply(4)
+		default:
+			gs.GuildInvite = &GuildInviteEntry{ID: id, Name: name, GuildName: guild}
+			gs.socialShowText(fmt.Sprintf("%s %s (%s)", gs.socialWord(535), name, guild))
+		}
+		log.Printf("GuildInvite: from %s (0x%08X) to %q", name, id, guild)
+	case 2:
+		s.zigzag()
+		name := s.str8(24)
+		gs.socialShowText(socialFormat(gs.socialWord(557), name))
+	case 3:
+		code := s.u8()
+		name := s.str8(24)
+		word, ok := map[byte]int{2: 559, 3: 560, 4: 576, 5: 587, 6: 589, 7: 642}[code]
+		if !ok {
+			word = 558
+		}
+		gs.socialShowText(socialFormat(gs.socialWord(word), name))
+	default:
+		log.Printf("GuildInvite: sub-type %d ignored", sub)
 	}
 }
 
-// handleBuddyInvite handles opcode 0x076F — buddy invite received.
-// handleBuffNotification handles opcode 0x076F — buff/debuff applied.
-// PS2: reads buffID(int32) + buffName(24-byte string), shows notification,
-// sends acknowledgment opcode 0x0368 back to server.
+// handleBuffNotification is 0x076F (Msg076F, 0x00BDB3E8): a buddy-list
+// invitation, not a buff. The requester's id (u32, VIClient+0x2BB10) and name.
+// Busy, the PS2 says so (649) and declines with 0x0368 {id, 1}; with 32
+// buddies it declines {id, 8}; otherwise it asks (519 is the prompt's title),
+// and AnswerBuddyRequest is the answer.
 func (gs *GameState) handleBuffNotification(msg *protocol.Message) {
-	data := msg.Data()
-	payload := data[2:] // skip opcode
-	if len(payload) < 4 {
+	s := newSocialStream(msg)
+	id := s.u32()
+	name := s.str8(24)
+	if s.err {
+		log.Printf("BuddyInvite: short message (%d bytes)", len(msg.Data()))
 		return
 	}
-	buffID := binary.LittleEndian.Uint32(payload[0:4])
-	buffName := ""
-	if len(payload) >= 28 {
-		// 24-byte null-terminated string
-		nameBytes := payload[4:28]
-		for i, b := range nameBytes {
-			if b == 0 {
-				buffName = string(nameBytes[:i])
-				break
-			}
-		}
-		if buffName == "" {
-			buffName = string(nameBytes)
-		}
+	gs.BuddyRequestID = id
+	gs.BuddyRequestName = name
+	switch {
+	case gs.socialBusy():
+		gs.socialShowText(socialFormat(gs.socialWord(649), name))
+		gs.socialSendMsg(protocol.GameOpcode(0x0368), id, 1)
+		gs.BuddyRequestID = 0xFFFFFFFF
+	case len(gs.Buddies) >= 32:
+		gs.socialSendMsg(protocol.GameOpcode(0x0368), id, 8)
+		gs.BuddyRequestID = 0xFFFFFFFF
+	default:
+		gs.socialShowText(gs.socialWord(519) + " " + name)
 	}
-	log.Printf("BuffNotification: id=%d name=%q", buffID, buffName)
-	if buffName != "" {
-		gs.addChatMessage(fmt.Sprintf("Buff: %s", buffName), ChatSystem)
+	log.Printf("BuddyInvite: from %s (0x%08X)", name, id)
+}
+
+// AnswerBuddyRequest answers the open buddy-list invitation the way the
+// PS2's prompt does: AnswerBuddyRequest sends 0x0367 {id},
+// RejectBuddyRequest 0x0368 {id, 2}.
+func (gs *GameState) AnswerBuddyRequest(accept bool) {
+	id := gs.BuddyRequestID
+	if id == 0 || id == 0xFFFFFFFF {
+		return
 	}
-	// PS2 sends acknowledgment opcode 0x0368 back to server.
-	// Build and queue the ack: opcode(2) + buffID(4) + flag(1) + fragment
-	if gs.Conn != nil {
-		ackData := make([]byte, 5)
-		binary.LittleEndian.PutUint32(ackData[0:4], buffID)
-		ackData[4] = 1 // ack flag
-		gs.Conn.QueueReliable(0x0368, ackData)
-		log.Printf("BuffNotification: sent ack 0x0368 for buff %d", buffID)
+	if accept {
+		gs.socialSend(protocol.GameOpcode(0x0367), binary.LittleEndian.AppendUint32(nil, id))
+	} else {
+		gs.socialSendMsg(protocol.GameOpcode(0x0368), id, 2)
 	}
+	gs.BuddyRequestID = 0xFFFFFFFF
 }
 
 // handleCombatEnd is 0x0777, VIClient::Msg0777, which does not end combat:
@@ -1081,70 +1032,59 @@ func (gs *GameState) handleNPCInteractResult(msg *protocol.Message) {
 
 // handleColoredChat — see state.go for existing implementation of 0x0A7A / 0x0A7B.
 
-// handleAddBuddyFailed handles opcode 0x03D8 — add buddy failed.
+// handleAddBuddyFailed is 0x03D8: "Add buddy failed: Your buddy's buddy list
+// is full." (591). 0x03D7 is the player's own list being full (590).
 func (gs *GameState) handleAddBuddyFailed(msg *protocol.Message) {
-	log.Printf("AddBuddyFailed: could not add buddy")
-	gs.addChatMessage("Could not add buddy.", ChatError)
+	gs.socialShowWord(591)
 }
 
-// handleBuddyListStuff handles opcode 0x0771 — buddy list data.
+// handleBuddyListStuff is 0x0771 (Msg0771, 0x00BDB6B8): why an invitation
+// went nowhere, a byte and a name: 2 declined (558), 1 busy (559), 5 cannot
+// accept (560), 6 expired (587), 7 too many open invitations (589), 8 their
+// buddy list is full (586), 9 already a buddy (592), 10 ignoring you (642).
+// (Any other byte formats a word id the PS2 never set; nothing is shown.)
 func (gs *GameState) handleBuddyListStuff(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("BuddyListStuff: dataLen=%d", len(data))
+	s := newSocialStream(msg)
+	code := s.u8()
+	name := s.str8(24)
+	word, ok := map[byte]int{2: 558, 1: 559, 5: 560, 6: 587, 7: 589, 8: 586, 9: 592, 10: 642}[code]
+	if !ok || s.err {
+		log.Printf("InviteResult: code %d from %q not shown", code, name)
+		return
+	}
+	gs.socialShowText(socialFormat(gs.socialWord(word), name))
 }
 
-// handleFactionPage handles opcode 0x07E2 — faction page response.
-// Wire format: opcode(2) + byte(0x77) + zigzag(pageID) + byte(pageIndex) +
-// byte(0x44) + zigzag(count) + [count × { int32(nameLen) + utf16(name) + zigzag(standing) }]
+// handleFactionPage is 0x07E2, VIClientPart4F078::Recv07E2 (0x00BEA820): a
+// 0x77 byte, the request's token, the page's index and the number of pages
+// (all zigzag), then a zigzag count of factions, each a wide name (63 at most)
+// and a zigzag standing. The PS2 keeps one page, the one it asked for last;
+// this client asks for every page at once and keeps them all.
 func (gs *GameState) handleFactionPage(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 8 {
+	s := newSocialStream(msg)
+	if s.u8() != 0x77 {
 		return
 	}
-	reader := buffer.NewReader(data[2:]) // skip opcode
-
-	marker, _ := reader.ReadByte() // 0x77
-	if marker != 0x77 {
-		log.Printf("FactionPage: unexpected marker 0x%02X", marker)
+	token := s.zigzag()
+	page := s.zigzag()
+	pages := s.zigzag()
+	count := int(s.zigzag())
+	if s.err || count < 0 || count > 1000 {
+		log.Printf("FactionPage: bad header (count %d)", count)
 		return
 	}
-
-	pageID, _ := reader.Read7BitEncodedInt64()
-	pageIndex, _ := reader.ReadByte()
-	flag, _ := reader.ReadByte() // 0x44
-	_ = flag
-
-	count, _ := reader.Read7BitEncodedInt64()
-	if count <= 0 || count > 20 {
-		return
+	for i := 0; i < count; i++ {
+		name := s.str16(128)
+		standing := s.zigzag()
+		if s.err {
+			break
+		}
+		gs.Factions = append(gs.Factions, FactionEntry{Name: name, Standing: int(standing)})
 	}
-
-	for i := int64(0); i < count; i++ {
-		nameLen, err := reader.ReadInt32()
-		if err != nil || nameLen <= 0 || nameLen > 100 {
-			break
-		}
-		name, err := reader.ReadStringUnicode(int(nameLen))
-		if err != nil {
-			break
-		}
-		standing, err := reader.Read7BitEncodedInt64()
-		if err != nil {
-			break
-		}
-		gs.Factions = append(gs.Factions, FactionEntry{
-			Name:     name,
-			Standing: int(standing),
-		})
-	}
-
-	log.Printf("FactionPage: pageID=%d pageIdx=%d count=%d total=%d",
-		pageID, pageIndex, count, len(gs.Factions))
-
-	// Mark loaded when we've received all 34 pages (pageIndex 66 is last)
-	if pageIndex >= 66 {
+	log.Printf("FactionPage: token=%d page %d of %d, %d factions, %d held",
+		token, page, pages, count, len(gs.Factions))
+	if page+1 >= pages {
 		gs.FactionLoaded = true
-		log.Printf("FactionPage: all %d factions loaded", len(gs.Factions))
 	}
 }
 
@@ -1170,134 +1110,185 @@ func (gs *GameState) handleUpdateTrainingPoints(msg *protocol.Message) {
 	gs.addChatMessage(fmt.Sprintf("Spent %d training points (%d remaining)", spent, gs.TrainingPoints), ChatSystem)
 }
 
-// handleClassMasteryServer handles opcode 0x1402 — class mastery response.
-// Wire format from pcap: type byte determines response format.
+// handleClassMasteryServer is 0x1402, VIClientPart4EC58::Recv1402
+// (0x00BF7240), class mastery, by sub-type:
+//
+//	1  a u32 (+0x41C), a u32 (+0x08)
+//	2  a u32 (+0x41C)
+//	3  the points: a u32 (+0x0C) and a u32 (+0x10, the unspent count this
+//	   client shows); a rise in the first is "You have earned %d mastery
+//	   points." (1627; 1628 for one), a notice on the PS2
+//	4  a u32 (+0x14)
+//	5  a skill bought: u32 (+0x41C), its id, the two point counts, the run
+//	   speed (f32, through SetSpeed), then stat blocks not ported; the skill
+//	   is marked owned
+//	6  a skill given back: u32 (+0x41C), its id, the speed, the stat blocks;
+//	   the skill is marked not owned
+//	7  a skill's id and whether it can be bought
+//	8  the whole tree (func_00BF7748)
+//	9  one skill's detail (func_00BF7810)
 func (gs *GameState) handleClassMasteryServer(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	payload := data[2:] // skip opcode
-	if len(payload) < 1 {
-		return
-	}
-
-	respType := payload[0]
-
-	switch respType {
-	case 0x08:
-		// Full CM tree (1154+ bytes)
-		gs.parseCMTree(payload)
-
-	case 0x09:
-		// Category detail (138-404 bytes) — skill name + description
-		gs.parseCMDetail(payload)
-
-	case 0x01:
-		// Select ack (9 bytes)
-		if len(payload) >= 9 {
-			skillID := int(binary.LittleEndian.Uint32(payload[5:9]))
-			log.Printf("CM: select ack skillID=0x%04X", skillID)
+	s := newSocialStream(msg)
+	sub := s.u8()
+	switch sub {
+	case 1:
+		s.u32()
+		id := s.u32()
+		log.Printf("CM: select ack 0x%04X", id)
+	case 2:
+		s.u32()
+	case 3:
+		points := s.u32()
+		unspent := s.u32()
+		if s.err {
+			return
 		}
-
-	case 0x03:
-		// Spend confirmation (9 bytes)
-		if len(payload) >= 9 {
-			remaining := int(binary.LittleEndian.Uint32(payload[5:9]))
-			gs.CMUnspent = remaining
-			log.Printf("CM: spend confirmed, %d CMs remaining", remaining)
-			gs.addChatMessage(fmt.Sprintf("CM spent (%d remaining)", remaining), ChatSystem)
-		}
-
-	default:
-		log.Printf("CM: unknown response type 0x%02X (%d bytes)", respType, len(payload))
-	}
-}
-
-// parseCMTree extracts skill entries from the full CM tree response.
-func (gs *GameState) parseCMTree(payload []byte) {
-	if len(payload) < 7 {
-		return
-	}
-	gs.CMUnspent = int(binary.LittleEndian.Uint16(payload[5:7]))
-	gs.CMSkills = nil
-
-	// Scan for skill entries: look for UTF-16 name strings preceded by int32 nameLen
-	pos := 7
-	for pos < len(payload)-6 {
-		// Try to find a name at nearby offsets
-		found := false
-		for scan := pos; scan < pos+20 && scan < len(payload)-4; scan++ {
-			nameLen := int(binary.LittleEndian.Uint32(payload[scan : scan+4]))
-			if nameLen >= 3 && nameLen <= 40 && scan+4+nameLen*2 <= len(payload) {
-				nameBytes := payload[scan+4 : scan+4+nameLen*2]
-				name := decodeUTF16LE(nameBytes)
-				if len(name) >= 3 && isPrintableString(name) {
-					// Extract header bytes before the name for ID/prereq/cost
-					headerStart := pos
-					header := payload[headerStart:scan]
-
-					skill := CMSkill{Name: name, HasName: true}
-
-					// Parse header: last 7 bytes before name are typically:
-					// skillID(1-2) flags(1) unk(1) prereqID(1-2) cost(1-2)
-					if len(header) >= 7 {
-						// Per-skill entry: ID rank hasName ID prereq cost
-						skill.ID = int(header[len(header)-7])
-						skill.Rank = header[len(header)-6]
-						skill.PrereqID = int(header[len(header)-3])<<8 | int(header[len(header)-4])
-						skill.Cost = int(header[len(header)-1])
-					} else if len(header) >= 2 {
-						skill.ID = int(header[0])
-					}
-
-					gs.CMSkills = append(gs.CMSkills, skill)
-					pos = scan + 4 + nameLen*2
-					found = true
-					break
-				}
+		if old := gs.CMPoints; points > old {
+			if n := points - old; n >= 2 {
+				gs.socialShowText(socialFormat(gs.socialWord(1627), n))
+			} else {
+				gs.socialShowWord(1628)
 			}
 		}
-		if !found {
-			pos++
+		gs.CMPoints = points
+		gs.CMUnspent = int(unspent)
+		log.Printf("CM: points %d, %d unspent", points, unspent)
+	case 4:
+		s.u32()
+	case 5, 6:
+		s.u32()
+		id := s.u32()
+		if sub == 5 {
+			gs.CMPoints = s.u32()
+			gs.CMUnspent = int(s.u32())
 		}
+		speed := s.u32()
+		if s.err {
+			return
+		}
+		gs.Player.Speed = math.Float32frombits(speed)
+		gs.socialSetCMOwned(int32(id), sub == 5)
+		log.Printf("CM: skill 0x%04X owned=%v, speed %.2f", id, sub == 5, gs.Player.Speed)
+	case 7:
+		id := s.u32()
+		v := s.u32()
+		if s.err {
+			return
+		}
+		for i := range gs.CMTree {
+			if gs.CMTree[i].ID == int32(id) {
+				gs.CMTree[i].Available = byte(v)
+			}
+		}
+		gs.socialCMSkills()
+	case 8:
+		gs.parseCMTree(s)
+	case 9:
+		gs.parseCMDetail(s)
+	default:
+		log.Printf("CM: sub-type %d ignored (%d bytes)", sub, len(msg.Data()))
 	}
-
-	gs.CMTreeLoaded = true
-	log.Printf("CM: tree loaded — %d skills, %d unspent CMs", len(gs.CMSkills), gs.CMUnspent)
 }
 
-// parseCMDetail extracts skill detail (name + description) from category response.
-func (gs *GameState) parseCMDetail(payload []byte) {
-	if len(payload) < 20 {
+// parseCMTree is func_00BF7748: a u32 (+0x41C), a u32 count, then that many
+// tree entries (func_00BF80A0).
+func (gs *GameState) parseCMTree(s *socialStream) {
+	s.u32()
+	n := int(s.u32())
+	if s.err || n < 0 || n > 4096 {
+		log.Printf("CM: bad tree header (count %d)", n)
 		return
 	}
-
-	skillID := int(binary.LittleEndian.Uint16(payload[5:7]))
-	detail := &CMSkillDetail{ID: skillID}
-
-	// Scan for UTF-16 strings: name, display name, description
-	strings := extractUTF16Strings16(payload[10:])
-
-	if len(strings) >= 1 {
-		detail.Name = strings[0]
+	tree := make([]CMTreeEntry, 0, n)
+	for i := 0; i < n; i++ {
+		e := readCMTreeEntry(s)
+		if s.err {
+			log.Printf("CM: tree cut short at entry %d of %d", i, n)
+			break
+		}
+		tree = append(tree, e)
 	}
-	if len(strings) >= 2 {
-		detail.DisplayName = strings[1]
-	}
-	if len(strings) >= 3 {
-		detail.Description = strings[2]
-	}
+	gs.CMTree = tree
+	gs.socialCMSkills()
+	gs.CMTreeLoaded = true
+	log.Printf("CM: tree loaded — %d entries, %d skills", len(tree), len(gs.CMSkills))
+}
 
-	// Rank info is in the last few bytes
-	if len(payload) >= 3 {
-		detail.Rank = payload[len(payload)-3]
-		detail.MaxRank = payload[len(payload)-2]
+// parseCMDetail is func_00BF7810: a u32 (+0x41C), then the record
+// func_00BF81F0 reads: zigzag id, two bytes, two zigzags (the second the
+// prerequisite), two bytes, nine zigzags, the name, a zigzag, a second name
+// and the description (wide: 63, 63, 255), then three counted arrays (byte
+// and zigzag pairs; a wide string and a byte; wide strings).
+func (gs *GameState) parseCMDetail(s *socialStream) {
+	s.u32()
+	d := &CMSkillDetail{}
+	d.ID = int(s.zigzag())
+	d.Rank = s.u8()
+	s.u8()
+	s.zigzag()
+	s.zigzag()
+	s.u8()
+	s.u8()
+	for i := 0; i < 9; i++ {
+		s.zigzag()
 	}
+	d.Name = s.str16(128)
+	s.zigzag()
+	d.DisplayName = s.str16(128)
+	d.Description = s.str16(512)
+	for i, n := 0, int(s.zigzag()); i < n && !s.err; i++ {
+		s.u8()
+		s.zigzag()
+	}
+	for i, n := 0, int(s.zigzag()); i < n && !s.err; i++ {
+		s.str16(128)
+		s.u8()
+	}
+	for i, n := 0, int(s.zigzag()); i < n && !s.err; i++ {
+		s.str16(128)
+	}
+	if s.err {
+		log.Printf("CM: short detail record")
+		return
+	}
+	d.MaxRank = 1
+	for _, e := range gs.CMTree {
+		if int(e.ID) == d.ID {
+			d.Cost = int(e.Cost)
+		}
+	}
+	gs.CMDetail = d
+	log.Printf("CM: detail id=%d name=%q desc=%q owned=%d", d.ID, d.Name, d.Description, d.Rank)
+}
 
-	gs.CMDetail = detail
-	log.Printf("CM: detail skillID=0x%04X name=%q desc=%q rank=%d/%d",
-		skillID, detail.Name, detail.Description, detail.Rank, detail.MaxRank)
+// socialSetCMOwned marks one tree entry owned or not (func_00BF78A8 finds it).
+func (gs *GameState) socialSetCMOwned(id int32, owned bool) {
+	for i := range gs.CMTree {
+		if gs.CMTree[i].ID == id {
+			if owned {
+				gs.CMTree[i].Owned = 1
+			} else {
+				gs.CMTree[i].Owned = 0
+			}
+		}
+	}
+	gs.socialCMSkills()
+}
+
+// socialCMSkills rebuilds the list the client's mastery tab draws out of the
+// tree: every entry that is owned or can be bought (the "x" placeholders are
+// neither). Rank is owned (0 or 1); each skill is one purchase.
+func (gs *GameState) socialCMSkills() {
+	gs.CMSkills = gs.CMSkills[:0]
+	for _, e := range gs.CMTree {
+		if e.Owned == 0 && e.Available == 0 {
+			continue
+		}
+		gs.CMSkills = append(gs.CMSkills, CMSkill{
+			ID: int(e.ID), Name: e.Name, HasName: true,
+			PrereqID: int(e.Prereq), Cost: int(e.Cost), Rank: e.Owned, MaxRank: 1,
+		})
+	}
 }
 
 // decodeUTF16LE decodes a UTF-16LE byte slice to a Go string.

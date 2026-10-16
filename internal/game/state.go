@@ -66,13 +66,16 @@ type ServerInfo struct {
 	IP         string
 }
 
-// GuildMember represents one member in the guild roster.
-// PS2: 0x44 (68) bytes per member in a binary tree at entity+0x288.
+// GuildMember represents one member in the guild roster: VIGuildMember, the
+// player record plus a rank and an online byte, in a map keyed by id at
+// VIClientGuild+0x288 (68-byte nodes).
 type GuildMember struct {
 	CharID int64
 	Name   string
 	Level  int
 	Class  int
+	Race   int
+	Rank   int
 	Online bool
 }
 
@@ -484,6 +487,10 @@ type GameState struct {
 	GroupMembers  []GroupMember
 	GroupInviteID uint32 // pending invite group ID (0 = none)
 	GroupInviter  string // name of inviter
+
+	// The social handlers' state (social.go): buddies, invitations, the
+	// dialog queue, the quest log, the pet, mail and the rest.
+	SocialState
 
 	// Reverse map: entity channel (0x00-0x17) → objectID currently on it.
 	// Avoids O(n) entity scans in decodeEntityState.
@@ -1946,274 +1953,165 @@ func readUnicodeString(data []byte, offset int) (string, int) {
 	return string(runes), 4 + charCount*2
 }
 
+// handleColoredChat is 0x0A7B (Msg0A7B, 0x00BD3600): a wide string of at
+// most 1,023 characters, then three colour bytes, one chat line in that
+// colour. The channel is the client's own sorting for its tabs.
 func (gs *GameState) handleColoredChat(msg *protocol.Message) {
-	data := msg.Data()
-	// Wire format: opcode(2) + int32(charCount) + UTF-16LE(chars) + 4 color bytes
-	if len(data) < 6 {
+	s := newSocialStream(msg)
+	text := s.str16(2048)
+	r, g, b := s.u8(), s.u8(), s.u8()
+	if s.err {
+		log.Printf("ColoredChat: short message (%d bytes)", len(msg.Data()))
 		return
 	}
-	text, consumed := readUnicodeString(data, 2) // skip 2-byte opcode prefix
-	if text == "" {
-		return
-	}
-
-	// Read color bytes (4 bytes after the string)
-	colorOff := 2 + consumed
-	var r, g, b uint8
-	if colorOff+4 <= len(data) {
-		r = data[colorOff]
-		g = data[colorOff+1]
-		b = data[colorOff+2]
-	} else {
-		r, g, b = 63, 255, 63 // default shout green
-	}
-
-	// Determine chat channel from color bytes.
-	// Sandstorm uses specific colors for different channels:
-	//   Shout:  green (63, 255, 63) or (255, 247, 0) = default
-	//   Guild:  typically teal/cyan or custom guild color
-	//   Server: varies (welcome messages, etc)
-	// The last 2 bytes after RGB may be channel flags.
-	channel := ChatShout
-	colorOff2 := colorOff + 3
-	if colorOff2 < len(data) {
-		flagByte := data[colorOff2]
-		// Check known Sandstorm flag patterns
-		if flagByte == 0xF7 {
-			channel = ChatSystem // server message (0xFFF7 = system)
-		}
-	}
-	// Detect channel from text content (Sandstorm embeds channel in the message text)
+	channel := ChatSystem
 	if strings.Contains(text, " tells you:") {
 		channel = ChatTell
 	} else if strings.Contains(text, " shouts:") {
 		channel = ChatShout
-	} else if r == 255 && g == 63 && b == 63 {
-		channel = ChatError
-	} else if r == 48 && g == 244 && b == 255 {
-		channel = ChatSystem // auction/system cyan
 	}
-
 	log.Printf("ColoredChat: %s (color: %d,%d,%d ch=%d)", text, r, g, b, channel)
-	gs.ChatLog = append(gs.ChatLog, ChatMessage{
-		Text:    text,
-		Channel: channel,
-		ColorR:  r, ColorG: g, ColorB: b,
-	})
+	gs.socialLine(text, channel, [3]uint8{r, g, b})
 }
 
+// handleClientMessage is 0x0A7A (Msg0A7A, 0x00BD36D0): a wide string, one
+// white chat line. Not guild chat: the captures carry an NPC's speech and
+// "You receive 38 tunar." on it. Guild chat is 0x0468 sub-type 5.
 func (gs *GameState) handleClientMessage(msg *protocol.Message) {
-	data := msg.Data()
-	// Wire format: opcode(2) + int32(charCount) + UTF-16LE(chars)
-	// On Sandstorm, 0x0A7A is used for guild chat messages.
-	// Text includes "SenderName: message".
-	if len(data) < 6 {
+	s := newSocialStream(msg)
+	text := s.str16(2048)
+	if s.err {
 		return
 	}
-	text, _ := readUnicodeString(data, 2) // skip 2-byte opcode prefix
-	if text == "" {
-		return
-	}
-
-	log.Printf("ClientMessage[guild]: %s", text)
-	gs.addChatMessage(fmt.Sprintf("[Guild] %s", text), ChatGuild)
+	log.Printf("ClientMessage: %s", text)
+	gs.socialLine(text, ChatSay, socialWhite)
 }
 
+// handleErrorMessage is 0x00CE: a wide string in (1, .25, .25).
 func (gs *GameState) handleErrorMessage(msg *protocol.Message) {
-	data := msg.Data()
-	// Wire format: opcode(2) + int32(charCount) + UTF-16LE(chars)
-	if len(data) < 6 {
+	s := newSocialStream(msg)
+	text := s.str16(2048)
+	if s.err {
 		return
 	}
-	text, _ := readUnicodeString(data, 2)
-	if text == "" {
-		return
-	}
-
 	log.Printf("ErrorMessage: %s", text)
-	gs.ChatLog = append(gs.ChatLog, ChatMessage{
-		Text:    text,
-		Channel: ChatError,
-		ColorR:  255, ColorG: 0, ColorB: 0,
-	})
+	gs.socialLine(text, ChatError, socialRed)
 }
 
+// handleGroupChat is 0x069E: a u32 the PS2 never reads back, then a wide
+// string in (.5, .5, 1).
 func (gs *GameState) handleGroupChat(msg *protocol.Message) {
-	data := msg.Data()
-	// Wire format: opcode(2) + uint32(senderOID) + uint32(charCount) + UTF-16LE(chars)
-	if len(data) < 10 {
+	s := newSocialStream(msg)
+	s.u32()
+	text := s.str16(2048)
+	if s.err {
 		return
 	}
-	text, _ := readUnicodeString(data, 6) // skip opcode(2) + senderOID(4)
-	if text == "" {
-		return
-	}
-
 	log.Printf("GroupChat: %s", text)
-	gs.ChatLog = append(gs.ChatLog, ChatMessage{
-		Text:    text,
-		Channel: ChatGroup,
-		ColorR:  100, ColorG: 180, ColorB: 255,
-	})
+	gs.socialLine(text, ChatGroup, socialGroup)
 }
 
-// handleGroupInvite processes a group invite from another player (opcode 0x0773).
-// Wire: opcode(2) + uint32 groupID + uint32 inviterOID + uint32 nameLen + ASCII name
+// handleGroupInvite is 0x0773 (Msg0773, 0x00BD3458): the inviter's id, a
+// second u32 and the inviter's name. Already in a group, the PS2 declines at
+// once (0x0624: the id and 2). Otherwise it queues the invitation and, when
+// the game window is free, asks (string 636); the client's own prompt is the
+// group menu, so the question is a chat line here.
 func (gs *GameState) handleGroupInvite(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 14 { // 2 + 4 + 4 + 4 minimum
-		log.Printf("GroupInvite: short data (%d bytes)", len(data))
+	s := newSocialStream(msg)
+	id := s.u32()
+	x := s.u32()
+	name := s.str8(24)
+	if s.err {
+		log.Printf("GroupInvite: short message (%d bytes)", len(msg.Data()))
 		return
 	}
-	groupID := binary.LittleEndian.Uint32(data[2:6])
-	// inviterOID at data[6:10] — not stored, we use name
-	nameLen := binary.LittleEndian.Uint32(data[10:14])
-	if len(data) < int(14+nameLen) {
-		log.Printf("GroupInvite: name truncated (need %d, have %d)", 14+nameLen, len(data))
+	if gs.GroupActive {
+		log.Printf("GroupInvite: from %s while grouped, declined", name)
+		gs.socialSendMsg(protocol.OpcodeDeclineGroupInvite, id, 2)
 		return
 	}
-	name := string(data[14 : 14+nameLen])
-
-	gs.GroupInviteID = groupID
-	gs.GroupInviter = name
-	log.Printf("GroupInvite: %s invited you to group %d", name, groupID)
-	gs.ChatLog = append(gs.ChatLog, ChatMessage{
-		Text:    fmt.Sprintf("%s has invited you to a group. Type /accept or /decline", name),
-		Channel: ChatSystem,
-		ColorR:  255, ColorG: 255, ColorB: 100,
-	})
+	gs.socialSyncInvites()
+	gs.GroupInvites = append(gs.GroupInvites, GroupInviteEntry{ID: id, X: x, Name: name})
+	gs.GroupInviteID = gs.GroupInvites[0].ID
+	gs.GroupInviter = gs.GroupInvites[0].Name
+	log.Printf("GroupInvite: %s (id=0x%08X x=0x%08X), %d pending", name, id, x, len(gs.GroupInvites))
+	if !gs.socialBusy() {
+		gs.socialLine(socialFormat(gs.socialWord(636), name), ChatSystem, socialWhite)
+	}
 }
 
-// handleCreateGroup processes group roster creation/update (opcode 0x0772).
-// Wire: opcode(2) + uint32 groupID + uint32 count + count×uint32 OIDs + count×(uint32 nameLen + ASCII name)
+// handleCreateGroup is 0x0772 (Msg0772, 0x00BD31C0): the roster. A u32 the
+// PS2 never reads back, the count, every member's id, then every member's
+// name. A member who was already in the roster keeps what channel 0x40 told
+// about them. The leader is the first member; the PS2 only ever sets that
+// flag here, never clears it. (The PS2 drops a roster while it is not in a
+// group, which its invite and accept set; the Go senders do not track that,
+// so a roster is what makes the group here.)
 func (gs *GameState) handleCreateGroup(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 10 { // 2 + 4 + 4 minimum
-		log.Printf("CreateGroup: short data (%d bytes)", len(data))
+	s := newSocialStream(msg)
+	groupID := s.u32()
+	count := int(s.u32())
+	if count > 4 { // m_group[4]; the PS2 does not check
+		log.Printf("CreateGroup: count %d, kept 4", count)
+		count = 4
+	}
+	old := map[uint32]GroupMember{}
+	for _, m := range gs.GroupMembers {
+		old[m.ObjectID] = m
+	}
+	members := make([]GroupMember, count)
+	for i := range members {
+		members[i].ObjectID = s.u32()
+		if o, ok := old[members[i].ObjectID]; ok {
+			members[i] = o
+		}
+	}
+	for i := range members {
+		members[i].Name = s.str8(24)
+	}
+	if s.err {
+		log.Printf("CreateGroup: short message (%d bytes)", len(msg.Data()))
 		return
 	}
-	groupID := binary.LittleEndian.Uint32(data[2:6])
-	count := binary.LittleEndian.Uint32(data[6:10])
-	if count > 6 {
-		log.Printf("CreateGroup: suspicious count %d, capping at 6", count)
-		count = 6
-	}
-
-	offset := 10
-	// Read OIDs
-	oids := make([]uint32, count)
-	for i := uint32(0); i < count; i++ {
-		if offset+4 > len(data) {
-			log.Printf("CreateGroup: truncated at OID %d", i)
-			return
-		}
-		oids[i] = binary.LittleEndian.Uint32(data[offset : offset+4])
-		offset += 4
-	}
-
-	// Read names
-	members := make([]GroupMember, count)
-	for i := uint32(0); i < count; i++ {
-		if offset+4 > len(data) {
-			log.Printf("CreateGroup: truncated at name %d", i)
-			return
-		}
-		nameLen := binary.LittleEndian.Uint32(data[offset : offset+4])
-		offset += 4
-		if offset+int(nameLen) > len(data) {
-			log.Printf("CreateGroup: name %d truncated", i)
-			return
-		}
-		members[i] = GroupMember{
-			ObjectID: oids[i],
-			Name:     string(data[offset : offset+int(nameLen)]),
-		}
-		offset += int(nameLen)
-	}
-
 	gs.GroupActive = true
 	gs.GroupID = groupID
 	gs.GroupMembers = members
-	gs.GroupInviteID = 0
-	gs.GroupInviter = ""
-
+	if count > 0 && members[0].ObjectID == gs.PlayerObjectID {
+		gs.GroupIsLeader = true
+	}
 	var names []string
 	for _, m := range members {
 		names = append(names, m.Name)
 	}
-	log.Printf("CreateGroup: groupID=%d members=[%s]", groupID, strings.Join(names, ", "))
-	gs.ChatLog = append(gs.ChatLog, ChatMessage{
-		Text:    fmt.Sprintf("Group formed: %s", strings.Join(names, ", ")),
-		Channel: ChatSystem,
-		ColorR:  255, ColorG: 255, ColorB: 100,
-	})
+	log.Printf("CreateGroup: groupID=%d members=[%s] leader=%v", groupID, strings.Join(names, ", "), gs.GroupIsLeader)
 }
 
-// handleRemoveGroupMember processes a member removal from the group (opcode 0x069A).
-// Wire: opcode(2) + byte slot
-// The byte is the server's internal group slot, NOT our array index.
-// Slot 0 = self removed (group disbanded). Other values = a non-self member left.
+// handleRemoveGroupMember is 0x069A: the player is out of the group. A byte
+// says why (string 630-633, or 631 again for 7; 5 and 8 say nothing), and
+// whatever it says the group is gone. Only while in a group.
 func (gs *GameState) handleRemoveGroupMember(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 3 { // 2 + 1
-		log.Printf("RemoveGroupMember: short data (%d bytes)", len(data))
+	if !gs.GroupActive {
 		return
 	}
-	slot := data[2]
-	log.Printf("RemoveGroupMember: slot=%d members=%d", slot, len(gs.GroupMembers))
-
-	// Slot 0 = self removed from group
-	if slot == 0 {
-		gs.GroupActive = false
-		gs.GroupID = 0
-		gs.GroupMembers = nil
-		gs.ChatLog = append(gs.ChatLog, ChatMessage{
-			Text:    "You have left the group.",
-			Channel: ChatSystem,
-			ColorR:  255, ColorG: 255, ColorB: 100,
-		})
-		return
+	s := newSocialStream(msg)
+	sub := s.u8()
+	word := map[byte]int{1: 630, 2: 631, 3: 632, 4: 633, 7: 631}
+	if w, ok := word[sub]; ok {
+		gs.socialShowWord(w)
 	}
-
-	// Non-zero slot = another member left. Remove the first non-self member
-	// we find (in a 2-person group there's only one). For larger groups the
-	// server resends CreateGroup with the updated roster.
-	for i, m := range gs.GroupMembers {
-		if m.ObjectID != gs.PlayerObjectID {
-			gs.GroupMembers = append(gs.GroupMembers[:i], gs.GroupMembers[i+1:]...)
-			if len(gs.GroupMembers) <= 1 {
-				gs.GroupActive = false
-				gs.GroupID = 0
-				gs.GroupMembers = nil
-				gs.ChatLog = append(gs.ChatLog, ChatMessage{
-					Text:    fmt.Sprintf("%s left the group. Group dissolved.", m.Name),
-					Channel: ChatSystem,
-					ColorR:  255, ColorG: 255, ColorB: 100,
-				})
-			} else {
-				gs.ChatLog = append(gs.ChatLog, ChatMessage{
-					Text:    fmt.Sprintf("%s has left the group.", m.Name),
-					Channel: ChatSystem,
-					ColorR:  255, ColorG: 255, ColorB: 100,
-				})
-			}
-			return
-		}
-	}
+	log.Printf("RemoveGroupMember: reason %d, group %d gone", sub, gs.GroupID)
+	gs.socialLeaveGroup()
 }
 
-// handleDisbandGroup processes a server group disband (opcode 0x062F).
-// Sent when the group is dissolved (e.g. last other member leaves).
+// handleDisbandGroup is 0x062F: "Your group has been lost." and the group
+// is gone. Only while in a group.
 func (gs *GameState) handleDisbandGroup(msg *protocol.Message) {
-	log.Printf("DisbandGroup: group %d disbanded by server", gs.GroupID)
-	gs.GroupActive = false
-	gs.GroupID = 0
-	gs.GroupMembers = nil
-	gs.ChatLog = append(gs.ChatLog, ChatMessage{
-		Text:    "Your group has been disbanded.",
-		Channel: ChatSystem,
-		ColorR:  255, ColorG: 255, ColorB: 100,
-	})
+	if !gs.GroupActive {
+		return
+	}
+	log.Printf("DisbandGroup: group %d lost", gs.GroupID)
+	gs.socialShowWord(634)
+	gs.socialLeaveGroup()
 }
 
 // handleClassicTargetInfo is 0x0010 (Msg0010, 0x00BD9D60): three bytes —
@@ -3213,53 +3111,53 @@ func (gs *GameState) parseAndLogItems(source string, data []byte) {
 	}
 }
 
+// handleDialogueBox is 0x0046: a u32 and a wide string of at most 511
+// characters, shown through ShowDialog (which does not keep the u32).
 func (gs *GameState) handleDialogueBox(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 10 {
+	s := newSocialStream(msg)
+	id := s.u32()
+	text := s.str16(1024)
+	if s.err {
+		log.Printf("DialogueBox: short message (%d bytes)", len(msg.Data()))
 		return
 	}
-	// Format: opcode(2) + uint32(counter) + stringUnicode(text)
-	counter := binary.LittleEndian.Uint32(data[2:6])
-	text, _ := readUnicodeString(data, 6)
-	if text != "" {
-		log.Printf("DialogueBox: counter=%d text=%s", counter, text)
-		fmt.Printf("\n--- Dialogue ---\n%s\n----------------\n", text)
-		gs.DialogueText = text
-		gs.DialogueOptions = nil
-		gs.DialogueCounter = counter
-		gs.DialogueActive = true
-	}
+	log.Printf("DialogueBox: id=%d text=%s", id, text)
+	fmt.Printf("\n--- Dialogue ---\n%s\n----------------\n", text)
+	gs.socialShowDialog(id, text)
 }
 
+// handleQuestPopup is 0x0034 (Msg0034, 0x00BDBD58), a dialog with answers:
+// a u32 the answer echoes, a wide question of at most 127 characters, a count,
+// and that many wide answers of at most 63. The window free, it opens; over a
+// plain dialog it waits its turn (one at a time); otherwise the PS2 answers
+// 255 itself (0x0035).
 func (gs *GameState) handleQuestPopup(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 10 {
+	s := newSocialStream(msg)
+	counter := s.u32()
+	greeting := s.str16(256)
+	n := int(s.u8())
+	options := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		options = append(options, s.str16(128))
+	}
+	if s.err {
+		log.Printf("OptionBox: short message (%d bytes)", len(msg.Data()))
 		return
 	}
-	// Format: opcode(2) + uint32(dialogueCounter) + stringUnicode(greeting) + byte(optionCount) + N × stringUnicode(option)
-	counter := binary.LittleEndian.Uint32(data[2:6])
-	greeting, consumed := readUnicodeString(data, 6)
-	if greeting == "" {
-		return
-	}
-	offset := 6 + consumed
-	if offset >= len(data) {
-		return
-	}
-	optionCount := int(data[offset])
-	offset++
-
-	options := make([]string, 0, optionCount)
-	for i := 0; i < optionCount && offset < len(data); i++ {
-		opt, n := readUnicodeString(data, offset)
-		if n == 0 {
-			break
-		}
-		options = append(options, opt)
-		offset += n
+	if len(options) > 6 { // room for six; the PS2 does not check
+		options = options[:6]
 	}
 
 	log.Printf("OptionBox: counter=%d greeting=%q options=%v", counter, greeting, options)
+	if gs.socialBusy() {
+		if gs.DialogueActive && len(gs.DialogueOptions) == 0 && gs.PendingOptionDialogue == nil {
+			gs.PendingOptionDialogue = &OptionDialogue{ID: counter, Text: greeting, Options: options}
+			return
+		}
+		log.Printf("OptionBox: window busy, answered 255")
+		gs.socialSendMsg(protocol.OpcodeDialogueBoxOption, counter, 255)
+		return
+	}
 	fmt.Printf("\n--- Dialogue (counter=%d) ---\n%s\n", counter, greeting)
 	for i, opt := range options {
 		fmt.Printf("  [%d] %s\n", i, opt)
@@ -3272,22 +3170,21 @@ func (gs *GameState) handleQuestPopup(msg *protocol.Message) {
 	gs.DialogueActive = true
 }
 
+// handleAddQuestLog is 0x007C (Msg007C): a u32 (VIClient+0x2BB0C), then a
+// quest title of at most 127 characters, kept while the log has fewer than
+// eight.
 func (gs *GameState) handleAddQuestLog(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 6 {
+	s := newSocialStream(msg)
+	stamp := s.u32()
+	text := s.str16(256)
+	if s.err {
 		return
 	}
-	// Format: opcode(2) + uint32(questNumber) + WriteStringUnicode(text)
-	reader := buffer.NewReader(data[2:])
-	questNum, _ := reader.ReadUint32()
-	textLen, err := reader.ReadInt32()
-	if err != nil || textLen <= 0 {
-		log.Printf("AddQuestLog: quest=%d (no text)", questNum)
-		return
+	gs.QuestLogStamp = stamp
+	if len(gs.QuestTitles) < 8 {
+		gs.QuestTitles = append(gs.QuestTitles, text)
 	}
-	text, _ := reader.ReadStringUnicode(int(textLen))
-	log.Printf("AddQuestLog: quest=%d text=%q", questNum, text)
-	writeItemLog("Quest", fmt.Sprintf("id=%d text=%q", questNum, text))
+	log.Printf("AddQuestLog: stamp=%d %q (%d in the log)", stamp, text, len(gs.QuestTitles))
 }
 
 // handleDamageIndication is 0x00DB: u32 attacker, zigzag amount, u32 defender
@@ -3791,304 +3688,167 @@ func (gs *GameState) handleSkyboxWeather(msg *protocol.Message) {
 
 // handleWhoListResponse handles opcode 0x0E02 — server who list response.
 // Format: byte(1) + byte(token) + zigzag(count) + count × { byte(race) + byte(class) + byte(level) + uint32_le(nameLen) + utf8(name) + uint32_le(objectID) }
+// handleWhoListResponse is 0x0E02 (VIClientPart38334, 0x00C03168): sub-type
+// 1, then the request's token (zigzag), then a zigzag count of 32-byte
+// entries: three bytes, a name of at most 23 characters, a u32. The PS2 keeps
+// a page only when the token is its latest request's and adds it to the list;
+// a new token starts the list over here.
 func (gs *GameState) handleWhoListResponse(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
+	s := newSocialStream(msg)
+	if s.u8() != 1 {
 		return
 	}
-
-	reader := buffer.NewReader(data[4:]) // skip 2-byte opcode + byte(1) + byte(token)
-	countRaw, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		log.Printf("WhoList: failed to read count: %v", err)
+	token := s.zigzag()
+	count := int(s.zigzag())
+	if s.err || count < 0 || count > 1000 {
+		log.Printf("WhoList: bad header (count %d)", count)
 		return
 	}
-	count := int(countRaw)
-	if count < 0 || count > 1000 {
-		log.Printf("WhoList: invalid count %d", count)
-		return
-	}
-
 	entries := make([]WhoEntry, 0, count)
 	for i := 0; i < count; i++ {
-		race, err := reader.ReadByte()
-		if err != nil {
+		var e WhoEntry
+		e.Race = s.u8()
+		e.Class = s.u8()
+		e.Level = s.u8()
+		e.Name = s.str8(24)
+		e.ObjectID = s.u32()
+		if s.err {
 			break
 		}
-		class, err := reader.ReadByte()
-		if err != nil {
-			break
-		}
-		level, err := reader.ReadByte()
-		if err != nil {
-			break
-		}
-		nameLen, err := reader.ReadUint32()
-		if err != nil {
-			break
-		}
-		name, err := reader.ReadStringUTF8(int(nameLen))
-		if err != nil {
-			break
-		}
-		objectID, err := reader.ReadUint32()
-		if err != nil {
-			break
-		}
-		entries = append(entries, WhoEntry{
-			Name:     name,
-			Race:     race,
-			Class:    class,
-			Level:    level,
-			ObjectID: objectID,
-		})
+		entries = append(entries, e)
 	}
-
-	gs.WhoList = entries
-	log.Printf("WhoList: %d players online", len(entries))
-}
-
-func (gs *GameState) handleBuddyListEntry(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 12 {
-		return
-	}
-
-	if !gs.tryParseLFGEntry(data) {
-		// Fallback: log as buddy list entry
-		strs := extractUTF16Strings(data)
-		for _, s := range strs {
-			log.Printf("BuddyListEntry: %s", s)
-		}
-	}
-}
-
-// tryParseLFGEntry attempts to parse a 0x03D5 message as an LFG group finder entry.
-// Returns true if parsing succeeded.
-func (gs *GameState) tryParseLFGEntry(data []byte) bool {
-	// Format: varint(charID) + int32(nameLen) + ascii(name) + level + classZigzag + zone + guildFlag + int32(guildChars) [+ UTF-16 guild]
-	reader := buffer.NewReader(data[2:]) // skip opcode
-	charID, err := reader.Read7BitEncodedUInt64()
-	if err != nil {
-		return false
-	}
-	nameLen, err := reader.ReadInt32()
-	if err != nil || nameLen <= 0 || nameLen > 40 {
-		return false
-	}
-	nameBytes := make([]byte, nameLen)
-	for i := int32(0); i < nameLen; i++ {
-		b, err := reader.ReadByte()
-		if err != nil {
-			return false
-		}
-		nameBytes[i] = b
-	}
-	name := string(nameBytes)
-
-	levelByte, err := reader.ReadByte()
-	if err != nil {
-		return false
-	}
-	classRaw, err := reader.ReadByte()
-	if err != nil {
-		return false
-	}
-	cls := byte((int64(classRaw) >> 1) ^ -(int64(classRaw) & 1))
-
-	zoneByte, err := reader.ReadByte()
-	if err != nil {
-		return false
-	}
-	guildFlag, err := reader.ReadByte()
-	if err != nil {
-		return false
-	}
-	guildChars, err := reader.ReadInt32()
-	if err != nil {
-		return false
-	}
-
-	guildName := ""
-	if guildFlag != 0 && guildChars > 0 && guildChars < 200 {
-		u16 := make([]uint16, guildChars)
-		for i := int32(0); i < guildChars; i++ {
-			lo, err := reader.ReadByte()
-			if err != nil {
-				break
-			}
-			hi, err := reader.ReadByte()
-			if err != nil {
-				break
-			}
-			u16[i] = uint16(lo) | uint16(hi)<<8
-		}
-		guildName = string(utf16.Decode(u16))
-	}
-
-	entry := LFGEntry{
-		CharID:    charID,
-		Name:      name,
-		Level:     levelByte,
-		Class:     cls,
-		Zone:      zoneByte,
-		GuildName: guildName,
-	}
-
-	// Deduplicate by charID
-	found := false
-	for i, e := range gs.LFGList {
-		if e.CharID == charID {
-			gs.LFGList[i] = entry
-			found = true
-			break
-		}
-	}
-	if !found {
-		gs.LFGList = append(gs.LFGList, entry)
-	}
-
-	if guildName != "" {
-		log.Printf("LFG: %s Lv%d class=%d zone=0x%02X guild=%q", name, levelByte, cls, zoneByte, guildName)
+	if token != gs.WhoToken || gs.WhoList == nil {
+		gs.WhoList = entries
 	} else {
-		log.Printf("LFG: %s Lv%d class=%d zone=0x%02X", name, levelByte, cls, zoneByte)
+		gs.WhoList = append(gs.WhoList, entries...)
 	}
-	return true
+	gs.WhoToken = token
+	log.Printf("WhoList: token %d, %d players (%d listed)", token, len(entries), len(gs.WhoList))
 }
 
-// handleCollectionRemove handles opcode 0x03D6.
-// PS2: reads zigzag varint key, searches binary tree at entity+0x2C70, removes entry.
-// Sandstorm sends this as buddy online/offline (charID + status byte).
-// Dual-purpose: PS2 uses it for data collection removal, Sandstorm for buddy notifications.
+// handleBuddyListEntry is 0x03D5: one VIBuddy, put into the buddy map by id
+// (new or replacing). The record is VIPlayerRecord's (zigzag id, a name of at
+// most 23 characters, zigzag class, race and level), then the online byte
+// and a wide string of at most 63. Sandstorm's "lfg" list arrives this way,
+// so the client's LFG tab shows the same records.
+func (gs *GameState) handleBuddyListEntry(msg *protocol.Message) {
+	s := newSocialStream(msg)
+	var b BuddyEntry
+	b.ID = s.zigzag()
+	b.Name = s.str8(24)
+	b.Class = s.zigzag()
+	b.Race = s.zigzag()
+	b.Level = s.zigzag()
+	b.Online = s.u8() != 0
+	b.Note = s.str16(128)
+	if s.err {
+		log.Printf("BuddyListEntry: short message (%d bytes)", len(msg.Data()))
+		return
+	}
+	gs.socialSetBuddy(b)
+	log.Printf("Buddy: %s id=%d class=%d race=%d level=%d online=%v note=%q",
+		b.Name, b.ID, b.Class, b.Race, b.Level, b.Online, b.Note)
+}
+
+// handleBuddyOnlineStatus is 0x03D6: a zigzag id, erased from the buddy map.
 func (gs *GameState) handleBuddyOnlineStatus(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 7 { // 2 opcode + 4 charID + 1 status
+	s := newSocialStream(msg)
+	id := s.zigzag()
+	if s.err {
 		return
 	}
-	charID := binary.LittleEndian.Uint32(data[2:6])
-	status := data[6]
-	log.Printf("BuddyOnlineStatus: charID=0x%08X status=%d", charID, status)
+	for i, b := range gs.Buddies {
+		if b.ID == id {
+			log.Printf("Buddy: %s (id=%d) removed", b.Name, id)
+			gs.Buddies = append(gs.Buddies[:i], gs.Buddies[i+1:]...)
+			break
+		}
+	}
+	gs.socialMirrorBuddies()
 }
 
-// handleGuildInfo handles Sandstorm opcode 0x0468 — guild info + online player listings.
-// Sub-type 0x01: Guild info (guild name UTF-16 + MOTD UTF-16)
-// Sub-type 0x03: Online player (varint charID + int32 nameLen + ASCII name + trailing bytes)
+// handleGuildInfo is 0x0468, VIClientGuild::Recv0468 (0x00BF0D38): a
+// sub-type byte, then
+//
+//	1  the guild's name and its message of the day, wide (63 and 255 at most)
+//	2  no guild: name, message and members cleared
+//	3  one member, added or replaced (VIGuildMember: the player record, a
+//	   zigzag rank, an online byte)
+//	4  a zigzag id, that member removed
+//	5  a u32 and a wide line of guild chat, in (.25, 1, .8)
+//	6-12, 16  one word-table line (578-583, 1041)
+//	13/14  guild messages shown / hidden, with 647 / 648
+//	15  two names, "%s has added %s to the guild." (717)
 func (gs *GameState) handleGuildInfo(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	// data[0:2] = opcode 0x0468
-	subType := data[2]
-	reader := buffer.NewReader(data[3:])
-
-	switch subType {
-	case 0x01:
-		// Guild info: int32(guildNameLen) + UTF-16(guildName) + int32(motdLen) + UTF-16(motd)
-		nameLen, err := reader.ReadInt32()
-		if err != nil || nameLen <= 0 || nameLen > 200 {
+	s := newSocialStream(msg)
+	sub := s.u8()
+	switch sub {
+	case 1:
+		name := s.str16(128)
+		motd := s.str16(512)
+		if s.err {
 			return
 		}
-		guildName, _ := reader.ReadStringUnicode(int(nameLen))
-		motdLen, err := reader.ReadInt32()
-		if err != nil || motdLen < 0 {
-			return
-		}
-		motd := ""
-		if motdLen > 0 && motdLen < 1000 {
-			motd, _ = reader.ReadStringUnicode(int(motdLen))
-		}
-		log.Printf("GuildInfo: guild=%q motd=%q", guildName, motd)
-		gs.GuildName = guildName
+		gs.InGuild = true
+		gs.GuildName = name
 		gs.GuildMOTD = motd
-
-		// Add MOTD to chat log if non-empty
+		log.Printf("GuildInfo: guild=%q motd=%q", name, motd)
+		// The PS2 shows the message of the day in its guild window; this
+		// client's guild tab reads the guild's chat lines.
 		if motd != "" {
-			gs.ChatLog = append(gs.ChatLog, ChatMessage{
-				Text:    fmt.Sprintf("[Guild MOTD] %s: %s", guildName, motd),
-				Channel: ChatGuild,
-			})
+			gs.socialLine(fmt.Sprintf("[Guild MOTD] %s: %s", name, motd), ChatGuild, socialGuild)
 		}
-
-	case 0x03:
-		// Online player: varint(charID) + int32(nameLen) + ASCII(name) + 5 trailing bytes
-		charID, _ := reader.Read7BitEncodedInt64()
-		nameLen, err := reader.ReadInt32()
-		if err != nil || nameLen <= 0 || nameLen > 50 {
-			return
-		}
-		name, _ := reader.ReadStringUTF8(int(nameLen))
-		// Remaining bytes: level, race/class info
-		remaining := reader.Remaining()
-		var trailHex string
-		if remaining > 0 {
-			trail, _ := reader.ReadBytes(remaining)
-			trailHex = fmt.Sprintf("%X", trail)
-		}
-		log.Printf("GuildInfo: player=%q charID=%d trailing=%s", name, charID, trailHex)
-
-	case 0x02:
-		// PS2 sub-type 2: Clear guild — set hasGuild=0, clear name+MOTD+members
-		log.Printf("GuildInfo: sub=2 CLEAR GUILD")
+	case 2:
+		gs.InGuild = false
 		gs.GuildName = ""
 		gs.GuildMOTD = ""
 		gs.GuildMembers = nil
-		gs.GuildLeader = false
-
-	case 0x04:
-		// PS2 sub-type 4: Member remove — zigzag memberID → remove from list
-		memberID, _ := reader.Read7BitEncodedInt64()
-		log.Printf("GuildInfo: sub=4 MEMBER_REMOVE id=%d", memberID)
-		// Remove from member list
+		log.Printf("GuildInfo: no guild")
+	case 3:
+		var m GuildMember
+		m.CharID = int64(s.zigzag())
+		m.Name = s.str8(24)
+		m.Class = int(s.zigzag())
+		m.Race = int(s.zigzag())
+		m.Level = int(s.zigzag())
+		m.Rank = int(s.zigzag())
+		m.Online = s.u8() != 0
+		if s.err {
+			log.Printf("GuildInfo: short member record (%d bytes)", len(msg.Data()))
+			return
+		}
+		gs.socialSetGuildMember(m)
+	case 4:
+		id := int64(s.zigzag())
 		for i, m := range gs.GuildMembers {
-			if m.CharID == memberID {
+			if m.CharID == id {
 				gs.GuildMembers = append(gs.GuildMembers[:i], gs.GuildMembers[i+1:]...)
 				break
 			}
 		}
-
-	case 0x05:
-		// PS2 sub-type 5: Guild chat — uint32(senderID) + blob(0x200 message)
-		if reader.Remaining() < 4 {
+	case 5:
+		s.u32()
+		text := s.str16(512)
+		if s.err {
 			return
 		}
-		senderID, _ := reader.ReadUint32()
-		msgText := ""
-		if reader.Remaining() > 0 {
-			remaining := reader.Remaining()
-			if remaining > 512 {
-				remaining = 512
-			}
-			msgBytes, _ := reader.ReadBytes(remaining)
-			msgText = decodeUTF16LE(msgBytes)
-		}
-		senderName := gs.resolveObjectName(senderID)
-		log.Printf("GuildChat: sender=0x%08X(%s) msg=%q", senderID, senderName, msgText)
-		if msgText != "" {
-			gs.addChatMessage(fmt.Sprintf("[Guild] %s: %s", senderName, msgText), ChatGuild)
-		}
-
-	case 0x06:
-		gs.addChatMessage("You have been promoted.", ChatGuild)
-	case 0x07, 0x08:
-		gs.addChatMessage("Guild rank changed.", ChatGuild)
-	case 0x09:
-		gs.addChatMessage("You have been demoted.", ChatGuild)
-	case 0x0A, 0x0B, 0x0C:
-		gs.addChatMessage("Guild notification.", ChatGuild)
-	case 0x0D:
-		// PS2: set guildLeader = 1
-		gs.GuildLeader = true
-		gs.addChatMessage("You are now the guild leader.", ChatGuild)
-	case 0x0E:
-		// PS2: set guildLeader = 0
-		gs.GuildLeader = false
-		gs.addChatMessage("Guild leadership transferred.", ChatGuild)
-	case 0x10:
-		gs.addChatMessage("Guild notification.", ChatGuild)
-
+		log.Printf("GuildChat: %s", text)
+		gs.socialLine(text, ChatGuild, socialGuild)
+	case 6, 7, 8, 9, 10, 11, 12, 16:
+		word := map[byte]int{6: 578, 7: 579, 8: 579, 9: 580, 10: 581, 11: 582, 12: 583, 16: 1041}[sub]
+		gs.socialLine(gs.socialWord(word), ChatGuild, socialWhite)
+	case 13:
+		gs.GuildChatVisible = true
+		gs.socialLine(gs.socialWord(647), ChatGuild, socialWhite)
+	case 14:
+		gs.GuildChatVisible = false
+		gs.socialLine(gs.socialWord(648), ChatGuild, socialWhite)
+	case 15:
+		who := s.str8(24)
+		added := s.str8(24)
+		gs.socialLine(socialFormat(gs.socialWord(717), who, added), ChatGuild, socialWhite)
 	default:
-		log.Printf("GuildInfo: unknown sub-type 0x%02X len=%d", subType, len(data))
+		log.Printf("GuildInfo: sub-type %d ignored (%d bytes)", sub, len(msg.Data()))
 	}
 }
 
