@@ -917,8 +917,8 @@ func (c *Client) reportDump(now time.Time) string {
 
 	f("")
 	f("[settings]")
-	f("max zoom %.1f, camera sensitivity %.2f, invert pitch %v, camera collision %v",
-		c.camMaxDist, c.camSensitivity, c.invertPitch, c.camCollision)
+	f("max zoom %.1f, camera sensitivity %.2f, invert pitch %v, camera collision %v, fixed follow %v, free pitch %v, remember zoom %v",
+		c.camMaxDist, c.camSensitivity, c.invertPitch, c.camCollision, c.camFixedFollow, c.camFreePitch, c.camRememberZoom)
 	f("volume master %.2f, sfx %.2f, bgm %.2f (muted %v), show fps %v",
 		c.masterVolume, c.sfxVolume, c.bgmVolume, c.bgmMuted, c.showFPS)
 	if c.isoPath != "" {
@@ -966,8 +966,9 @@ func (c *Client) reportDumpWorld(f func(string, ...any), gs *game.GameState) {
 	f("hp %d/%d, power %d/%d, dead %v, breath timer %.1f", p.HPInt, p.MaxHPInt, p.PowerInt, p.MaxPowerInt, p.Dead, c.breathTimer)
 	f("speed %.2f (server %.3f), velocity y %.2f, on ground %v, water %d, liquid 0x%X, auto-run %v, follow %v",
 		c.currentSpeed, p.Speed, c.velocityY, c.onGround, c.waterState, c.liquidFlags, c.autoRun, c.followTarget)
-	f("camera: mode %d, angle %.3f, pitch %.3f, distance %.2f, collision %.2f",
-		c.camMode, c.camAngle, c.camPitch, c.camDist, c.camCollDist)
+	f("camera: mode %d (%s), angle %.3f, pitch %.3f, distance %.2f (%.2f..%.2f), flags 0x%X, walker pitch %.3f, turn rate %.3f, panel %v, dead %v",
+		c.wcam.mode, cameraModeName(c.wcam.mode), c.camAngle, c.camPitch, c.camDist, c.wcam.minOrbitDist, c.wcam.maxOrbitDist,
+		c.wcam.flags, c.wcam.pitch, c.wcam.turnRate, c.wcam.panelCam, c.wcam.dead)
 	if c.weather != nil {
 		f("game hour %.2f, weather %v -> %v, intensity %.2f", gs.GameHour(), c.weather.Type, c.weather.TargetType, c.weather.Intensity)
 	}

@@ -31,7 +31,13 @@ type loginConfig struct {
 	MaxZoom        float32 `json:"max_zoom,omitempty"`
 	CamSensitivity float32 `json:"cam_sensitivity,omitempty"`
 	InvertPitch    bool    `json:"invert_pitch,omitempty"`
-	CamCollision   bool    `json:"cam_collision,omitempty"`
+	// CamNoCollision turns the camera's world sweep off (CLIENT always
+	// sweeps); the old cam_collision, off by default, is no longer read.
+	CamNoCollision  bool `json:"cam_no_collision,omitempty"`
+	CamFixedFollow  bool `json:"cam_fixed_follow,omitempty"`  // VIGameOptions::m_x06: third person is the fixed follow
+	CamFreePitch    bool `json:"cam_free_pitch,omitempty"`    // Go extra: W/S pitch the third-person orbit
+	CamRememberZoom bool `json:"cam_remember_zoom,omitempty"` // Go extra: keep the saved zoom at login
+	CamNoPanelView  bool `json:"cam_no_panel_view,omitempty"` // no ApplyRaceCamera while the menu is open
 	MasterVolume float32 `json:"master_volume,omitempty"`
 	SFXVolume    float32 `json:"sfx_volume,omitempty"`
 	BGMVolume    float32 `json:"bgm_volume,omitempty"`

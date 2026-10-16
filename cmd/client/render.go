@@ -133,9 +133,11 @@ func (c *Client) drawWorld() {
 		}
 	}
 
-	// PS2 VIWalkCamera orbit -- distance=0 naturally becomes first-person.
+	// VIWalkCamera::SetCamera (walkcamera.go). The player's own model is
+	// hidden in first person and when the fixed follow's eye is in its head
+	// (func_00BC6500).
 	camera := c.currentCamera(p)
-	firstPerson := c.camDist < 0.1
+	firstPerson := c.cameraHidesPlayer(p, camera)
 
 	// VICameraEffect: a spell's shake bobs the eye and the look direction
 	// vertically (it only ever runs for the local player).
@@ -1027,8 +1029,7 @@ func (c *Client) drawWorld() {
 
 	// Camera mode HUD (bottom center, same style as POS display)
 	{
-		modeNames := [3]string{"Tether", "Follow", "First Person"}
-		modeText := fmt.Sprintf("Y/R3 Reset/Default  U/Select Camera: %s", modeNames[c.camMode])
+		modeText := fmt.Sprintf("R3 Reset  U/Select First/Third Person  Camera: %s", cameraModeName(c.wcam.mode))
 		cx := int32(rl.GetScreenWidth()) - c.measureText(modeText, 11) - 8
 		cy := int32(rl.GetScreenHeight()) - 18
 		c.drawText(modeText, cx, cy, 11, rl.Color{R: 200, G: 200, B: 200, A: 180})

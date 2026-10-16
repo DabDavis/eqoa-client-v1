@@ -22,7 +22,8 @@ import (
 //	./client --offline [--iso PATH] [--char NAME] [--pos X,Y,Z] [--facing DEG]
 //	         [--hour H] [--world N] [--weather TYPE] [--npc MODEL[:dead]]...
 //	         [--npc-dist D] [--spell EFFECT] [--cam DIST,PITCHDEG,ANGLEDEG]
-//	         [--size WxH] [--shot FILE.png [--shot-wait S] [--shot-frames N]]
+//	         [--race N[:f]] [--camstyle N] [--menu] [--size WxH]
+//	         [--shot FILE.png [--shot-wait S] [--shot-frames N]]
 //	         [assetsDir]
 //
 // --char loads ~/.config/eqoa/saves/NAME.json (position, camera, appearance,
@@ -55,6 +56,10 @@ type offlineConfig struct {
 	npcDist    float32
 	spell      uint32
 	cam        *[3]float32
+	race       int // --race: -1, or the race (0..9) of the default character's model
+	female     bool
+	camStyle   int  // --camstyle: -1, or VIClient::SetCameraStyle's style at entry
+	menu       bool // --menu: the main menu open, so ApplyRaceCamera's camera
 	shot       string
 	shotWait   float32
 	shotFrames int
@@ -77,7 +82,7 @@ var offlineDefaultPos = [3]float32{25305.6, 54.125, 15748.4}
 // parseOfflineArgs takes the offline options out of args. It returns nil when
 // --offline is absent, and the remaining (positional) arguments either way.
 func parseOfflineArgs(args []string) (*offlineConfig, []string, error) {
-	cfg := &offlineConfig{world: 0, weather: -1, shotWait: 1, shotFrames: 10, npcDist: 3}
+	cfg := &offlineConfig{world: 0, weather: -1, race: -1, camStyle: -1, shotWait: 1, shotFrames: 10, npcDist: 3}
 	on := false
 	var rest []string
 	next := func(i *int, name string) (string, error) {
@@ -114,7 +119,10 @@ func parseOfflineArgs(args []string) (*offlineConfig, []string, error) {
 		case "--offline":
 			on = true
 			continue
-		case "--iso", "--size", "--char", "--pos", "--facing", "--hour", "--world", "--weather", "--npc", "--npc-dist", "--spell", "--cam", "--shot", "--shot-wait", "--shot-frames":
+		case "--menu":
+			cfg.menu = true
+			continue
+		case "--iso", "--size", "--char", "--pos", "--facing", "--hour", "--world", "--weather", "--npc", "--npc-dist", "--spell", "--cam", "--race", "--camstyle", "--shot", "--shot-wait", "--shot-frames":
 			if v, err = next(&i, a); err != nil {
 				return nil, nil, err
 			}
@@ -182,6 +190,16 @@ func parseOfflineArgs(args []string) (*offlineConfig, []string, error) {
 				return nil, nil, err
 			}
 			cfg.cam = &[3]float32{f[0], f[1] * math.Pi / 180, f[2] * math.Pi / 180}
+		case "--race":
+			spec, female := strings.CutSuffix(v, ":f")
+			if cfg.race, err = strconv.Atoi(spec); err != nil || cfg.race < 0 || cfg.race > 9 {
+				return nil, nil, fmt.Errorf("--race %q: want 0..9, :f for female", v)
+			}
+			cfg.female = female
+		case "--camstyle":
+			if cfg.camStyle, err = strconv.Atoi(v); err != nil {
+				return nil, nil, err
+			}
 		case "--shot":
 			cfg.shot = v
 		case "--shot-wait":
@@ -247,6 +265,14 @@ func (c *Client) newOfflineEngine() *game.Engine {
 				s.ChestTint, s.BracerTint, s.GlovesTint, s.LegsTint, s.BootsTint, s.HelmTint, s.RobeTint
 		}
 	}
+	if o.race >= 0 {
+		p.Race = byte(o.race)
+		p.Sex = 0
+		if o.female {
+			p.Sex = 1
+		}
+		p.ModelID = uint32(createModelID(o.race, int(p.Sex)))
+	}
 	if p.Sex == 0 {
 		p.Sex = game.SexFromModelID(p.ModelID)
 	}
@@ -297,8 +323,21 @@ func (c *Client) offlineEnterWorld() {
 	if o.world != int(c.currentWorld) {
 		c.switchWorldTerrain(byte(o.world))
 	}
+	if o.camStyle >= 0 {
+		c.setCameraStyle(o.camStyle)
+		c.saveCameraPreset(&c.wcam.saved)
+	}
+	if o.menu {
+		c.menuOpen = true
+	}
 	if o.cam != nil {
-		c.camDist, c.camPitch, c.camAngle = o.cam[0], o.cam[1], o.cam[2]
+		// The walk camera's own setters, so the drag and the eye agree; free
+		// pitch keeps style 3 from snapping the given pitch back.
+		c.camFreePitch = true
+		c.wcam.maxOrbitDist = max(c.wcam.maxOrbitDist, o.cam[0])
+		c.setOrbitDistance(o.cam[0])
+		c.setOrbitPitch(o.cam[1])
+		c.setOrbitAngle(o.cam[2])
 	}
 	if o.weather >= 0 && c.weather != nil {
 		c.weather.SetWeather(game.WeatherType(o.weather), true)
