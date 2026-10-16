@@ -8,8 +8,12 @@ import (
 )
 
 // ambientFadeMs is VISceneSoundTrack::m_p10: a track change waits this long
-// after the last one, and a track fades in or out over the same 15 s.
+// after the last one, and a track fades in or out over the same 15,000 ticks.
 const ambientFadeMs = 15000
+
+// ps2TicksPerSecond is VITimer::GetTime's rate (SUPPORT vitimer.cpp: 2 a
+// compare interrupt at 9.216 MHz / 18,750), which VIScene::GetTime runs at.
+const ps2TicksPerSecond = 983.04
 
 // ambientGain is this client's mix level for the ambient XMs, under the
 // level SetSoundTrack computes (which peaks at 1).
@@ -198,7 +202,9 @@ func (s *System) SetAmbient(track int32, tracks map[int32]*AmbientTrack, rain, o
 	if s.ambStart.IsZero() {
 		s.ambStart = time.Now()
 	}
-	now := time.Since(s.ambStart).Milliseconds()
+	// The scene's clock is VITimer's: 983.04 ticks a real second, so the
+	// 15,000 of a fade or a hold-off are 15.26 s.
+	now := int64(time.Since(s.ambStart).Seconds() * ps2TicksPerSecond)
 	ready := func(id int32) bool { t, ok := tracks[id]; return ok && t != nil && len(t.PCM) > 0 }
 	act, moved := s.ambMix.Step(track, ready, now, rain, outdoors, inLiquid)
 	if moved {

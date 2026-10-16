@@ -429,11 +429,16 @@ type GameState struct {
 	AdminMenuType byte  // menu type from server
 	AdminMenuCode int64 // menu code from server
 
-	// Time of day (from OpcodeTime 0x0013)
-	TimeEpoch1   uint64    // server epoch1 (ms)
-	TimeEpoch2   uint64    // server epoch2 (ms) — used for day/night cycle
-	TimeReceived time.Time // wall clock when received
-	TimeValid    bool      // true after first OpcodeTime
+	// Time of day (from OpcodeTime 0x0013): its two times, and the two
+	// VISyncTime clocks SetTime feeds them to (+0x2EC30, +0x2EC50).
+	TimeEpoch1 uint64 // server epoch1
+	TimeEpoch2 uint64 // server epoch2 — the day/night cycle's
+	TimeValid  bool   // true after first OpcodeTime
+	clockA     syncTime
+	clockB     syncTime
+
+	// PS2Clock, when set, replaces VITimer::GetTime (tests pin the clock).
+	PS2Clock func() int64
 
 	// Buff state (from channel 0x43, variable slot count)
 	Buffs []BuffSlot // active buffs/debuffs (server sends variable count)
@@ -1283,39 +1288,43 @@ func (gs *GameState) handleTime(msg *protocol.Message) {
 		epoch2, _ := reader.ReadUint64()
 		gs.TimeEpoch1 = epoch1
 		gs.TimeEpoch2 = epoch2
-		gs.TimeReceived = time.Now()
-		gs.TimeValid = true
+		gs.setTime(int64(epoch1), int64(epoch2))
 		log.Printf("Time: epoch1=%d epoch2=%d (delta=%dms)", epoch1, epoch2, epoch2-epoch1)
 	}
 }
 
-// GameDayMs is the length of a game day in real milliseconds: CLIENT
-// func_00BC7B70 takes the clock modulo 3,600,000, so a day lasts 60 minutes.
+// setTime is VIClient::SetTime (0x00BD0508's 0x0013, [V]): each time into its
+// VISyncTime against the frame clock.
+func (gs *GameState) setTime(a, b int64) {
+	now := gs.ps2Now()
+	gs.clockA.Set(a, now)
+	gs.clockB.Set(b, now)
+	gs.TimeValid = true
+}
+
+// GameDayMs is the length of a game day in VITimer ticks: CLIENT's
+// UpdateTimeOfDay takes the clock modulo 3,600,000, which at 983.04 ticks a
+// second is 61.04 real minutes.
 const GameDayMs = 3_600_000
 
 // GameHour returns the current game hour (0.0-24.0) based on server time.
 // Returns 12.0 (noon) if no time has been received yet.
 //
-// CLIENT func_00BC7B70 computes it every frame as
-// (VISyncTime::Get(+0x2EC50) mod 3,600,000) / 3,600,000 * 24 and hands it to
-// VIScene::SetTimeOfDay. The Time handler (func_00BD0508) syncs the SECOND
-// timestamp into +0x2EC50, and VISyncTime::Get advances it at 1:1 from the
-// moment it was synced, so the phase comes from epoch2 alone. The first
-// timestamp (+0x2EC30) plays no part in the hour.
+// VIClient::UpdateTimeOfDay (0x00BC7B70, [V]) computes it every frame as
+// (m_clockB.GetTime(now) mod 3,600,000) / 3,600,000 × 24 and hands it to
+// VIScene::SetTimeOfDay. m_clockB holds the 0x0013's SECOND time; the first
+// (m_clockA) plays no part in the hour. The clock runs in VITimer ticks, and
+// a later 0x0013 is blended in over a minute rather than jumped to.
 func (gs *GameState) GameHour() float32 {
 	if !gs.TimeValid {
 		return 12.0
 	}
-	elapsedMs := time.Since(gs.TimeReceived).Milliseconds()
-	if elapsedMs < 0 {
-		elapsedMs = 0
-	}
-	ms := (gs.TimeEpoch2 + uint64(elapsedMs)) % GameDayMs
+	ms := gs.clockB.Get(gs.ps2Now()) % GameDayMs
 	return float32(ms) / GameDayMs * 24
 }
 
 // SetGameHour pins the clock so GameHour reads h now and advances from there,
-// as if a Time opcode had just carried that hour. Offline mode uses it.
+// as if the first Time opcode had just carried that hour. Offline mode uses it.
 func (gs *GameState) SetGameHour(h float32) {
 	h = float32(math.Mod(float64(h), 24))
 	if h < 0 {
@@ -1323,8 +1332,8 @@ func (gs *GameState) SetGameHour(h float32) {
 	}
 	gs.TimeEpoch2 = uint64(float64(h) / 24 * GameDayMs)
 	gs.TimeEpoch1 = gs.TimeEpoch2
-	gs.TimeReceived = time.Now()
-	gs.TimeValid = true
+	gs.clockA, gs.clockB = syncTime{}, syncTime{}
+	gs.setTime(int64(gs.TimeEpoch1), int64(gs.TimeEpoch2))
 }
 
 func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
