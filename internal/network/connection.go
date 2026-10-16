@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"net"
@@ -106,6 +107,19 @@ type Connection struct {
 
 	// Outgoing state channel sequence counters (per channel)
 	sendStateSeq map[byte]uint16
+
+	// The 0x40 channel's outgoing side, as connection_send_state keeps a
+	// state channel (connection.cpp:1181): ONE message at a time, either
+	// pending (queued, not yet written: m_ucWhere 1) or outstanding (written
+	// and not yet acked: 2), plus the last one queued or written, which a new
+	// one is compared with (iSame). The server's ack of the channel is
+	// m_usTxAck (connection_record_state_acks).
+	cuPending   *protocol.Message
+	cuSent      *protocol.Message
+	cuSentTime  time.Time
+	cuSentFlush uint16
+	cuLast      []byte
+	cuAck       uint16
 
 	// (prevClientUpdate/prevClientUpdateSeq removed — always send keyframes now)
 
@@ -215,6 +229,7 @@ type ConnectionMetrics struct {
 	ArrivalGaps      uint32 // Forward arrivals with gap > 1
 	Retransmits      uint32 // Reliable messages retransmitted
 	FragmentsExpired uint32 // Orphaned fragment buffers cleaned up
+	StateRetransmits uint32 // 0x40 states retransmitted (unacked past the RTO, or lost)
 }
 
 // LobbySession tracks the pre-promotion game server session for ACK maintenance.
@@ -397,32 +412,57 @@ func (c *Connection) QueueUnreliable(opcode protocol.GameOpcode, data []byte) {
 	c.mu.Unlock()
 }
 
-// QueueClientUpdate queues an outgoing state channel 0x40 message (position update).
-// Always sends keyframes (refnum=0, raw data) — no XOR delta.
+// QueueClientUpdate sends the player's own state on channel 0x40, the way
+// connection_send_state (connection.cpp:1181) does:
 //
-// PS2 uses XOR delta (refnum=1) for compression, but this creates a fragile chain:
-// if ANY single UDP packet is lost, the server's SegmentBody.read() hits
-// "refnum does not exist" → return false, rejecting the ENTIRE packet body.
-// This kills ALL message processing (including FlushAck, GuaranteedAck, StateAcks)
-// for up to 29 consecutive packets until the next keyframe. The server's unacked
-// messages pile up for 60 seconds → Connection.java terminate(0).
+//   - a state byte-identical to the last one queued or written is NOT sent
+//     (iSame), so an idle player sends nothing at all -- in the PS2 captures
+//     no two consecutive 0x40s are equal, and ps2_sandstorm.pcap has a 23 s
+//     gap with none while the server went on sending entities;
+//   - a state queued while an earlier one is still waiting to be written
+//     REPLACES it (vlist_replace), so a flush carries one 0x40, the newest;
+//   - a new state supersedes one written and not yet acked, which is then
+//     not retransmitted (case 2); one that stays unacked is retransmitted
+//     under its own sequence, like a guaranteed message (Flush).
 //
-// Keyframes avoid this entirely. The bandwidth cost is ~200 bytes/s extra (41 raw
-// bytes RLE'd vs ~5 bytes for idle XOR delta, at 3.3 packets/s). Negligible.
+// The data always goes out whole (refnum 0, raw data), not as the PS2's XOR
+// delta: a delta needs its reference, and if ANY single UDP packet is lost
+// the server's SegmentBody.read() hits "refnum does not exist" and rejects
+// the ENTIRE packet body, FlushAck, GuaranteedAck and StateAcks included, for
+// up to 29 packets until the next keyframe.
 func (c *Connection) QueueClientUpdate(data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cuLast != nil && bytes.Equal(c.cuLast, data) {
+		return
+	}
+	c.cuLast = append(c.cuLast[:0], data...)
+	if c.cuPending != nil {
+		c.cuPending.SetData(data)
+		return
+	}
+
 	msg := &protocol.Message{}
 	msg.Type = protocol.MessageTypeClientUpdate // 0x40
-
-	c.mu.Lock()
 	c.sendStateSeq[0x40]++
 	msg.Sequence = c.sendStateSeq[0x40]
-
-	// Always send keyframe (raw, refnum=0). No XOR delta chain to break.
 	msg.SetData(data)
 	msg.XORByte = 0
 
+	c.cuSent = nil
+	c.cuPending = msg
 	c.outgoing = append(c.outgoing, msg)
-	c.mu.Unlock()
+}
+
+// resetClientUpdate forgets the 0x40 channel's outgoing state, for a new
+// connection. Must be called with c.mu held.
+func (c *Connection) resetClientUpdate() {
+	c.cuPending = nil
+	c.cuSent = nil
+	c.cuSentTime = time.Time{}
+	c.cuSentFlush = 0
+	c.cuLast = nil
+	c.cuAck = 0
 }
 
 // RecvLoop runs in a goroutine, reading UDP packets and pushing them to the Incoming channel.
@@ -639,6 +679,7 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 			c.stateRx = make(map[byte]uint16)
 			c.stateRxFlag = make(map[byte]byte)
 			c.sendStateSeq = make(map[byte]uint16)
+			c.resetClientUpdate()
 
 			c.stateBases = make(map[byte]map[uint16][]byte)
 			// Reset message type tracking for promoted session
@@ -821,6 +862,20 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 		}
 	}
 
+	// connection_record_state_acks (connection.cpp:2374) for the one channel
+	// we send on: an ack of the outstanding 0x40's own sequence retires it.
+	if arrivalValid {
+		for _, a := range body.StateAcks {
+			if a.Channel != byte(protocol.MessageTypeClientUpdate) || int16(a.Ack-c.cuAck) <= 0 {
+				continue
+			}
+			if c.cuSent != nil && c.cuSent.Sequence == a.Ack {
+				c.cuSent = nil
+			}
+			c.cuAck = a.Ack
+		}
+	}
+
 	// Session ack - server acknowledges our instance.
 	// PS2 DRDP: body flag 0x40 carries instance_local from the remote side.
 	// When the server sends this, it contains the server's own instance.
@@ -864,9 +919,9 @@ func (c *Connection) ProcessIncoming(pkt *ReceivedPacket) []*protocol.Message {
 		// Log summary every 50 arrivals
 		if int(body.ArrivalNumber)-c.lastSummary >= 50 {
 			c.lastSummary = int(body.ArrivalNumber)
-			log.Printf("=== MSG SUMMARY at arrival %d: totalPkts=%d totalMsgs=%d typeCounts=%v serverAckedOurs=%d retransmits=%d gaps=%d fragExpired=%d dropped=%d ===",
+			log.Printf("=== MSG SUMMARY at arrival %d: totalPkts=%d totalMsgs=%d typeCounts=%v serverAckedOurs=%d retransmits=%d stateRetransmits=%d gaps=%d fragExpired=%d dropped=%d ===",
 				body.ArrivalNumber, c.totalPktsIn, c.totalMsgsIn, c.msgTypeCounts, c.serverAckedReliable,
-				c.metrics.Retransmits, c.metrics.ArrivalGaps, c.metrics.FragmentsExpired, c.metrics.PacketsDropped)
+				c.metrics.Retransmits, c.metrics.StateRetransmits, c.metrics.ArrivalGaps, c.metrics.FragmentsExpired, c.metrics.PacketsDropped)
 		}
 	}
 
@@ -1394,6 +1449,19 @@ func (c *Connection) Flush() {
 		}
 	}
 
+	// The outstanding 0x40 goes again, under its own sequence, by the rule a
+	// guaranteed message follows: past the RTO, or at once when the server
+	// has acked a later flush than the one that carried it.
+	if c.cuSent != nil && c.cuPending == nil {
+		lost := !c.serverShort && int16(c.flushAckMax-c.cuSentFlush) > 0
+		if time.Since(c.cuSentTime) >= c.rto || lost {
+			c.cuPending = c.cuSent
+			c.cuSent = nil
+			c.outgoing = append(c.outgoing, c.cuPending)
+			c.metrics.StateRetransmits++
+		}
+	}
+
 	// PS2 connection_flush "nothing to send" check (#28):
 	// If no pending ACK bits AND no pending messages AND no SessionAck → skip.
 	// State ACKs are piggybacked onto packets sent for other reasons (not standalone).
@@ -1450,6 +1518,14 @@ func (c *Connection) Flush() {
 	// Post-build bookkeeping (still under lock)
 	now := time.Now()
 	sentArrival := c.sendArrival - 1          // BuildPacket incremented after writing
+	for _, msg := range msgs {
+		if msg == c.cuPending {
+			c.cuSent = msg
+			c.cuSentTime = now
+			c.cuSentFlush = sentArrival
+			c.cuPending = nil
+		}
+	}
 	c.flushSendTimes[sentArrival&0x3FF] = now // #21: store per-seq send timestamp for RTT
 	// PS2 connection_flush line 1292: conn.flags &= 0xfff0 — clears bits 0-3 atomically.
 	c.arrivalDirty = false
@@ -1655,6 +1731,7 @@ func (c *Connection) SwitchToGameServer(endpointID uint16) {
 	c.unackedFlush = make(map[uint16]uint16)
 	c.outgoing = nil
 	// A new connection: every state channel starts again at rx 0 with no bases.
+	c.resetClientUpdate()
 	c.stateRx = make(map[byte]uint16)
 	c.stateRxFlag = make(map[byte]byte)
 	c.stateBases = make(map[byte]map[uint16][]byte)
