@@ -145,8 +145,8 @@ func TestSelfIsTheMemoryDumpsSource(t *testing.T) {
 func TestCreatureFieldsAsCLIENTReadsThem(t *testing.T) {
 	gs := routingState(t)
 	m := entityState(1, 0x30, entityTypeCreature, "Merchant Nelly")
-	m[40] = 30   // velocity x
-	m[145] = 0   // +0x259
+	m[40] = 30    // velocity x
+	m[145] = 0    // +0x259
 	m[146] = 0x81 // m_npcFlags low: merchant (1) and not attackable (0x80)
 	feed(gs, 6, m)
 	feed(gs, 6, m) // a first appearance starts at rest; the second reads the velocity

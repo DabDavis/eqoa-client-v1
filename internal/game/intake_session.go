@@ -62,7 +62,6 @@ type SessionIntake struct {
 
 	// AdminLevel is VIClientPart382E8+0x14, which 0x0700 sub-type 35 sets.
 	AdminLevel int32
-
 }
 
 // DisconnectState is VIClient::Disconnect's record of why.
@@ -158,8 +157,6 @@ func psSigned(r *buffer.Reader) (int32, error) {
 }
 
 // ----------------------------------------------------------------- words --
-
-
 
 // ------------------------------------------------------------ disconnect --
 

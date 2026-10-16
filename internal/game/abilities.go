@@ -429,8 +429,6 @@ func (gs *GameState) handleAbilityRemove(msg *protocol.Message) {
 	gs.refreshHotbar()
 }
 
-
-
 // addWordLine is VIWndGame::AddText: one line in the chat window, in a colour.
 func (gs *GameState) addWordLine(text string, r, g, b uint8) {
 	gs.ChatLog = append(gs.ChatLog, ChatMessage{Text: text, Channel: ChatSystem, ColorR: r, ColorG: g, ColorB: b})

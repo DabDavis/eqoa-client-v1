@@ -283,11 +283,9 @@ type SocialState struct {
 
 // --- text ----------------------------------------------------------------
 
-
 // guildCreateCost is the Tunar a guild costs, the word CLIENT formats into
 // string 567 (data_00CD7A50).
 const guildCreateCost = 5000
-
 
 // socialFormat is the part of VIString::snprintf16 the words use: %s and %S
 // take a string, %d and %u a number, %% is a percent sign.
