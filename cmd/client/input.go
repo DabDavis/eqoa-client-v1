@@ -764,8 +764,7 @@ func (c *Client) handleInWorldInput() {
 		if c.onGround {
 			c.engine.VelY = 0
 		}
-		c.engine.StickMagnitude = 254
-		c.engine.AccelState = 0x80
+		c.engine.ForceX, c.engine.ForceZ = c.driveForce(moveX, moveZ, targetSpeed, walkSpeedCap)
 	} else {
 		// No input — decelerate using PS2 exponential damping.
 		c.currentSpeed = c.currentSpeed * decay
@@ -777,8 +776,7 @@ func (c *Client) handleInWorldInput() {
 			c.engine.VelX = 0
 			c.engine.VelY = 0
 			c.engine.VelZ = 0
-			c.engine.StickMagnitude = 0x80
-			c.engine.AccelState = 0x80
+			c.engine.ForceX, c.engine.ForceZ = 0, 0
 		} else {
 			// Still decelerating — continue moving in last direction.
 			speed := c.currentSpeed
@@ -807,8 +805,7 @@ func (c *Client) handleInWorldInput() {
 			if c.onGround {
 				c.engine.VelY = 0
 			}
-			c.engine.StickMagnitude = 0x80
-			c.engine.AccelState = 0x80
+			c.engine.ForceX, c.engine.ForceZ = 0, 0
 		}
 	}
 
@@ -828,37 +825,6 @@ func (c *Client) handleInWorldInput() {
 		p.Facing = facing
 	} else {
 		p.Facing = c.targetFacing
-	}
-
-	// === PS2 0x40 Smoothed Facing + Turn Rate ===
-	// Byte 28: smoothed facing lags behind byte 22 during turns (PS2 pcap: 88% match).
-	// Byte 23: turning input derived from heading change rate.
-	{
-		// Smoothed facing: exponential approach toward current facing.
-		diff := p.Facing - c.engine.SmoothedFacing
-		// Normalize to [-PI, PI]
-		for diff > math.Pi {
-			diff -= 2 * math.Pi
-		}
-		for diff < -math.Pi {
-			diff += 2 * math.Pi
-		}
-		// Lag factor: 0.15 per frame at 30fps, frame-rate independent.
-		lagFactor := float32(1.0 - math.Pow(1.0-0.15, float64(dt)*30.0))
-		c.engine.SmoothedFacing += diff * lagFactor
-
-		// Turn rate: heading change per second for byte 23 encoding.
-		facingDiff := p.Facing - c.engine.PrevFacing
-		for facingDiff > math.Pi {
-			facingDiff -= 2 * math.Pi
-		}
-		for facingDiff < -math.Pi {
-			facingDiff += 2 * math.Pi
-		}
-		if dt > 0.001 {
-			c.engine.TurnRate = facingDiff / dt
-		}
-		c.engine.PrevFacing = p.Facing
 	}
 
 	// GM Noclip: PS2 VIFlyCamera — force-based movement with exponential damping.
@@ -1069,6 +1035,7 @@ func (c *Client) handleInWorldInput() {
 			}
 		}
 	}
+	c.engine.SetWalkState(c.walkFlags(), c.floorY)
 
 afterPhysics:
 

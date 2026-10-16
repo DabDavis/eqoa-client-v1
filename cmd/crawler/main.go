@@ -270,7 +270,7 @@ func (c *Crawler) moveTo(targetX, targetZ float32) {
 		velRatio := c.moveSpeed / dist
 		c.engine.VelX = dx * velRatio
 		c.engine.VelZ = dz * velRatio
-		c.engine.AnimByte = 2 // running animation
+		c.engine.AnimByte = 3 // m_locoState 3, a run (2 is walking backwards)
 
 		// Harvest entities while traveling
 		c.harvestEntities()
@@ -394,7 +394,7 @@ func (c *Crawler) sweepColumn(x, _, startZ, endZ float32) {
 		// Set velocity so server tracks our movement for EntityInRange
 		c.engine.VelX = 0
 		c.engine.VelZ = step / 0.2 // step per tick / tick duration = units per second
-		c.engine.AnimByte = 2       // running
+		c.engine.AnimByte = 3      // m_locoState 3, a run
 
 		// Harvest every tick
 		c.harvestEntities()
