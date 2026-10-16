@@ -337,34 +337,12 @@ func (c *Client) loadWeatherTextures() {
 	c.weather.SetTextures(rain, snow, splash)
 }
 
-// worldESFName maps PS2 world IDs to ESF filenames: the retail table's six.
-var worldESFName = map[byte]string{
-	0: "TUNARIA.ESF",
-	1: "RATHE.ESF",
-	2: "ODUS.ESF",
-	3: "LAVASTM.ESF",
-	4: "PLANESKY.ESF",
-	5: "SECRETS.ESF",
-}
-
-// sandstormWorldESFName is the two worlds Sandstorm's S2 adds to the table
-// (cave 0x000FC900): 6 is data3\Underfoot.esf, which is on no disc (found
-// only if the assets folder has it), and 7 is Secrets again.
-var sandstormWorldESFName = map[byte]string{
-	6: "UNDERFOOT.ESF",
-	7: "SECRETS.ESF",
-}
-
-// worldESF is the ESF a world id loads under the active server's rules.
+// worldESF is the ESF a world id loads: the world table of the session's
+// rules — the patch's when it has one (Sandstorm's S2 adds 6, data3\Underfoot.esf,
+// which is on no disc and is found only if the assets folder has it, and 7,
+// Secrets again), retail's six otherwise.
 func worldESF(worldID byte) (string, bool) {
-	if name, ok := worldESFName[worldID]; ok {
-		return name, true
-	}
-	if models.ActiveRules == models.RulesSandstorm {
-		name, ok := sandstormWorldESFName[worldID]
-		return name, ok
-	}
-	return "", false
+	return models.ActiveRules.WorldESF(worldID)
 }
 
 // switchWorldTerrain unloads the current terrain and loads a new world's ESF.

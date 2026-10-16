@@ -1,17 +1,14 @@
 package network
 
 import (
-	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/des"
 	"encoding/binary"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"time"
 )
 
@@ -161,55 +158,4 @@ func Login(host string, port int, username, password string) (uint32, []byte, er
 	log.Printf("Auth: using AES-256-ECB encrypted password as UDP token (%d bytes)", len(udpToken))
 
 	return accountID, udpToken, nil
-}
-
-// verantPatcher is the XML structure from the patch server.
-type verantPatcher struct {
-	XMLName xml.Name `xml:"VerantPatcher"`
-	Product struct {
-		Name   string `xml:"Name"`
-		Server string `xml:"Server"`
-		Port   string `xml:"Port"`
-	} `xml:"Product"`
-}
-
-// CheckPatch queries the HTTP patch server to get the game server IP.
-func CheckPatch(host string, port int) (string, error) {
-	url := fmt.Sprintf("http://%s:%d/patch/eqoa/eqoa-frontierslive-update.xml.gz", host, port)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", fmt.Errorf("patch request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("patch server returned status %d", resp.StatusCode)
-	}
-
-	// Decompress gzip
-	gz, err := gzip.NewReader(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("gzip decompress failed: %w", err)
-	}
-	defer gz.Close()
-
-	xmlData, err := io.ReadAll(gz)
-	if err != nil {
-		return "", fmt.Errorf("reading patch xml failed: %w", err)
-	}
-
-	var patcher verantPatcher
-	if err := xml.Unmarshal(xmlData, &patcher); err != nil {
-		return "", fmt.Errorf("parsing patch xml failed: %w", err)
-	}
-
-	serverIP := patcher.Product.Server
-	if serverIP == "" {
-		return "", fmt.Errorf("no server IP in patch response")
-	}
-
-	log.Printf("Patch server returned game server IP: %s", serverIP)
-	return serverIP, nil
 }

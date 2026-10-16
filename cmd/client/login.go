@@ -14,7 +14,9 @@ import (
 	"github.com/DabDavis/eqoa-esf-tools/pkg/esf"
 
 	"github.com/eqoa/client/internal/game"
+	"github.com/eqoa/client/internal/models"
 	"github.com/eqoa/client/internal/network"
+	"github.com/eqoa/client/internal/patcher"
 )
 
 // loginConfig holds saved login credentials and display settings.
@@ -55,7 +57,7 @@ type loginConfig struct {
 }
 
 // saveDir is a server's save folder: the stand-in for the PS2 memory card's
-// game folder (network.CardFolder), beside the binary under saves/<server>/.
+// game folder (patcher.CardFolder), beside the binary under saves/<server>/.
 // One per server, because each server's patcher fills its own.
 func saveDir(serverIP string) string {
 	base := "."
@@ -68,7 +70,7 @@ func saveDir(serverIP string) string {
 		}
 		return r
 	}, serverIP)
-	return filepath.Join(base, "saves", server, network.CardFolder)
+	return filepath.Join(base, "saves", server, patcher.CardFolder)
 }
 
 // loadWords loads the string table the way the patched PS2 does: the save
@@ -272,6 +274,7 @@ func (c *Client) attemptLogin() {
 	audio := c.audioSys
 	serverIP := c.serverIP
 	remember := c.loginRemember
+	damageRGB := models.ActiveRules.DamageRGB
 
 	ch := make(chan loginResult, 1)
 	c.loginResultCh = ch
@@ -308,6 +311,7 @@ func (c *Client) attemptLogin() {
 		engine.AssetsDir = assetsDir
 		engine.ISOPath = isoPath
 		engine.SaveDir = saveDir(serverIP) // the patcher's card folder
+		engine.State.DamageRGB = damageRGB
 		engine.Audio = audio
 		engine.State.DebugEntityMovement = true
 

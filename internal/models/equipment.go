@@ -1,5 +1,7 @@
 package models
 
+import "fmt"
+
 // ArmorTextures maps [armorSet][textSlot] to ESF Surface DictIDs.
 // TextSlots: 0=chest, 1=bracer, 2=gloves, 3=legs, 4=boots
 // Source: PS2 VICSpriteCust::$Armor table at EE 0x004FB910 stores VIRaster pool
@@ -89,9 +91,10 @@ type TintColor struct {
 
 // Tints maps tint index to RGBA color. 0-14 are VICSpriteCust::Tints[15]
 // (index 14 is yellow; with only 14 entries it fell through to white); 15-29
-// are Sandstorm's, read out of its S2 patch (the table at 0x000FCD00 its
-// GetTintColor returns). Which ones a server may use is ActiveRules.TintCount:
-// retail turns 15 or more into 0.
+// are Sandstorm's, as its S2 patch has them (the table at 0x000FCD00 its
+// GetTintColor returns). What a session draws is ActiveRules.Tint: a patch's
+// own table when the save folder has one (SandstormRules is this one), and
+// retail's 15 otherwise, which turns 15 or more into 0.
 var Tints = [30]TintColor{
 	{0xFF, 0xFF, 0xFF, 0xFF}, // 0 = White
 	{0x5A, 0x5A, 0x5A, 0xFF}, // 1 = DarkGray
@@ -135,19 +138,17 @@ var TintNames = [len(Tints)]string{
 	"Slate", "Golden",
 }
 
-// RobeTextures maps [robeStyle] to ESF Surface DictIDs.
+// RobeTextures maps [robeStyle] to ESF Surface DictIDs: retail's four.
 // Each robe has 2 textures: [0]=chest, [1]=legs.
 // Source: PS2 $Robe table at 0x004FBB48, pool indices resolved from EE dump.
-// Robes 4 and 5 are Sandstorm's: the DictIDs its S2 SetResources hook
-// (cave 0x000FD7A0) looks up in ss-art.csf for the table at 0x000FD6A0,
-// [robe-4][chest, legs].
-var RobeTextures = [6][2]int32{
+// A patch's robes past these (Sandstorm's 4 and 5) are ActiveRules.RobeTexture:
+// the DictIDs its art hook looks up for its own table (S2: cave 0x000FD7A0
+// into 0x000FD6A0, out of ss-art.csf).
+var RobeTextures = [4][2]int32{
 	{1163857248, 2111470074},    // robe 0: pool[199,200]
 	{-1466178805, 222590899},    // robe 1: pool[201,202]
 	{1563400161, 1163725733},    // robe 2: pool[203,204]
 	{656438062, -1236576364},    // robe 3: pool[205,206]
-	{-559038737, -889275714},    // robe 4: 0xDEADBEEF, 0xCAFEBABE (Sandstorm's ss-art.csf)
-	{-559038722, -889275669},    // robe 5: 0xDEADBEFE, 0xCAFEBAEB (Sandstorm's ss-art.csf)
 }
 
 // HelmTextures maps helm index to ESF Surface DictID in CHARCUST.CSF.
@@ -269,9 +270,9 @@ func GetRobeTextureDictID(robeIndex byte, textSlot int) int32 {
 	}
 	switch textSlot {
 	case TextSlotChest:
-		return RobeTextures[robeIndex][0]
+		return ActiveRules.RobeTexture(robeIndex)[0]
 	case TextSlotLegs:
-		return RobeTextures[robeIndex][1]
+		return ActiveRules.RobeTexture(robeIndex)[1]
 	default:
 		return 0
 	}
@@ -350,12 +351,19 @@ func GetHelmModelDictID(helmIndex byte) int32 {
 }
 
 // GetTintColor returns the RGBA tint color for a tint index, under the
-// active server's rules: past ActiveRules.TintCount it is white (index 0).
+// session's rules: the patch's table when it has one, and past
+// ActiveRules.TintCount white (index 0).
 func GetTintColor(tintIndex byte) TintColor {
-	if int(tintIndex) >= ActiveRules.TintCount() {
-		return Tints[0]
+	return ActiveRules.Tint(tintIndex)
+}
+
+// TintName labels a tint index for the UI: TintNames for the 30 known (retail
+// and Sandstorm's), the number past them.
+func TintName(i int) string {
+	if i >= 0 && i < len(TintNames) {
+		return TintNames[i]
 	}
-	return Tints[tintIndex]
+	return fmt.Sprintf("Tint %d", i)
 }
 
 // GetFaceTexture returns the ESF hash DictID for a face texture.

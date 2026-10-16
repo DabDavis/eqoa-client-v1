@@ -331,6 +331,11 @@ type GameState struct {
 	// Server list
 	Servers []ServerInfo
 
+	// DamageRGB: the patch reads DamageIndication's three trailing colour
+	// bytes (models.Rules.DamageRGB, Sandstorm's S2); retail stops at the
+	// defender.
+	DamageRGB bool
+
 	// Character select
 	Characters   []CharInfo
 	SelectedChar int // index into Characters, -1 = none selected
@@ -3148,10 +3153,11 @@ func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 		targetID = v
 	}
 	// Sandstorm's S2 (cave 0x000FBA40): three more bytes are an RGB the
-	// number is drawn in. Without them it keeps the retail colours.
+	// number is drawn in. Without them it keeps the retail colours, and so
+	// does retail, which reads no further (gs.DamageRGB).
 	var color [3]uint8
 	hasColor := false
-	if reader.Remaining() >= 3 {
+	if gs.DamageRGB && reader.Remaining() >= 3 {
 		rgb, _ := reader.ReadBytes(3)
 		copy(color[:], rgb)
 		hasColor = true

@@ -303,6 +303,8 @@ type Client struct {
 	weather       *game.WeatherSystem
 	zoneParticlesSpawned bool // true after zone ParticleSprites have been spawned
 	saveArtFor           string // the save folder whose art the model manager holds
+	rulesSetting         string // client.json "rules": "retail", "sandstorm", or "" for the save folder's patch
+	patched              bool   // the patch screen has run this launch
 	words                game.Words   // the string table: the save folder's WORDS.TXT, else the disc's
 	playerSearch         playerSearch // Sandstorm's player search window (playersearch.go)
 
@@ -604,9 +606,12 @@ func runClient() {
 		if cfg.ServerIP != "" {
 			client.serverIP = cfg.ServerIP
 		}
-		models.ActiveRules = models.RulesFor(client.serverIP, cfg.Rules)
+		client.rulesSetting = cfg.Rules
 	}
-	log.Printf("rules: %s (server %s)", models.ActiveRules, client.serverIP)
+	// The save folder as the last patch left it; the patch screen applies it
+	// again once the patcher has run.
+	client.applyPatch(saveDir(client.serverIP))
+	log.Printf("server %s", client.serverIP)
 
 	// Check for updates before showing title/login. Offline mode reaches no
 	// server at all, the update server included.
@@ -682,6 +687,18 @@ func runClient() {
 					client.titleScr.drawTitleScene(client, true)
 					client.checkScreenshot()
 			rl.EndDrawing()
+				}
+			}
+
+			// SETUP's "Play": the patcher, before the login, once a launch.
+			// Its "Back" (and a failed patch's "Restart") is the title again.
+			if client.offline == nil && !client.patched && !rl.WindowShouldClose() {
+				switch client.runPatchScreen() {
+				case patchPlay:
+					client.patched = true
+				case patchBack:
+					client.titleShown = false
+					continue
 				}
 			}
 

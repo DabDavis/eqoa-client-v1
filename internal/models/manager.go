@@ -2511,18 +2511,25 @@ func (m *ModelManager) getEquipmentTexture(dictID int32, src texSource) rl.Textu
 	return tex
 }
 
-// saveArtFiles are the art files a patcher may put in the save folder: Sandstorm's
-// ss-art.csf (its robes 4/5), and retail's addart.csf (SOE's own patch-art path,
-// which CLIENT reads off the card).
-var saveArtFiles = []string{"ss-art.csf", "addart.csf"}
+// saveArtFiles are the art files CLIENT reads off the card, in its order: the
+// patch's own (Sandstorm's S2 reads ss-art.csf first, for its robes 4/5, in a
+// hook on the call that reads retail's), then retail's addart.csf (SOE's own
+// patch-art path), which the hook's tail-jump still reads.
+func saveArtFiles() []string {
+	if f := ActiveRules.ArtFile; f != "" && f != "addart.csf" {
+		return []string{f, "addart.csf"}
+	}
+	return []string{"addart.csf"}
+}
 
 // SetSaveArt hands the model manager the art the patcher put in a server's
-// save folder. Its surfaces are searched after the disc's, as the PS2
-// registers them in the same dictionary; a file that is absent or does not
-// parse is skipped. Called once per server, on the main goroutine.
+// save folder, as the session's rules read it. Its surfaces are searched after
+// the disc's, as the PS2 registers them in the same dictionary; a file that is
+// absent or does not parse is skipped. Called again whenever the rules change
+// (a patch ran), on the main goroutine.
 func (m *ModelManager) SetSaveArt(dir string) {
 	m.saveArt = nil
-	for _, name := range saveArtFiles {
+	for _, name := range saveArtFiles() {
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			continue
@@ -2541,14 +2548,11 @@ func (m *ModelManager) SetSaveArt(dir string) {
 		m.saveArt = append(m.saveArt, f)
 		log.Printf("models: save art %s (%d bytes)", name, len(data))
 	}
-	// Sandstorm's robes 4 and 5 need all four of their surfaces.
-	saveRobeArt = len(m.saveArt) > 0
-	for _, row := range RobeTextures[4:6] {
-		for _, id := range row {
-			if !m.hasSaveSurface(id) {
-				saveRobeArt = false
-			}
-		}
+	// A patch robe is drawn once both its surfaces are in the art.
+	saveRobeArt = map[byte]bool{}
+	for robe := byte(4); int(robe) < ActiveRules.RobeCount(); robe++ {
+		art := ActiveRules.RobeTexture(robe)
+		saveRobeArt[robe] = art[0] != 0 && art[1] != 0 && m.hasSaveSurface(art[0]) && m.hasSaveSurface(art[1])
 	}
 }
 

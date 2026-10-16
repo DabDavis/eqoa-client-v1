@@ -15,9 +15,11 @@ import "fmt"
 // ZoneEmpty is string 641, "Empty": the lookup's answer off a grid.
 const ZoneEmpty = 641
 
-// WorldNameIDs are the worlds' name string ids (0x413 "Tunaria" …). 5-7
-// are all "Secret Zones".
-var WorldNameIDs = [8]int{0x413, 0x414, 0x5A0, 0x5B6, 0x5B7, 0x6F8, 0x6F8, 0x6F8}
+// WorldNameIDs are the world table's name string ids (0x413 "Tunaria" …),
+// as the session's rules have it (models.Rules.WorldNameIDs): retail's six,
+// or the patch's table — Sandstorm's adds 6 and 7, and 5-7 are all "Secret
+// Zones".
+var WorldNameIDs = []int{0x413, 0x414, 0x5A0, 0x5B6, 0x5B7, 0x6F8, 0x6F8, 0x6F8}
 
 // zoneGrids[world][row][col] are the zone string ids.
 var zoneGrids = [6][][]uint16{

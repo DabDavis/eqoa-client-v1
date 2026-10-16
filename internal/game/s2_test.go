@@ -67,12 +67,15 @@ func TestLocationLineEdges(t *testing.T) {
 	}
 }
 
-// 0x00DB: three more bytes after the defender are its colour.
+// 0x00DB under Sandstorm's S2: three more bytes after the defender are its
+// colour. Retail reads no further than the defender.
 func TestDamageColor(t *testing.T) {
 	gs := NewGameState("test", 10070, 9735, 7000, "test")
+	gs.DamageRGB = true
 	plain := []byte{1, 0, 0, 0, 0x13, 2, 0, 0, 0} // attacker, zigzag -10, defender
+	coloured := append(append([]byte{}, plain...), 255, 128, 0)
 	gs.HandleMessage(s2msg(protocol.OpcodeDamageIndication, plain))
-	gs.HandleMessage(s2msg(protocol.OpcodeDamageIndication, append(append([]byte{}, plain...), 255, 128, 0)))
+	gs.HandleMessage(s2msg(protocol.OpcodeDamageIndication, coloured))
 	if len(gs.FloatingTexts) != 2 {
 		t.Fatalf("%d floating texts", len(gs.FloatingTexts))
 	}
@@ -82,6 +85,11 @@ func TestDamageColor(t *testing.T) {
 	// CLIENT draws |amount| with "%d" (func_00BE96A8): no sign.
 	if ft := gs.FloatingTexts[1]; !ft.HasColor || ft.Color != [3]uint8{255, 128, 0} || ft.Text != "10" {
 		t.Fatalf("coloured number %+v", ft)
+	}
+	gs.DamageRGB = false
+	gs.HandleMessage(s2msg(protocol.OpcodeDamageIndication, coloured))
+	if ft := gs.FloatingTexts[2]; ft.HasColor {
+		t.Fatal("retail coloured a number")
 	}
 }
 

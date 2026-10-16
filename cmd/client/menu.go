@@ -1257,7 +1257,7 @@ func (c *Client) drawMenuAppearance(startY, contentH int32) {
 		}
 		tc := models.GetTintColor(t.Tint)
 		rl.DrawRectangle(x+210, y, 16, 16, rl.NewColor(tc.R, tc.G, tc.B, 255))
-		c.uiLabel(x+232, y+2, models.TintNames[t.Tint], 11, colorWhite)
+		c.uiLabel(x+232, y+2, models.TintName(int(t.Tint)), 11, colorWhite)
 	}
 }
 
@@ -1984,10 +1984,11 @@ func (c *Client) drawMenuNearby(startY, contentH int32) {
 
 func (c *Client) drawMenuSocial(startY, contentH int32) {
 
-	// Sub-tab bar: Who / Group / LFG / Auction. On Sandstorm the third is its
-	// player search (Register / Unregister / Search, S2's Group menu items).
+	// Sub-tab bar: Who / Group / LFG / Auction. Under Sandstorm's S2 the third
+	// is its player search (Register / Unregister / Search, S2's Group menu
+	// items).
 	third := "LFG"
-	if models.ActiveRules == models.RulesSandstorm {
+	if models.ActiveRules.PlayerSearch {
 		third = "Search"
 	}
 	innerY := c.uiTabBar(menuXPos()+menuPad, startY, []string{"Who", "Group", third, "Auction"}, &c.socialSubTab)
@@ -1999,7 +2000,7 @@ func (c *Client) drawMenuSocial(startY, contentH int32) {
 	case 1:
 		c.drawMenuGroup(innerY, innerH)
 	case 2:
-		if models.ActiveRules == models.RulesSandstorm {
+		if models.ActiveRules.PlayerSearch {
 			c.drawMenuPlayerSearch(innerY, innerH)
 		} else {
 			c.drawMenuLFG(innerY, innerH)
@@ -2254,10 +2255,7 @@ func (c *Client) drawMenuAuction(startY, contentH int32) {
 	if c.auctionLevelMax == 0 {
 		// Retail's Auctions window opens on Max. Level 50; Sandstorm's S2
 		// makes it 60 (CLIENT+0x5CFE4).
-		c.auctionLevelMax = 50
-		if models.ActiveRules == models.RulesSandstorm {
-			c.auctionLevelMax = 60
-		}
+		c.auctionLevelMax = models.ActiveRules.AuctionMaxLevel
 	}
 	c.uiTextInput(panelLeft, y, filterW, &c.auctionSearchName, &c.auctionSearchFocus, 20)
 	y += 24

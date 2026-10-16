@@ -68,13 +68,12 @@ func (c *Client) drawWorld() {
 	gs := c.engine.State
 	p := gs.Player
 
-	// The save folder's art, once the patcher has been through it: in world
-	// means the startup I/O, patcher included, has finished. Offline reads the
-	// configured server's folder as it last stood.
-	if dir := c.engine.SaveDir; c.modelMgr != nil && dir != c.saveArtFor {
-		c.modelMgr.SetSaveArt(dir)
-		c.loadWords(dir)
-		c.saveArtFor = dir
+	// The save folder's patch, its art and words: applied by the patch
+	// screen before the login, and at startup for offline, which reads the
+	// configured server's folder as it last stood. This catches an engine
+	// whose folder is another.
+	if dir := c.engine.SaveDir; dir != "" && dir != c.saveArtFor {
+		c.applyPatch(dir)
 	}
 	gs.Words = c.words // the handlers' chat lines (abilities, outmatched)
 

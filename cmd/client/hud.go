@@ -414,7 +414,7 @@ func (c *Client) handleChatInput() {
 			// slash and all, to the server as say chat (0x000B) in no chat
 			// mode — its server-side commands arrive that way. Retail prints
 			// string 826 as `%S "%s".` and sends nothing.
-			if models.ActiveRules == models.RulesSandstorm {
+			if models.ActiveRules.CommandsToServer {
 				c.engine.SendChatCommand(text)
 			} else {
 				gs := c.engine.State

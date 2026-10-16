@@ -42,8 +42,9 @@ type Engine struct {
 	// Assets directory for loading SPELLFX, etc.
 	AssetsDir string
 	// SaveDir is this server's save folder, the stand-in for the memory
-	// card's game folder that the patcher brings in line with the server's
-	// manifest (network.RunPatcher). Empty runs only the old manifest check.
+	// card's game folder, which the patcher (internal/patcher) brings in line
+	// with the server's manifest before the login, as SETUP does before
+	// STATION's.
 	SaveDir string
 	ISOPath   string // path to EQOA ISO (optional, for reading assets directly)
 
@@ -260,12 +261,11 @@ func (e *Engine) Tick() {
 		gs.StatusMsg = "Connecting..."
 		e.startupCh = make(chan startupResult, 1)
 		ch := e.startupCh
-		serverIP, authPort, gamePort, patchPort := gs.ServerIP, gs.AuthPort, gs.GamePort, gs.PatchPort
+		serverIP, authPort, gamePort := gs.ServerIP, gs.AuthPort, gs.GamePort
 		username, password := gs.Username, e.password
 		accountID, token := gs.AccountID, e.sessionToken
-		saveDir := e.SaveDir
 		go func() {
-			ch <- runStartupIO(serverIP, authPort, gamePort, patchPort, username, password, accountID, token, saveDir)
+			ch <- runStartupIO(serverIP, authPort, gamePort, username, password, accountID, token)
 		}()
 		return
 	}
@@ -364,11 +364,12 @@ type startupResult struct {
 	ok           bool
 }
 
-// runStartupIO runs the blocking auth → patch → UDP connection flow off the
-// main goroutine. It only touches its arguments and locals — never GameState —
+// runStartupIO runs the blocking auth → UDP connection flow off the main
+// goroutine. It only touches its arguments and locals — never GameState —
 // and returns the result for the main goroutine to apply. Must run in a
-// goroutine (network.Login/CheckPatch block).
-func runStartupIO(serverIP string, authPort, gamePort, patchPort int, username, password string, accountID uint32, sessionToken []byte, saveDir string) startupResult {
+// goroutine (network.Login blocks). The patcher is not in it: it is SETUP's,
+// and runs before the login (internal/patcher).
+func runStartupIO(serverIP string, authPort, gamePort int, username, password string, accountID uint32, sessionToken []byte) startupResult {
 	// Step 1: TCP Auth (skip if pre-authenticated via login screen).
 	if accountID != 0 && sessionToken != nil {
 		log.Printf("Skipping TCP auth (pre-authenticated, accountID=%d)", accountID)
@@ -383,21 +384,8 @@ func runStartupIO(serverIP string, authPort, gamePort, patchPort int, username, 
 		log.Printf("Auth success: accountID=%d, token=%d bytes", accountID, len(sessionToken))
 	}
 
-	// Step 2: the patcher, as SETUP runs it before login: the save folder is
-	// brought in line with the server's manifest. Non-fatal, as before — a
-	// server with no patch port still plays.
-	log.Printf("=== Step 2: Patch ===")
-	if saveDir != "" {
-		if _, err := network.RunPatcher(serverIP, patchPort, saveDir); err != nil {
-			log.Printf("Patcher failed (non-fatal): %v", err)
-		}
-	} else if _, err := network.CheckPatch(serverIP, patchPort); err != nil {
-		log.Printf("Patch check failed (non-fatal): %v", err)
-	}
-	log.Printf("Patch step complete, server IP: %s", serverIP)
-
-	// Step 3: UDP connection to login endpoint (0xFFFE).
-	log.Printf("=== Step 3: UDP Login ===")
+	// Step 2: UDP connection to login endpoint (0xFFFE).
+	log.Printf("=== Step 2: UDP Login ===")
 	conn, err := network.NewConnection(serverIP, gamePort, 0xFFFE)
 	if err != nil {
 		log.Printf("UDP connect failed: %v", err)

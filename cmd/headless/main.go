@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/eqoa/client/internal/game"
+	"github.com/eqoa/client/internal/models"
+	"github.com/eqoa/client/internal/patcher"
 )
 
 // gameMu serializes all GameState access in this dev tool. Unlike the shipped
@@ -46,7 +48,7 @@ func main() {
 	autoConnect := flag.Bool("auto-connect", true, "Auto-connect to first game server")
 	autoSelect := flag.Int("auto-select", 0, "Auto-select character N (1-indexed, 0=disabled)")
 	assetsDir := flag.String("assets", "", "Assets directory for SPELLFX.CSF/ESF (optional)")
-	saveDir := flag.String("save", "", "Save folder for the patcher (the memory card's game folder); empty = manifest check only")
+	saveDir := flag.String("save", "", "Save folder for the patcher (the memory card's game folder); empty = no patch, retail rules")
 	cmdPortFlag := flag.Int("cmd-port", 7778, "TCP command port for agent control")
 	flag.Parse()
 
@@ -69,6 +71,22 @@ func main() {
 	engine.AutoConnect = *autoConnect
 	engine.AssetsDir = *assetsDir
 	engine.SaveDir = *saveDir
+
+	// SETUP's patcher, before the login as on the PS2, into -save; the session
+	// then plays as the patch there says (its S2, read by internal/sspatch).
+	// A dev tool goes on after a failed patch, with the folder as it was.
+	if *saveDir != "" {
+		st := patcher.NewStatus()
+		patcher.Run(patcher.Config{Host: *serverIP, Port: *patchPort, Dir: *saveDir}, st)
+		if snap := st.Snapshot(); snap.State != patcher.StateDone {
+			log.Printf("Patcher failed (state %d): %s", snap.State, snap.Err)
+		}
+		rules := models.RulesFor(*saveDir, "")
+		models.ActiveRules = rules
+		game.WorldNameIDs = rules.WorldNameIDs()
+		engine.State.DamageRGB = rules.DamageRGB
+		log.Printf("rules: %s", rules)
+	}
 
 	// Auto-select is handled on the tick goroutine below (folded in so it no
 	// longer races the tick loop's GameState writes).
