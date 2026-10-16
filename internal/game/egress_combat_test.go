@@ -18,8 +18,9 @@ import (
 // The combat lane of the egress pass: what combat.go sends, against what a
 // real PS2 sent (egress_capture_test.go) and against CLIENT's own tables.
 
-// sentMsg is one message the engine queued (through GameState.sendHook).
-type sentMsg struct {
+// combatSent is one message the engine queued (through GameState.sendHook),
+// with the rig's clock.
+type combatSent struct {
 	at uint64 // the fake clock when it went
 	op protocol.GameOpcode
 	p  []byte
@@ -31,7 +32,7 @@ type combatRig struct {
 	e    *Engine
 	gs   *GameState
 	now  int64
-	sent []sentMsg
+	sent []combatSent
 }
 
 func newCombatRig(t *testing.T) *combatRig {
@@ -41,7 +42,7 @@ func newCombatRig(t *testing.T) *combatRig {
 	r.gs = r.e.State
 	r.e.clock = func() int64 { return r.now }
 	r.gs.sendHook = func(op protocol.GameOpcode, p []byte) {
-		r.sent = append(r.sent, sentMsg{uint64(r.now), op, append([]byte(nil), p...)})
+		r.sent = append(r.sent, combatSent{uint64(r.now), op, append([]byte(nil), p...)})
 	}
 	r.gs.selfKnown = true
 	r.gs.PlayerObjectID = 0x1C6AFEAC
@@ -70,7 +71,7 @@ func (r *combatRig) npc(ch int, id uint32, x, y, z float32) *Entity {
 }
 
 // ops lists the opcodes sent since the last call.
-func (r *combatRig) take() []sentMsg {
+func (r *combatRig) take() []combatSent {
 	s := r.sent
 	r.sent = nil
 	return s
@@ -596,7 +597,7 @@ func TestSelectAndCycleTarget(t *testing.T) {
 	r.e.SelectTarget(4)
 	want("SelectTarget(4)", 0x222)
 	r.e.SelectTarget(5) // past the roster's size
-	want("SelectTarget(5)", noTarget)
+	want("SelectTarget(5)", targetNone)
 	r.e.SelectTarget(6)
 	want("SelectTarget(6)", 0x333)
 
@@ -650,7 +651,7 @@ func TestSelectAndCycleTarget(t *testing.T) {
 	// and 0x0010 says so.
 	r.e.CycleTarget(false, &TargetView{Pos: [3]float32{0, 0, 1000}, Dir: v.Dir,
 		Visible: func(x, y, z float32) bool { return false }, ClipX: v.ClipX})
-	want("empty scene", noTarget)
+	want("empty scene", targetNone)
 
 	// ClearTarget sends nothing.
 	r.e.TargetObjectID = 0xB
@@ -779,21 +780,24 @@ func TestFaceTargetAndStops(t *testing.T) {
 	r := newCombatRig(t)
 	r.npc(1, 0x555, 10, 0, 0)
 	r.e.TargetObjectID = 0x555
-	if _, ok := r.e.FaceTargetHeading(); ok {
+	if _, ok := r.e.FaceTargetHeading(false); ok {
 		t.Error("faced the target with auto-attack off and no swing")
 	}
 	r.e.CombatEngaged = true
-	if h, ok := r.e.FaceTargetHeading(); !ok || math.Abs(float64(h)-math.Pi/2) > 1e-6 {
+	if h, ok := r.e.FaceTargetHeading(false); !ok || math.Abs(float64(h)-math.Pi/2) > 1e-6 {
 		t.Errorf("auto-attack on: heading %v %v, want pi/2 (east)", h, ok)
 	}
 	// Within a second of a swing's effect it still faces; after, not.
 	r.e.CombatEngaged = false
 	r.e.lastSwingFX = r.now - 500
-	if _, ok := r.e.FaceTargetHeading(); !ok {
+	if _, ok := r.e.FaceTargetHeading(false); !ok {
 		t.Error("half a second after a swing")
 	}
+	if _, ok := r.e.FaceTargetHeading(true); ok {
+		t.Error("half a second after a swing, with turn input")
+	}
 	r.e.lastSwingFX = r.now - 1000
-	if _, ok := r.e.FaceTargetHeading(); ok {
+	if _, ok := r.e.FaceTargetHeading(false); ok {
 		t.Error("a second after a swing")
 	}
 	// The frame applies it to the player (and swings: the target is out of

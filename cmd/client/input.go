@@ -22,6 +22,8 @@ func (c *Client) handleInWorldInput() {
 		c.safeValid = false
 		c.currentSpeed = 0
 		c.flyVelX, c.flyVelY, c.flyVelZ = 0, 0, 0
+		// Respawn's camera half runs once the arrival sets the walker down
+		// (arrival.go: resetCameraBehind).
 	}
 
 	// The F3 report dialog holds the keyboard, as the menu and chat do: no
@@ -77,16 +79,13 @@ func (c *Client) handleInWorldInput() {
 	}
 
 	// PS2 death: blocks ALL input (movement, camera, chat, hotkeys, spells).
-	// Only logout (Ctrl+X) remains active. Camera auto-orbits slowly.
+	// Only logout (Ctrl+X) remains active.
 	// PS2 VICSprite::SetDeath (0x00421588) sets IsDead flag, plays death anim (slot 14),
 	// holds last frame. CLIENT game loop checks IsDead and blocks all input processing.
+	// The camera is VIClient::DeathCamera's meanwhile (processWalkCamera).
 	if c.engine.State.Player.Dead {
 		c.currentSpeed = 0
 		c.autoRun = false
-		// Slow auto-orbit camera around corpse (PS2 VIWalkCamera::OrbitRight).
-		// ~PI/12 rad/s = 15 deg/s = full rotation in 24 seconds.
-		dt := rl.GetFrameTime()
-		c.camAngle += float32(math.Pi/12.0) * dt
 		return
 	}
 
@@ -214,8 +213,6 @@ func (c *Client) handleInWorldInput() {
 	}
 
 	dt := rl.GetFrameTime()
-	rotSpeed := float32(10.0) * c.camSensitivity   // Camera orbit force (rad/s²), scaled by sensitivity
-	zoomSpeed := float32(67) * c.camSensitivity   // Zoom force (units/s²), scaled by sensitivity
 	// PS2 VIWalkControl speed constants from InitParms (0x00487910).
 	// Walk base = 3.0 (hardcoded, never changed by server).
 	// Run base = server PlayerSpeed value (handler at 0x00BDD540, default 8.833).
@@ -229,8 +226,6 @@ func (c *Client) handleInWorldInput() {
 		dampingBase = float64(0.02)
 		// Minimum speed before snapping to zero (avoids infinite deceleration tail).
 		speedEpsilon = float32(0.05)
-		// Follow-camera orbit tracking speed -- how fast camera orbits behind character.
-		camFollowRate = float32(4.0) // radians/sec
 
 		// PS2 VIWalkControl::UpdatePhysics gravity constants.
 		// Extracted from EE memory dump: _13VIWalkControl$Gravity at 0x004E31F8.
@@ -404,51 +399,10 @@ func (c *Client) handleInWorldInput() {
 	// --- Gamepad input (merged with keyboard below) ---
 	gpFwd, gpRight, gpCamH, gpCamV := c.handleGamepadInWorld()
 
-	// PS2 VIWalkCamera: force-based orbit with exponential damping.
-	// OrbitRight (0x004833C0) accumulates force, UpdateCameraPhysics (0x00482758)
-	// integrates with powf(0.01, dt). Camera damping base = 0.01 (InitParms +0x258).
-	const camDampingBase = float64(0.01)
-	camDecay := float32(math.Pow(camDampingBase, float64(dt)))
-
-	// Camera orbit / character turn: A/D + right stick X.
-	// PS2: In first person, A/D rotates the character (camera follows facing).
-	// In third person, A/D orbits the camera independently.
+	// The walk camera's axes for this frame: A/D and the right stick's x orbit
+	// or turn, W/S and its y zoom or look, by camera mode (walkcamera.go).
 	ctrlDown := rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
-	var camAngleForce float32
-	if !ctrlDown && rl.IsKeyDown(rl.KeyA) {
-		camAngleForce -= rotSpeed
-	}
-	if !ctrlDown && rl.IsKeyDown(rl.KeyD) {
-		camAngleForce += rotSpeed
-	}
-	camAngleForce += gpCamH
-	c.camAngleVel += camAngleForce * dt
-	c.camAngle += c.camAngleVel * dt
-	c.camAngleVel *= camDecay
-
-	// Camera pitch: W/S accumulate pitch force (PS2 SetOrbitPitchAngle).
-	rp := c.playerRaceParams()
-	maxPitch := float32(1.5708)  // PI/2 up (same for all races)
-	minPitch := -rp.PitchLimit   // per-race downward limit
-	var camPitchForce float32
-	if !ctrlDown && rl.IsKeyDown(rl.KeyW) {
-		camPitchForce += rotSpeed
-	}
-	if !ctrlDown && rl.IsKeyDown(rl.KeyS) {
-		camPitchForce -= rotSpeed
-	}
-	camPitchForce += gpCamV
-	c.camPitchVel += camPitchForce * dt
-	c.camPitch += c.camPitchVel * dt
-	c.camPitchVel *= camDecay
-	if c.camPitch > maxPitch {
-		c.camPitch = maxPitch
-		c.camPitchVel = 0
-	}
-	if c.camPitch < minPitch {
-		c.camPitch = minPitch
-		c.camPitchVel = 0
-	}
+	c.gatherCameraInput(gpCamH, gpCamV, ctrlDown)
 
 	// Arrow keys / left stick: player movement.
 	// PS2 ViewRelativeWalk (0x004856B8): converts camera-relative input to world heading.
@@ -577,6 +531,7 @@ func (c *Client) handleInWorldInput() {
 		decay = float32(math.Pow(airDamping, float64(dt)))
 	}
 
+	steer := false // this frame sets a target heading (mode 3's SetTargetHeading)
 	if moveX != 0 || moveZ != 0 {
 		// Cancel emote on movement
 		if c.animMgr.EmoteAnim != 0 {
@@ -617,6 +572,7 @@ func (c *Client) handleInWorldInput() {
 		// First person: character faces camera, not movement direction.
 		if !c.firstPerson {
 			c.targetFacing = float32(math.Atan2(float64(moveX), float64(moveZ)))
+			steer = true
 		}
 
 		// Apply movement using ramped speed. VIWalkControl::Run walks only in
@@ -652,8 +608,7 @@ func (c *Client) handleInWorldInput() {
 		if c.onGround {
 			c.engine.VelY = 0
 		}
-		c.engine.StickMagnitude = 254
-		c.engine.AccelState = 0x80
+		c.engine.ForceX, c.engine.ForceZ = c.driveForce(moveX, moveZ, targetSpeed, walkSpeedCap)
 	} else {
 		// No input — decelerate using PS2 exponential damping.
 		c.currentSpeed = c.currentSpeed * decay
@@ -665,8 +620,7 @@ func (c *Client) handleInWorldInput() {
 			c.engine.VelX = 0
 			c.engine.VelY = 0
 			c.engine.VelZ = 0
-			c.engine.StickMagnitude = 0x80
-			c.engine.AccelState = 0x80
+			c.engine.ForceX, c.engine.ForceZ = 0, 0
 		} else {
 			// Still decelerating — continue moving in last direction.
 			speed := c.currentSpeed
@@ -695,67 +649,41 @@ func (c *Client) handleInWorldInput() {
 			if c.onGround {
 				c.engine.VelY = 0
 			}
-			c.engine.StickMagnitude = 0x80
-			c.engine.AccelState = 0x80
+			c.engine.ForceX, c.engine.ForceZ = 0, 0
 		}
 	}
 
 	// === Facing rotation ===
-	// First person: character always faces camera direction (PS2 mode 0).
-	// Third person: character faces movement direction (PS2 ViewRelativeWalk).
-	if c.firstPerson {
-		// PS2 mode 0: character faces camera look direction.
-		// Camera look = (-cosA, -sinA) in XZ plane.
-		// Facing = atan2(lookX, lookZ) = atan2(-cosA, -sinA).
-		cosA := float32(math.Cos(float64(c.camAngle)))
-		sinA := float32(math.Sin(float64(c.camAngle)))
-		facing := float32(math.Atan2(float64(-cosA), float64(-sinA)))
-		if facing < 0 {
-			facing += 2 * math.Pi
+	// VIWalkControl's angular body at the camera style's turn rate: in third
+	// person a bang-bang turn toward the move's heading (2π rad/s, style 3),
+	// in first person and the fixed follow the turn keys (π/2 rad/s), which
+	// the camera follows (walkcamera.go).
+	//
+	// The face block of the same update (func_00BC3AE8 at 0x00BC3FE4): while
+	// auto-attack is on, or for a second after a swing's effect with no turn
+	// input, the walker turns to its target — style 3 by a SetTargetHeading
+	// after the move's, the other styles by a full turn once the target is
+	// more than 10 degrees off.
+	c.wcam.faceTarget = false
+	if h, ok := c.engine.FaceTargetHeading(c.wcam.inTurn != 0); ok {
+		if c.wcam.mode == camModeThird {
+			c.wcam.faceTarget, c.wcam.faceHeading = true, h
+		} else {
+			d := h - p.Facing
+			for d > math.Pi {
+				d -= 2 * math.Pi
+			}
+			for d < -math.Pi {
+				d += 2 * math.Pi
+			}
+			if d > 0.17453292 {
+				c.wcam.inTurn = 1
+			} else if d < -0.17453292 {
+				c.wcam.inTurn = -1
+			}
 		}
-		p.Facing = facing
-	} else {
-		p.Facing = c.targetFacing
 	}
-	// The target facing (FaceTargetHeading): while auto-attack is on, or for a
-	// second after a swing's effect, the walker faces its target.
-	if !c.firstPerson {
-		if h, ok := c.engine.FaceTargetHeading(); ok {
-			p.Facing = h
-			c.targetFacing = h
-		}
-	}
-
-	// === PS2 0x40 Smoothed Facing + Turn Rate ===
-	// Byte 28: smoothed facing lags behind byte 22 during turns (PS2 pcap: 88% match).
-	// Byte 23: turning input derived from heading change rate.
-	{
-		// Smoothed facing: exponential approach toward current facing.
-		diff := p.Facing - c.engine.SmoothedFacing
-		// Normalize to [-PI, PI]
-		for diff > math.Pi {
-			diff -= 2 * math.Pi
-		}
-		for diff < -math.Pi {
-			diff += 2 * math.Pi
-		}
-		// Lag factor: 0.15 per frame at 30fps, frame-rate independent.
-		lagFactor := float32(1.0 - math.Pow(1.0-0.15, float64(dt)*30.0))
-		c.engine.SmoothedFacing += diff * lagFactor
-
-		// Turn rate: heading change per second for byte 23 encoding.
-		facingDiff := p.Facing - c.engine.PrevFacing
-		for facingDiff > math.Pi {
-			facingDiff -= 2 * math.Pi
-		}
-		for facingDiff < -math.Pi {
-			facingDiff += 2 * math.Pi
-		}
-		if dt > 0.001 {
-			c.engine.TurnRate = facingDiff / dt
-		}
-		c.engine.PrevFacing = p.Facing
-	}
+	c.steerWalker(dt, steer, c.targetFacing)
 
 	// GM Noclip: PS2 VIFlyCamera — force-based movement with exponential damping.
 	// Decompiled from SUPPORT VIFlyCamera::UpdateCameraPhysics at 0x00441788.
@@ -965,41 +893,9 @@ func (c *Client) handleInWorldInput() {
 			}
 		}
 	}
+	c.engine.SetWalkState(c.walkFlags(), c.floorY)
 
 afterPhysics:
-
-	// PS2 VIWalkCamera follow mode -- camera auto-orbits behind character.
-	// SetOrbitAngleBehind (0x00513086) snaps camera directly behind.
-	// We use smooth tracking at camFollowRate for less jarring motion.
-	if c.camFollow && c.engine.Walking {
-		// "Behind character" = character facing + PI (camera looks at character from behind).
-		behindAngle := p.Facing + math.Pi
-		for behindAngle >= 2*math.Pi {
-			behindAngle -= 2 * math.Pi
-		}
-		// Smooth orbit toward behind angle.
-		camDiff := behindAngle - c.camAngle
-		for camDiff > math.Pi {
-			camDiff -= 2 * math.Pi
-		}
-		for camDiff < -math.Pi {
-			camDiff += 2 * math.Pi
-		}
-		maxCamTurn := camFollowRate * dt
-		if camDiff > maxCamTurn {
-			camDiff = maxCamTurn
-		} else if camDiff < -maxCamTurn {
-			camDiff = -maxCamTurn
-		}
-		c.camAngle += camDiff
-	}
-	// Keep camera angle in [0, 2*pi).
-	for c.camAngle < 0 {
-		c.camAngle += 2 * math.Pi
-	}
-	for c.camAngle >= 2*math.Pi {
-		c.camAngle -= 2 * math.Pi
-	}
 
 	// Initialize onGround on first frame with terrain.
 	// Also recovers from void fall: if falling below any findable ground, snap back.
@@ -1019,78 +915,9 @@ afterPhysics:
 		}
 	}
 
-	// U key: toggle first-person / third-person camera.
+	// U: first/third person (VIClient::InitCameraStyle, the PS2's Select).
 	if rl.IsKeyPressed(rl.KeyU) {
-		c.cycleCameraMode()
-	}
-
-	// Zoom: +/- or scroll wheel applies distance force (PS2 OrbitIn at 0x004834D0).
-	var camDistForce float32
-	if rl.IsKeyDown(rl.KeyEqual) || rl.IsKeyDown(rl.KeyKpAdd) {
-		camDistForce -= zoomSpeed
-	}
-	if rl.IsKeyDown(rl.KeyMinus) || rl.IsKeyDown(rl.KeyKpSubtract) {
-		camDistForce += zoomSpeed
-	}
-	wheel := rl.GetMouseWheelMove()
-	if wheel != 0 && !c.isMouseOverChat() {
-		// Scroll wheel: impulse into velocity (instant response, then decay).
-		c.camDistVel -= wheel * 5 * c.camSensitivity
-	}
-	c.camDistVel += camDistForce * dt
-	c.camDist += c.camDistVel * dt
-	c.camDistVel *= camDecay
-
-	// Clamp zoom distance based on camera mode.
-	switch c.camMode {
-	case 0: // Tether: min 3 units
-		if c.camDist < 3 {
-			c.camDist = 3
-			c.camDistVel = 0
-		}
-	case 1: // Follow: locked at current distance
-		c.camDist = c.camFollowDist
-		c.camDistVel = 0
-	case 2: // First-person: locked at 0
-		c.camDist = 0
-		c.camDistVel = 0
-	}
-	if c.camDist > c.camMaxDist {
-		c.camDist = c.camMaxDist
-		c.camDistVel = 0
-	}
-}
-
-// cycleCameraMode cycles through: tether → follow → first-person → tether.
-func (c *Client) cycleCameraMode() {
-	c.camMode = (c.camMode + 1) % 3
-	wasFP := c.firstPerson
-	switch c.camMode {
-	case 0:
-		// Tether: free zoom, restore saved distance.
-		c.firstPerson = false
-		if c.camSavedDist < 3 {
-			c.camSavedDist = 11.75
-		}
-		c.camDist = c.camSavedDist
-		log.Printf("Camera: tether (dist=%.1f)", c.camDist)
-	case 1:
-		// Follow: lock at current zoom level, no zoom allowed.
-		c.firstPerson = false
-		c.camFollowDist = c.camDist // lock at whatever tether was set to
-		log.Printf("Camera: follow (locked dist=%.1f)", c.camFollowDist)
-	case 2:
-		// First-person: inside character.
-		c.firstPerson = true
-		c.camSavedDist = c.camFollowDist // save for return to tether
-		c.camDist = 0
-		log.Printf("Camera: first-person")
-	}
-	// Leaving first person: sync targetFacing to camera-derived facing
-	// so character doesn't snap back to old movement direction.
-	if wasFP && !c.firstPerson {
-		p := &c.engine.State.Player
-		c.targetFacing = p.Facing
+		c.toggleFirstPerson()
 	}
 }
 

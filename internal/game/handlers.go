@@ -1032,7 +1032,7 @@ func (gs *GameState) handleBuddyListStuff(msg *protocol.Message) {
 // 0x77 byte, the request's token, the page's index and the number of pages
 // (all zigzag), then a zigzag count of factions, each a wide name (63 at most)
 // and a zigzag standing. The PS2 keeps one page, the one it asked for last;
-// this client asks for every page at once and keeps them all.
+// this client asks for the pages one after another and keeps them all.
 func (gs *GameState) handleFactionPage(msg *protocol.Message) {
 	s := newSocialStream(msg)
 	if s.u8() != 0x77 {
@@ -1058,6 +1058,10 @@ func (gs *GameState) handleFactionPage(msg *protocol.Message) {
 		token, page, pages, count, len(gs.Factions))
 	if page+1 >= pages {
 		gs.FactionLoaded = true
+		gs.factionWaiting = false
+	} else if int64(token) == int64(gs.FactionPageID) {
+		// the window's next page (func_00C4A9D8): page+1, same token
+		gs.requestFactionPage(int32(page + 1))
 	}
 }
 

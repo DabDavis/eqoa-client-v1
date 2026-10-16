@@ -133,9 +133,11 @@ func (c *Client) drawWorld() {
 		}
 	}
 
-	// PS2 VIWalkCamera orbit -- distance=0 naturally becomes first-person.
+	// VIWalkCamera::SetCamera (walkcamera.go). The player's own model is
+	// hidden in first person and when the fixed follow's eye is in its head
+	// (func_00BC6500).
 	camera := c.currentCamera(p)
-	firstPerson := c.camDist < 0.1
+	firstPerson := c.cameraHidesPlayer(p, camera)
 
 	// VICameraEffect: a spell's shake bobs the eye and the look direction
 	// vertically (it only ever runs for the local player).
@@ -178,16 +180,22 @@ func (c *Client) drawWorld() {
 			}
 		}
 
-		// PS2 VIBattleMusic: switch to battle BGM during combat, restore zone BGM after.
-		// Play() selects a random battle track (battle01-08.bgm), Stop() fades out.
-		if c.engine.InCombat && !c.battleBGMActive {
+		// VIBattleMusic as the frame drives it (func_00BC6500): while the
+		// player is alive and LeaderByte263 — the server's combat byte
+		// (+0x263) on the player, or on the group's leader — is set, a
+		// battle track plays; otherwise it stops. With the disc's default
+		// option 9 the track is one of eight, picked as the battle starts
+		// (VIBattleMusic::Play, rand() % 8 + 1). Battle music is BGM slot 0,
+		// which outranks the zone's slot 1 (VISoundDevice::StreamBgm), so
+		// the zone's music resumes when it stops.
+		battle := gs.LeaderByte263() && !gs.Player.Dead
+		if battle && !c.battleBGMActive {
 			c.battleBGMActive = true
-			// VIBattleMusic::Play: a random battle track, rand() % 8 + 1.
 			track := rand.Intn(8) + 1
 			bgmName := fmt.Sprintf("BATTLE%02d.BGM", track)
 			c.playBGMFromISO(bgmName)
 			c.currentBGM = bgmName
-		} else if !c.engine.InCombat && c.battleBGMActive {
+		} else if !battle && c.battleBGMActive {
 			c.battleBGMActive = false
 			c.currentBGM = "" // triggers zone BGM restore below
 		}
@@ -427,21 +435,23 @@ func (c *Client) drawWorld() {
 		c.updateEntityEmitterPositions(&p)
 	}
 
-	// Wire terrain height lookup for entity Y snapping (prevents clipping through slopes).
-	if c.terrainLoader != nil && c.terrainZoneIdx >= 0 {
-		if zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx); zt != nil {
-			gs.SampleHeightFunc = func(x, z, refY float32) (float32, bool) {
-				// Fast path: single tile. Fallback: 3×3 for tile boundaries.
-				if y, ok := zt.SampleHeightRef(x, z, refY); ok {
-					return y, true
-				}
-				return zt.SampleHeight(x, z, refY)
+	// A creature's floor probe (0x00CBCE40) is the scene's collision under
+	// it: the zone that holds the point, if it is loaded.
+	if loader := c.terrainLoader; loader != nil {
+		gs.CreatureFloorFunc = func(x, y, z float32) (float32, bool) {
+			zt := loader.GetZoneTerrain(loader.FindZone(x, z))
+			if zt == nil {
+				return y, false
 			}
+			return zt.CreatureFloor(x, y, z)
 		}
+	} else {
+		gs.CreatureFloorFunc = nil
 	}
 
-	// Interpolate entity positions (dead reckoning + correction toward server target).
-	gs.InterpolateEntities(dt)
+	// UpdateCreatures then Extrapolate: every entity stepped by its velocity
+	// and set down, then drawn where the blend says (entitymotion.go).
+	gs.UpdateEntityMotion()
 
 	// Debug: periodic interpolation state dump (every 2 seconds)
 	if gs.DebugEntityMovement {
@@ -482,14 +492,6 @@ func (c *Client) drawWorld() {
 		// Skip entities on a different continent (World byte from state channel offset 16).
 		if ent.World != p.World {
 			continue
-		}
-
-		// Server sends exact Y — no ground-snap needed for entities.
-		// Only adjust swimming entities slightly for visual water surface.
-		if groundSnapZT != nil && ent.Interpolating {
-			if ent.Animation == 12 || groundSnapZT.GetEnvFlags(ent.X, ent.Y, ent.Z)&terrain.EnvFlagWater != 0 {
-				ent.Y += 0.5
-			}
 		}
 
 		if !terrainLoaded {
@@ -1027,8 +1029,7 @@ func (c *Client) drawWorld() {
 
 	// Camera mode HUD (bottom center, same style as POS display)
 	{
-		modeNames := [3]string{"Tether", "Follow", "First Person"}
-		modeText := fmt.Sprintf("Y/R3 Reset/Default  U/Select Camera: %s", modeNames[c.camMode])
+		modeText := fmt.Sprintf("R3 Reset  U/Select First/Third Person  Camera: %s", cameraModeName(c.wcam.mode))
 		cx := int32(rl.GetScreenWidth()) - c.measureText(modeText, 11) - 8
 		cy := int32(rl.GetScreenHeight()) - 18
 		c.drawText(modeText, cx, cy, 11, rl.Color{R: 200, G: 200, B: 200, A: 180})

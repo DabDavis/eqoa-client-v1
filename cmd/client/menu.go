@@ -2532,11 +2532,11 @@ func (c *Client) drawSettingsCamera(y, sliderX, sliderW int32) {
 		fmt.Sprintf("%.0f%%", c.camSensitivity*100))
 	y += 48
 
+	// The third-person zoom ceiling: CLIENT's style 3 stops at 8.0; more is
+	// a Go extra, as EQOA-QOL.ELF's camera distance is on the console.
 	if c.uiSliderFloat(sliderX, y+16, sliderW, &c.camMaxDist, 2, 300, "Max Camera Zoom",
 		fmt.Sprintf("%.0f units", c.camMaxDist)) {
-		if c.camDist > c.camMaxDist {
-			c.camDist = c.camMaxDist
-		}
+		c.applyCameraOptions()
 	}
 	y += 48
 
@@ -2546,14 +2546,33 @@ func (c *Client) drawSettingsCamera(y, sliderX, sliderW int32) {
 	c.uiCheckbox(x, y, "Camera Collision", &c.camCollision)
 	y += 28
 
+	// VIGameOptions::m_x06: which camera third person is (ApplyOptions).
+	if c.uiCheckbox(x, y, "Fixed Follow Camera", &c.camFixedFollow) {
+		c.applyCameraOptions()
+	}
+	y += 28
+
+	c.uiCheckbox(x, y, "Free Camera Pitch (W/S)", &c.camFreePitch)
+	y += 28
+
+	c.uiCheckbox(x, y, "Remember Camera Zoom", &c.camRememberZoom)
+	y += 28
+
+	// ApplyRaceCamera: the camera turns to face the player while the menu is
+	// open, as the PS2's character panel does.
+	c.uiCheckbox(x, y, "Character View Camera", &c.camPanelView)
+	y += 28
+
 	if c.uiButton(x, y, "Reset to Defaults", 13) {
 		c.camSensitivity = 1.0
 		c.camMaxDist = 8
 		c.invertPitch = false
-		c.camCollision = false
-		if c.camDist > c.camMaxDist {
-			c.camDist = c.camMaxDist
-		}
+		c.camCollision = true
+		c.camFixedFollow = false
+		c.camFreePitch = false
+		c.camRememberZoom = false
+		c.camPanelView = true
+		c.applyCameraOptions()
 	}
 
 	if rl.IsMouseButtonReleased(rl.MouseButtonLeft) {
@@ -2561,7 +2580,11 @@ func (c *Client) drawSettingsCamera(y, sliderX, sliderW int32) {
 		cfg.MaxZoom = c.camMaxDist
 		cfg.CamSensitivity = c.camSensitivity
 		cfg.InvertPitch = c.invertPitch
-		cfg.CamCollision = c.camCollision
+		cfg.CamNoCollision = !c.camCollision
+		cfg.CamFixedFollow = c.camFixedFollow
+		cfg.CamFreePitch = c.camFreePitch
+		cfg.CamRememberZoom = c.camRememberZoom
+		cfg.CamNoPanelView = !c.camPanelView
 		saveLoginConfig(cfg)
 	}
 }
@@ -2786,15 +2809,12 @@ func (c *Client) drawMenuGroup(startY, contentH int32) {
 		y += 20
 		c.uiLabel(px, y, fmt.Sprintf("From: %s", gs.GroupInviter), 13, colorWhite)
 		rightX := px + listW
+		// The answer takes the invitation off the queue and shows the next.
 		if c.uiButtonStyled(rightX-120, y, 54, 18, "Accept", 12) {
 			c.engine.SendAcceptGroupInvite(gs.GroupInviteID)
-			gs.GroupInviteID = 0
-			gs.GroupInviter = ""
 		}
 		if c.uiButtonStyled(rightX-60, y, 54, 18, "Decline", 12) {
 			c.engine.SendDeclineGroupInvite(gs.GroupInviteID)
-			gs.GroupInviteID = 0
-			gs.GroupInviter = ""
 		}
 		y += lineH + 10
 	}
@@ -2874,12 +2894,8 @@ func (c *Client) sendGroupInviteByName(name string) {
 	nameLower := strings.ToLower(name)
 	for _, ent := range gs.Entities {
 		if ent.IsPlayer && strings.ToLower(ent.Name) == nameLower {
+			// InviteToGroup says so itself (word 637), or why not.
 			c.engine.SendGroupInvite(ent.ObjectID, ent.Name)
-			gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-				Text:    fmt.Sprintf("Invited %s to group.", ent.Name),
-				Channel: game.ChatSystem,
-				ColorR:  255, ColorG: 255, ColorB: 100,
-			})
 			return
 		}
 	}

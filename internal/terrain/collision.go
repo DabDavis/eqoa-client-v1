@@ -637,6 +637,37 @@ func (zt *ZoneTerrain) Fit(x, feetY, z float32) (floor, head float32) {
 	return floor, head
 }
 
+// CreatureFloor is the floor half of CLIENT's 0x00CBCE40, which sets a
+// creature that is not walking down on every update and every frame: a
+// sphere of radius 0.1 swept from 1.5 above (x, y, z) to 1.5 below; a hit
+// puts the creature on the floor, the sphere's centre less its radius. A
+// sweep that meets nothing leaves it where it was (false). Characters are no
+// part of it (its VIAIExtrapolateFilter rejects every VICSprite actor), and
+// they are not in the collision tiles.
+func (zt *ZoneTerrain) CreatureFloor(x, y, z float32) (float32, bool) {
+	const reach, radius = 1.5, 0.1
+	var s collSphere
+	s.init(vec3{x, y + reach, z}, vec3{x, y - reach, z}, radius)
+	if !zt.collideSphere(&s, true) {
+		return y, false
+	}
+	return s.hitPoint()[1] - radius, true
+}
+
+// ArrivalFloor is the cast CLIENT's Respawn (0x00BD5628, 0x00B2's, reach 3)
+// and MoveTo (0x00BD53A0, reach 300) set the arriving walker down with: a
+// sphere of radius 0.1 from reach above (x, y, z) to reach below, and the
+// walker's feet 0.2 below the sphere's centre where it stopped — 0.1 under a
+// floor it met (the walker steps up onto it), or 0.2 under the sweep's end
+// when it met none. (Both run the same sweep twice and throw the first
+// answer away: the second Collide is not re-aimed.)
+func (zt *ZoneTerrain) ArrivalFloor(x, y, z, reach float32) float32 {
+	var s collSphere
+	s.init(vec3{x, y + reach, z}, vec3{x, y - reach, z}, 0.1)
+	zt.collideSphere(&s, true)
+	return s.hitPoint()[1] - 0.2
+}
+
 // collideSphere sweeps s against the collision triangles around its path,
 // keeping the earliest hit — the walker's VIScene::Collide. The wall sweep
 // passes all = false and meets only the steep faces; see CalcFit.

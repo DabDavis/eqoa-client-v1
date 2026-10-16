@@ -85,43 +85,29 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 	inputRight = lx
 	inputFwd = -ly // stick Y is inverted (up = -1)
 
-	// --- Right Stick: Camera orbit (X) + Zoom/Swim (Y) ---
-	rx := gpStick(rl.GamepadAxisRightX)
-	ry := gpStick(rl.GamepadAxisRightY)
-	camRotSpeed := float32(10.0) * c.camSensitivity // Camera orbit force (rad/s²), scaled by sensitivity
-	camDH = rx * camRotSpeed // returns force magnitude, integrated by caller like keyboard
+	// --- Right Stick: the walk camera's axes (gatherCameraInput) ---
+	// x orbits (third person) or turns (first person, fixed follow); y zooms
+	// or looks. In a liquid y swims (on the PS2 that is SwimUp in third person
+	// and PitchDown's swim branch at the surface in first person).
+	camDH = gpStick(rl.GamepadAxisRightX)
+	camDV = gpStick(rl.GamepadAxisRightY)
 	if c.waterState != 0 {
 		// In water: right stick Y = ascend/descend (up = ascend, down = descend)
 		const gpSwimSpeed = float32(3.0) // PS2 InitParms+0x20 = 3.0
-		c.swimVelY = -ry * gpSwimSpeed // stick Y inverted: up=-1
-	} else if c.camMode >= 1 {
-		// Follow cam / first-person: right stick Y = pitch (look up/down).
-		if c.invertPitch {
-			camDV = -ry * camRotSpeed
-		} else {
-			camDV = ry * camRotSpeed
-		}
-	} else {
-		// Third-person: right stick Y = zoom via velocity (PS2 OrbitIn damped).
-		zoomSpeed := float32(5) * c.camSensitivity
-		c.camDistVel += ry * zoomSpeed
+		c.swimVelY = -camDV * gpSwimSpeed // stick Y inverted: up=-1
+		camDV = 0
 	}
 
-	// --- Select button: cycle camera mode ---
+	// --- Select: first/third person (VIClient::InitCameraStyle, pad code 145) ---
 	if gpPressed(rl.GamepadButtonMiddleLeft) {
-		c.cycleCameraMode()
+		c.toggleFirstPerson()
 	}
 
-	// --- R3 (right stick press): reset camera to default tether ---
+	// --- R3: back to the third-person camera, behind (a Go extra: on the
+	// PS2, R3 is code 147, VIWndGame's Enter) ---
 	if gpPressed(rl.GamepadButtonRightThumb) {
-		c.camMode = 0
-		c.firstPerson = false
-		c.camDist = 11.75 // PS2 default orbit distance
-		c.camPitch = 0.5236 // PS2 default pitch (30 degrees)
-		c.camDistVel = 0
-		c.camAngleVel = 0
-		c.camPitchVel = 0
-		log.Printf("Camera: reset to default tether")
+		c.toggleCameraStyle()
+		log.Printf("Camera: reset to %s", cameraModeName(c.wcam.mode))
 	}
 
 	// --- D-Pad: Dialogue navigation / Spell bar / target cycling ---
@@ -267,24 +253,8 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 		c.autoRun = !c.autoRun
 	}
 
-	// --- Select (Back): Toggle first/third person ---
-	if gpPressed(rl.GamepadButtonMiddleLeft) {
-		if c.camDist < 0.1 {
-			if c.camSavedDist < 1 {
-				c.camSavedDist = 11.75 // PS2 default orbit distance
-			}
-			c.camDist = c.camSavedDist
-		} else {
-			c.camSavedDist = c.camDist
-			c.camDist = 0
-		}
-	}
-
-	// --- R3 (Right stick click): Reset camera to PS2 default ---
-	if gpPressed(rl.GamepadButtonRightThumb) {
-		c.camPitch = 0.5236 // PS2 default: PI/6
-		c.camDist = 11.75   // PS2 VIWalkCamera default: InitParms+0x254
-	}
+	// Select and R3 are handled once, above (they were handled twice, so
+	// Select switched the mode and then the distance on the same press).
 
 	return
 }

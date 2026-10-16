@@ -31,7 +31,12 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 | `VIRadialFloraSystem` | 3×3 grid of 40-unit swatches, real FloraSprite meshes | `internal/terrain/flora.go` |
 | `VIWorld::StreamLeaf` | zones load within 900, unload past 950 (3D) | `cmd/client/render.go` |
 | `VIWalkControl::Move` (env half) | `ZoneTerrain.ProbeLiquid()` — the liquid bits at feet+1.2 ±0.1 and mud at the feet | `internal/terrain/water.go` |
-| `VIWalkCamera::Process` | Camera orbit in `handleInWorldInput()` | `cmd/client/input.go` |
+| `VIWalkCamera` (all of it: `Process`, `UpdateCameraPhysics`, `MoveCamera`, `SetCamera`, `Find(Best)OrbitAngle`, the setters) | `processWalkCamera` / `walkCameraView`: the mode-3 DRAG orbit (the angle re-derived from where the eye was), the pitch snap to 15°, the zoom-in to 3.5 and the 60° / eight-angle wall swing, all against the walker's scene sweep | `cmd/client/walkcamera.go`, `internal/terrain/camsweep.go` |
+| `VIClient::SetCameraStyle` / `InitCameraStyle` / `ToggleCameraStyle` / `ApplyOptions` | Styles 0 first person (race eye height), 2 fixed follow, 3 third person (default: 3.38 behind, 1.5..8, 15°, turn 2π), 1 orbit; U / Select = first ⇄ third; Fixed Follow Camera = `VIGameOptions::m_x06` | `cmd/client/walkcamera.go` |
+| `GetRaceCamera` + the two `VIRaceCamera` tables (0x00CDD8A0 / 0x00CDDD38, by `ExpansionFlags() & 2`) | `getRaceCamera`; 3 camera settings + eye height per race, pinned to the image | `cmd/client/racecam.go` |
+| `VIClient::ApplyRaceCamera` / `ApplyDefaultCamera` | the camera in FRONT of the player while the main menu is open (Character View Camera) | `cmd/client/walkcamera.go` |
+| `VIClient::ResetCamera` + `DeathCamera` | the death camera: backs away, rises, swings | `cmd/client/walkcamera.go` |
+| `VIWalkControl::SetTargetHeading` / `TurnLeft` / `PitchDown` + `UpdatePhysics`' angular half | the bang-bang turn with the overshoot snap, at the style's turn rate; first-person look | `cmd/client/walkcamera.go` |
 | `VIParticleEmitter::Update` | Analytical particle physics (birth/death/position/size/color) | `internal/game/particles.go` |
 | `VIParticleSprite::Raster` | Billboard quad rendering (camera-facing textured quads) | `internal/game/particles.go` |
 | `VISpellEffectSystem::Play` | Spell effect playback with timed event sequences | `internal/game/spelldriver.go` |
@@ -56,9 +61,9 @@ Code addresses (the old table listed name-string addresses):
 
 | PS2 VI Function | Purpose | Code Address (SUPPORT) |
 |---|---|---|
-| `VIWalkControl::UpdatePhysics` | Ground half: force/velocity damping and the bang-bang turn (the air half is ported) | `0x00486198` |
+| `VIWalkControl::UpdatePhysics` | Ground half: force/velocity damping (the air half and the angular half are ported) | `0x00486198` |
 | `VIWalkControl::UpdateLocomotion` | Locomotion state from measured displacement (only the forward run/walk thresholds are ported) | `0x00487178` |
-| `VIWalkCamera::UpdateCameraPhysics` | Drag camera, `MoveCamera` + `FindOrbitAngle` wall swing | `0x00482758` |
+| `VICameraEffect` manual camera (`VIClient::BeginManualCamera` 0x00BCE270) | the look-around VIWndGame starts 300 ms after a target cycle while modal | `0x0041DBA8` |
 | `VIWalkControl::CalcPitchRollToLandscape` | Terrain-following rotation | `0x00485FE8` |
 | `VIRStrip4` (VU1) | Character lighting — not decompiled; characters are drawn unlit | — |
 
@@ -85,7 +90,8 @@ cmd/client/                          # Raylib 3D client (~23k lines)
   charsave.go                        # Per-character JSON state persistence
   isoprompt.go                       # ISO path entry with file browser + drag-and-drop
   transmog.go                        # Client-side cosmetic equipment override
-  racecam.go                         # Per-race camera params (from CLIENT.AUT 0x00CDD8A0)
+  racecam.go                         # VIRaceCamera tables + GetRaceCamera (CLIENT 0x00CDD8A0 / 0x00CDDD38)
+  walkcamera.go                      # VIWalkCamera + CLIENT's camera styles, presets, death camera, the walker's turn
   gamepad.go                         # PS2 DualShock 2 button mapping
   entitysound.go                     # Animation-triggered positional audio
   screenshot.go                      # PrintScreen/F9 capture
@@ -510,7 +516,7 @@ ISO Prompt → Title Screen → Login → Character Select → [Create/Delete] �
 - **Character Select** (`charselect.go`): Up to 8 chars with 3D model preview, delete confirmation, per-race BGM.
 - **Character Create** (`charcreate.go`): 5-step wizard (race/gender, class, appearance, stats, name). Hardcoded base stats from Sandstorm.
 - **Loading Screen** (`loadingscreen.go`): Procedural 256x256 rotating gear, alpha fade transitions.
-- **Race Camera** (`racecam.go`): Per-race/gender camera params from CLIENT.AUT 0x00CDD8A0.
+- **Race Camera** (`racecam.go`): `VIRaceCamera`, three camera settings and an eye height per race; the table is picked by `ExpansionFlags() & 2`, not by sex.
 
 ## Character Persistence
 
@@ -577,11 +583,11 @@ configured server's folder as it last stood.
 ```bash
 xvfb-run -a ./client --offline --iso "$ISO" [--char NAME] [--pos X,Y,Z] [--facing DEG] \
     [--hour H[,H...]] [--world N] [--weather WXTYPE] [--npc 0xMODEL[:dead]]... [--npc-dist D] \
-    [--spell 0xEFFECT] [--cam DIST,PITCHDEG,ANGLEDEG] [--size WxH] \
-    [--shot out.png [--shot-wait S] [--shot-frames N]]
+    [--spell 0xEFFECT] [--cam DIST,PITCHDEG,ANGLEDEG] [--race N[:f]] [--camstyle N] [--menu] \
+    [--size WxH] [--shot out.png [--shot-wait S] [--shot-frames N]]
 ```
 
-`--shot` captures once the world has streamed in, one file per `--hour`. Repeating an hour (`--hour 12,12,12`) takes a sequence `--shot-frames` apart. `--spell` plays an effect from the player at the first NPC. Under Xvfb the client runs at about 5 fps, and physics runs during the loading screen.
+`--race` puts the default character on that race's model (`:f` female); `--camstyle` sets `SetCameraStyle`'s style at entry and `--menu` opens the main menu (the Character View Camera); `--cam` turns Free Camera Pitch on so style 3 keeps the given pitch. `--shot` captures once the world has streamed in, one file per `--hour`. Repeating an hour (`--hour 12,12,12`) takes a sequence `--shot-frames` apart. `--spell` plays an effect from the player at the first NPC. Under Xvfb the client runs at about 5 fps, and physics runs during the loading screen.
 
 ## Problem Reports (F3)
 
@@ -650,7 +656,7 @@ These are Dab's Mod's crash reports (`port/src/crashreport.c`), in two halves.
 
 ## Gamepad Support
 
-`cmd/client/gamepad.go`: PS2 DualShock 2 mapping → Raylib gamepad. Left stick = movement, right stick = camera orbit/zoom/swim, D-pad = targeting, cross/circle/square/triangle = actions. Auto-shows spell bar on first gamepad frame.
+`cmd/client/gamepad.go`: PS2 DualShock 2 mapping → Raylib gamepad. Left stick = movement, right stick = camera orbit/zoom/swim (third person) or turn/look (first person, fixed follow), Select = first ⇄ third person (CLIENT's pad code 145), D-pad = targeting, cross/circle/square/triangle = actions. Auto-shows spell bar on first gamepad frame.
 
 ## Runtime Robustness Invariants (do NOT regress — 2026-07-21)
 
@@ -698,24 +704,39 @@ A message at or below the channel's rx is dropped and the channel re-acked with 
 - Run live on Sandstorm 2026-10-15: world entry, the fragmented MemoryDump, ~110 s in world, 0 retransmits/drops.
 - **Sandstorm refuses VPN addresses**: a real login from one gets auth opcode 0x43 and a close (reported as "auth read failed: unexpected EOF").
 
-### Position Updates (0x40 — 41 bytes)
+### The player's own state, channel 0x40 (41 bytes) — `internal/game/selfstate.go`
+CLIENT's writer `func_00BC2F30`, read off the disassembly: the walk camera's COMMITTED
+`VIWalkPhysics` (`VIClient+0x6F00`), each vector quantised by `WriteQuantized` over a
+static box (built by `func_00CC6558`; a box axis with no extent writes nothing, so roll
+never goes out). Every one of the 3,315 0x40s in the PS2 captures re-encodes byte for
+byte (`TestSelfStateReencodesEveryCapturedBuffer`).
 ```
-[0]     World ID
-[1-9]   Position: X,Y,Z as uint24 big-endian
-[10-15] Velocity: uint16 (0x8000 = idle)
-[16-21] Unknown uint16×3
-[22]    Facing (0-255)
-[23]    Turning (0x80 = center)
-[24-29] Various center values
-[30-34] Flags
-[35]    Animation: 0=idle, 1=walk, 2=run
-[36]    Skip byte
-[37-40] Target ObjectID (0xFFFFFFFF = no target)
+[0]      world (m_worldId)            [22-23] heading ±π, pitch ±1.6 (wrapped to [-π,π))
+[1-9]    position, 3 B/axis           [24-25] angular velocity ±6.4, ±0.8
+         (-4000,-1000,-4000)..        [26-27] torque ±31.2, ±3.9
+         (32000,1000,32000)           [28]    target heading ±π
+[10-15]  velocity, 2 B/axis           [29-30] position.y − floor, ±2000
+         ±15.3, -84.5..3, ±15.3       [31-34] VIWalkFlags u32 LE (0x501 standing on landscape)
+[16-21]  force, 2 B/axis              [35]    m_locoState (0 idle 1 walk 2 back 3 run 6 air 12/13 swim)
+         ±62.6, ±12.51, ±62.52        [36]    auto-attack   [37-40] target u32 LE, -1 none
 ```
+Quantising: `(v − lo)` clamped to the range, × 2^(8n), ÷ range, truncated, high byte first.
+add/sub/mul chop, but **the divide rounds to nearest**: with a chopping divide 23 captured
+position axes are unreachable from any float32. Velocity y 0 is `0xF739`.
 
-**Encoding**: `uint24((X+4000)/36000 * 0xFFFFFF)` for X/Z, `uint24((Y+1000)/2000 * 0xFFFFFF)` for Y.
+**Cadence** (`VIClient::Process`, 0x00BC7F40): written every +0x7578 ms (100 from the
+constructor; 0x07B2 sets it; no capture carries one), and the frame's flush with it — the
+captures' intervals are 100 and 133 ms. **A state equal to the last is not sent at all**
+(`connection_send_state`'s iSame): no capture has two equal 0x40s in a row, and a PS2
+standing still sends none, for 23 s in `ps2_sandstorm.pcap` while Sandstorm went on
+sending entities. A newer state replaces one still queued; an unacked one is retransmitted
+under its own sequence (`Connection.QueueClientUpdate`). Go still sends each one whole
+(refnum 0), not as the PS2's XOR delta.
 
-**World entry**: All 4 reliable opcodes + first 0x40 in ONE packet. Then idle heartbeat every 3 ticks (~3.3/s).
+**World entry / teleport**: the first 0x40 is `SetLocation`'s state (flags 0x101, still)
+in the same packet as the world entry's reliable messages. Emotes are NOT in byte 35;
+CLIENT's `PlayEmote` sends an opcode. `ForcePositionFlush` has no CLIENT counterpart: it
+only brings the next write forward.
 
 ### Entity state channels (0x00-0x17, 162 bytes) — `ChannelEntity` (0x00BD41B8)
 **24 slots, channel 0 an ordinary one**: the player's own entity is the one whose id is the

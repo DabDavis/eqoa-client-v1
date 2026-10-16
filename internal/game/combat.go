@@ -19,9 +19,9 @@ import (
 // (decomp/modules/client/src/MATCHED.txt), [A] written but not matched, or
 // read off the disassembly.
 
-// noTarget is CLIENT's "no target": m_target = 0xFFFFFFFF (lui+ori). Go keeps
-// 0 in Engine.TargetObjectID for none; wireTarget converts.
-const noTarget = 0xFFFFFFFF
+// targetNone is CLIENT's "no target": m_target = 0xFFFFFFFF (lui+ori). Go keeps
+// 0 in Engine.TargetObjectID for none; noTarget (egress_senders.go) converts.
+const targetNone = 0xFFFFFFFF
 
 // targeting is the part of VIClient these functions keep on the Engine.
 // Engine.CombatEngaged is m_autoAttack (+0x71E4) and Engine.TargetObjectID
@@ -41,6 +41,11 @@ type targeting struct {
 	followID  uint32 // m_p0007C: the one followed
 
 	cycleDir int // CycleTarget's static (data_00CCE5A4): the list the last cycle used
+
+	// WalkerSteers is set by a client whose walker turns to
+	// FaceTargetHeading itself (the visual client's walk control); without
+	// one the engine's frame sets the facing outright.
+	WalkerSteers bool
 
 	clock0 time.Time
 	clock  func() int64 // tests: the game clock instead of the wall clock
@@ -71,24 +76,16 @@ func (e *Engine) gameMs() int64 {
 	return time.Since(e.clock0).Milliseconds() + 1
 }
 
-// wireTarget is a Go target id as CLIENT holds it: 0 is noTarget.
-func wireTarget(id uint32) uint32 {
-	if id == 0 {
-		return noTarget
-	}
-	return id
-}
-
 // goTarget is the other way round.
 func goTarget(id uint32) uint32 {
-	if id == noTarget {
+	if id == targetNone {
 		return 0
 	}
 	return id
 }
 
 // target is m_target.
-func (e *Engine) target() uint32 { return wireTarget(e.TargetObjectID) }
+func (e *Engine) target() uint32 { return noTarget(e.TargetObjectID) }
 
 // combatEntity is what these functions read of a VIEntity: the entity and
 // whether it is a VICreatureEntity (type 0x82; Virtual3(130) says so).
@@ -101,7 +98,7 @@ type combatEntity struct {
 // the player's own included (the self id's slot is gs.Player). An entity Go
 // holds with no slot (offline mode makes them) counts as a creature.
 func (gs *GameState) findEntity(id uint32) (combatEntity, bool) {
-	if id == noTarget {
+	if id == targetNone {
 		return combatEntity{}, false
 	}
 	for i := range gs.entitySlots {
@@ -156,7 +153,7 @@ func (e *Engine) SetTarget(id uint32) {
 	e.TargetObjectID = goTarget(id)
 	e.CombatEngaged = false
 	e.State.TargetInfoValid = false
-	e.SendTarget(wireTarget(id))
+	e.SendTarget(noTarget(id))
 }
 
 // ClearTarget is VIClient::ClearTarget (0x00BD5F38 [V]): no target, and no
@@ -172,7 +169,7 @@ func (e *Engine) ClearTarget() {
 // both pick the second member), and one past the roster's size is no target.
 func (e *Engine) SelectTarget(which int) {
 	gs := e.State
-	id := uint32(noTarget)
+	id := uint32(targetNone)
 	n := gs.groupCount()
 	switch which {
 	case 1:
@@ -241,7 +238,7 @@ func (e *Engine) CycleTarget(party bool, v *TargetView) {
 				list = append(list, targetCandidate{id: id})
 			}
 		}
-		if gs.PetID != noTarget && gs.PetID != 0 {
+		if gs.PetID != targetNone && gs.PetID != 0 {
 			list = append(list, targetCandidate{id: gs.PetID})
 		}
 	} else if v != nil {
@@ -259,7 +256,7 @@ func (e *Engine) CycleTarget(party bool, v *TargetView) {
 			}
 		}
 	}
-	next := uint32(noTarget)
+	next := uint32(targetNone)
 	switch {
 	case len(list) == 0:
 	case at == len(list):
@@ -368,7 +365,7 @@ func normXZ(x, z float32) (float32, float32) {
 // auto-attack and the target info as they were.
 func (e *Engine) SetAssistTarget(id uint32) {
 	e.TargetObjectID = goTarget(id)
-	e.SendTarget(wireTarget(id))
+	e.SendTarget(noTarget(id))
 }
 
 // CastAbility is Send0032 (0x00BCBEE8 [V]) for a hotbar slot: the ability
@@ -406,7 +403,7 @@ func (e *Engine) ToggleAutoAttack() {
 		now := e.gameMs()
 		if e.nextSwing <= now || e.nextSwing == 0 {
 			e.nextSwing = now
-			if tgt != noTarget {
+			if tgt != targetNone {
 				e.SendAttack(tgt)
 			}
 		}
@@ -739,7 +736,7 @@ func (sys *SpellEffectSystem) has(effectID uint32) bool {
 func (e *Engine) targetInRange(slot int) bool {
 	gs := e.State
 	tgt := e.target()
-	if tgt == noTarget {
+	if tgt == targetNone {
 		return false
 	}
 	t, ok := gs.findEntity(tgt)
@@ -833,20 +830,21 @@ func (e *Engine) hasAmmoFor(weapon ParsedItem) bool {
 
 // FaceTargetHeading is the target-facing half of the local walk update
 // (func_00BC3AE8 at 0x00BC3FE4, [A]): while auto-attack is on, or within a
-// second of a swing's effect (with no turn key held), the walker turns to the
-// target. CLIENT steers a bang-bang turn past 10 degrees, or in camera style
-// 3 takes the target's heading outright; Go's camera-relative walking is
-// style 3's and it has no turn rate, so this returns the heading to take. The
+// second of a swing's effect with no turn input, the walker turns to the
+// target — in camera style 3 a SetTargetHeading after the move's, in the
+// others a full turn while the target is more than 10 degrees off. This
+// returns the heading; the visual client's walker turns to it, and the
+// engine sets it outright when nothing steers the walker (headless). The
 // target must be an entity in the scene and not the player.
-func (e *Engine) FaceTargetHeading() (float32, bool) {
+func (e *Engine) FaceTargetHeading(turning bool) (float32, bool) {
 	gs := e.State
 	now := e.gameMs()
-	recent := e.lastSwingFX != 0 && now-e.lastSwingFX < 1000
+	recent := !turning && e.lastSwingFX != 0 && now-e.lastSwingFX < 1000
 	if !recent && !e.CombatEngaged {
 		return 0, false
 	}
 	tgt := e.target()
-	if tgt == noTarget || tgt == gs.PlayerObjectID {
+	if tgt == targetNone || tgt == gs.PlayerObjectID {
 		return 0, false
 	}
 	me, ok := gs.findEntity(gs.PlayerObjectID)
@@ -881,8 +879,10 @@ func (e *Engine) combatTick() {
 		gs.AssistTargetPending = false
 		e.SetAssistTarget(gs.AssistTarget)
 	}
-	if h, ok := e.FaceTargetHeading(); ok {
-		gs.Player.Facing = h
+	if !e.WalkerSteers {
+		if h, ok := e.FaceTargetHeading(false); ok {
+			gs.Player.Facing = h
+		}
 	}
 	e.autoAttackTick()
 }
@@ -973,6 +973,9 @@ func (e *Engine) ToggleFollow() {
 // Following reports whether ToggleFollow's following is on.
 func (e *Engine) Following() bool { return e.following }
 
+// StopFollow is MoveTo's and Respawn's m_p00078 = 0 (0x00BD55DC, 0x00BD586C).
+func (e *Engine) StopFollow() { e.following = false }
+
 // FollowStep is the follow half of the local walk update (func_00BC3AE8 at
 // 0x00BC41A8, [A]). Auto-attack ends following, and so does the walk stick
 // (forward input past 0.7); so does the member leaving the roster or the
@@ -996,7 +999,7 @@ func (e *Engine) FollowStep(forwardInput float32) (heading float32, move bool, w
 			}
 		}
 	}
-	if !inGroup || e.followID == noTarget || e.followID == gs.PlayerObjectID {
+	if !inGroup || e.followID == targetNone || e.followID == gs.PlayerObjectID {
 		e.following = false
 		return 0, false, false
 	}

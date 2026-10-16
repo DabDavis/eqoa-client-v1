@@ -32,8 +32,9 @@ type SessionIntake struct {
 	// Every server sends -1.
 	ExpansionFlags uint32
 
-	// P07578 is VIClient+0x7578, the u32 0x07B2 carries; the constructor
-	// sets 100. Nothing else in CLIENT reads it at that offset.
+	// P07578 is VIClient+0x7578, the u32 0x07B2 carries: the 0x40's
+	// interval in ms. VIClient::Process writes the 0x40 once it is that long
+	// since the last (0x00BC7F54, an `lwu`); the constructor sets 100.
 	P07578 uint32
 
 	// ReplyName is VIClient+0x4F0B8 (GetReplyName), the name 0x07A3 carries.

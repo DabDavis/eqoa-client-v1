@@ -24,9 +24,8 @@ type Engine struct {
 	sessionToken []byte // 32-byte token from TCP auth
 	startupCh    chan startupResult // off-thread startup I/O → main goroutine (#4)
 	tickCount    int
-	whoToken       byte   // Who list request token (increments by 2)
+	whoToken       int32  // VIClientPart38334+0x04: one more per who request (Close)
 	TargetObjectID uint32 // m_target (VIClient+0xC140), 0 for none: 0x40 bytes 37-40 carry it (0xFFFFFFFF for none)
-	chatMode       byte   // Current server-side chat mode (0=say, 3=group)
 
 	// Movement target (goto command)
 	moveTargetActive bool
@@ -71,29 +70,30 @@ type Engine struct {
 	isCSpriteCB    func(actorObjID uint32) bool
 	weaponTrailCB  func(actorObjID uint32, trailID int32, color [3]float32)
 
-	// 0x40 position send throttle — PS2 runs at 30fps and sends 0x40 at ~6/s
-	// (~every 5 frames). Visual client at 60fps must NOT queue per frame.
+	// lastPositionSend is VIClient+0x7570, when the 0x40 was last written;
+	// zero (Connect's -1) writes it on the next tick. See selfStateDue.
 	lastPositionSend time.Time
 
 	// Arrow-key walking (set by UI layer each frame)
 	Walking       bool
-	AnimByte      byte // CPlayList slot: 0=idle, 1=walk, 3=run, 4=swim (matches PS2 wire format)
-	EmoteAnimByte byte // non-zero while an emote is playing (overrides AnimByte in 0x40)
+	// AnimByte is the walker's m_locoState, 0x40 byte 35, which is also the
+	// CPlayList slot the sprite plays (VIWalkControl::UpdateSprite): 0 idle,
+	// 1 walk, 2 walk back, 3 run, 4/5 turn, 6 in the air, 10/11 strafe,
+	// 12/13 swim (UpdateLocomotion).
+	AnimByte      byte
 	InCombat      bool // true when server confirms auto-attack (sets animation byte to 0x09)
 	CombatEngaged bool // m_autoAttack (VIClient+0x71E4), 0x40 byte 36: on while the attack button is held (combat.go)
 
 	targeting // CLIENT's swing timer, target cycling and following (combat.go)
 
-	// PS2 0x40 velocity encoding — world-space velocity set by movement handler each frame.
-	// Encoded as uint16 big-endian in 0x40 bytes 10-15, 0x8000 = center (zero velocity).
-	VelX, VelY, VelZ float32
-
-	// PS2 0x40 auxiliary fields (set by visual client each frame)
-	StickMagnitude byte    // byte 24: analog stick deflection (128=center, 254=max). Keyboard: 254 when moving, 128 idle.
-	AccelState     byte    // byte 26: 0x80=steady/idle, 0xFF=accelerating, 0x00=decelerating
-	SmoothedFacing float32 // byte 28: exponentially smoothed facing (lags during turns)
-	TurnRate       float32 // byte 23: heading change rate in rad/s (0=no turn, positive=right, negative=left)
-	PrevFacing     float32 // previous frame facing for turn rate computation
+	// The walker's committed physics, which the 0x40 sends (selfstate.go),
+	// set by whatever moves the player: the visual client's walker, the
+	// headless goto, the crawler.
+	VelX, VelY, VelZ float32 // m_velocity: world space, units/s
+	ForceX, ForceZ   float32 // m_force: the walk/run thrust (DriveAccel along the move), 0 with no input
+	walkFlags        uint32  // m_flags, VIWalkFlags (SetWalkState)
+	walkFloor        float32 // m_floor, the last floor stood on
+	walkStateSet     bool    // a walker has called SetWalkState
 
 	// Deferred game server switch — avoids goroutine deadlock with Flush mutex.
 	// After server list arrives, we wait a few ticks for the ACK to go out,
@@ -309,10 +309,7 @@ func (e *Engine) Tick() {
 		e.updateMovement()
 		e.combatTick() // the frame's facing, auto-attack swing and assist target (combat.go)
 
-		// Send 0x40 position updates.
-		// The PS2 client sends 0x40 every frame even when idle. Sandstorm
-		// uses continuous 0x40 receipt to initialize EntityInRange (visibility).
-		// Without periodic updates, entity state channels never arrive.
+		// The 0x40: the world entry's, a teleport's, then the periodic one.
 		if !e.State.WorldEntryAcked {
 			e.sendWorldEntryTrigger()
 		} else if e.State.TeleportPending {
@@ -320,13 +317,12 @@ func (e *Engine) Tick() {
 			// Sandstorm waits for this before processing position at new location.
 			e.sendTeleportArrival()
 		} else {
-			// Throttle 0x40 to ~6/s (every ~166ms), matching PS2's observed
-			// rate of 5.87/s. PS2 runs at 30fps and sends 0x40 every ~5 frames.
-			// At 60fps visual client, this prevents queuing 6 XOR-chained
-			// messages per 100ms flush cycle.
-			if time.Since(e.lastPositionSend) >= 150*time.Millisecond {
+			// VIClient::Process (0x00BC7F40): the 0x40 every +0x7578 VITimer
+			// ticks -- 100 from the constructor, 0x07B2 sets it -- and the frame's
+			// flush with it. The captures' intervals are 100 and 133 ms (3 or
+			// 4 frames at 30 fps), and nothing while the state is unchanged.
+			if selfStateDue(e.lastPositionSend, time.Now(), e.State.Session.P07578) {
 				e.sendPositionUpdate()
-				e.lastPositionSend = time.Now()
 			}
 		}
 
@@ -577,190 +573,94 @@ func (e *Engine) SetPosition(x, y, z, facing float32) {
 	e.State.Player.Facing = facing
 }
 
-// sendWorldEntryTrigger sends the first 0x40 with the player's current position.
-// PS2 sends the first 0x40 in the SAME packet as the world entry opcodes
-// (CharacterInWorld + ChangeChatMode + FactionMessages + LootMessages).
-// The reliable messages were already queued by handleMemoryDump but NOT flushed.
-// We queue the 0x40, then flush everything together in one packet.
-func (e *Engine) sendWorldEntryTrigger() {
-	// Initialize smoothed facing to current facing to prevent initial lag.
-	p := &e.State.Player
-	e.SmoothedFacing = p.Facing
-	e.PrevFacing = p.Facing
-	e.AccelState = 0x80
-	e.StickMagnitude = 0x80
+// SetWalkState records the walker's flags and floor for the 0x40: its
+// VIWalkPhysics m_flags (VIWalkFlags) and m_floor, the last floor stood on.
+// A tool that never calls it sends a walker standing on landscape.
+func (e *Engine) SetWalkState(flags uint32, floor float32) {
+	e.walkFlags = flags
+	e.walkFloor = floor
+	e.walkStateSet = true
+}
 
-	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
-	e.State.Conn.Flush()
+// sendWorldEntryTrigger sends the first 0x40 with the player's current
+// position, in the same packet as the world entry's reliable messages, which
+// handleMemoryDump queued and did not flush: CLIENT's first frame after the
+// MemoryDump writes the 0x40 (Connect left +0x7570 at -1) and the frame's
+// drdp_flush carries both (every PS2 capture has 0x00CA beside its first
+// 0x40). The state is SetLocation's: still, on a floor.
+func (e *Engine) sendWorldEntryTrigger() {
+	e.sendSelfState(true)
 	e.State.WorldEntryAcked = true
 	log.Printf("sendWorldEntryTrigger: sent world entry batch + initial 0x40 in one packet")
 }
 
-// buildPositionBuffer builds a 41-byte 0x40 state buffer matching the PS2 format.
-// PS2 sends 41 bytes: position + velocity + facing + turning + flags + animation + target.
-func (e *Engine) buildPositionBuffer() []byte {
+// selfState is the walker as func_00BC2F30 reads it. At a SetLocation --
+// world entry, a teleport -- it is what VIWalkControl::SetLocation leaves:
+// no velocity, force or turn, flags onFloor plus the kept 0x100 bit, locomotion 0.
+func (e *Engine) selfState(setLocation bool) SelfState {
 	p := &e.State.Player
-
-	rawX := uint32(float64(p.X+4000.0) / 36000.0 * float64(0xFFFFFF))
-	rawY := uint32(float64(p.Y+1000.0) / 2000.0 * float64(0xFFFFFF))
-	rawZ := uint32(float64(p.Z+4000.0) / 36000.0 * float64(0xFFFFFF))
-
-	// Clamp to uint24 range
-	if rawX > 0xFFFFFF {
-		rawX = 0xFFFFFF
+	target := e.TargetObjectID
+	if target == 0 {
+		target = 0xFFFFFFFF
 	}
-	if rawY > 0xFFFFFF {
-		rawY = 0xFFFFFF
+	s := SelfState{
+		World:         p.World,
+		Position:      [3]float32{p.X, p.Y, p.Z},
+		Angles:        [3]float32{p.Facing, 0, 0},
+		TargetHeading: p.Facing,
+		Floor:         p.Y,
+		Flags:         WalkOnFloor | WalkTurnTrack | WalkLandscape,
+		Target:        target,
 	}
-	if rawZ > 0xFFFFFF {
-		rawZ = 0xFFFFFF
+	if e.walkStateSet {
+		s.Flags = e.walkFlags
+		s.Floor = e.walkFloor
 	}
-
-	// PS2 facing byte encoding:
-	// facingByte = heading * 128/PI + 128
-	// The +128 offset means: heading=0 (north/+Z) → byte 128, heading=PI (south) → byte 0.
-	// Java server reads: getByte(22) + 128, which undoes the offset to get unsigned 0-255.
-	// C# ConvertFacing: (sbyte)(byte - 128) * PI/128 recovers radians.
-	// PS2 pcap verified: facing byte 128 when facing north, 0 when facing south.
-	facingByte := byte(p.Facing*128/math.Pi) + 128
-
-	// Build 41-byte state buffer matching PS2 format exactly.
-	// The Java Sandstorm server reads the full buffer for enteredGame() / EntityInRange.
-	buf := make([]byte, 41)
-
-	// [0] World ID — must match server's world for entity visibility
-	buf[0] = p.World
-
-	// [1-9] Position: X, Y, Z as uint24 big-endian
-	buf[1] = byte(rawX >> 16)
-	buf[2] = byte(rawX >> 8)
-	buf[3] = byte(rawX)
-	buf[4] = byte(rawY >> 16)
-	buf[5] = byte(rawY >> 8)
-	buf[6] = byte(rawY)
-	buf[7] = byte(rawZ >> 16)
-	buf[8] = byte(rawZ >> 8)
-	buf[9] = byte(rawZ)
-
-	// [10-15] Velocity: VelX(uint16), VelY(uint16), VelZ(uint16) — big-endian
-	// 0x8000 = center (zero velocity). PS2 encodes actual movement velocity.
-	// Java Sandstorm decodes: vx = 15.3*2*raw/0xFFFF - 15.3 = 30.6*raw/65535 - 15.3
-	// Inverting: raw = (vx + 15.3) / 30.6 * 65535 = vx * 2142.0 + 32768
-	// So raw = 0x8000 + vx * 2142.0 (matching uint16 offset-from-center encoding).
-	//
-	// Sandstorm relays this velocity to PS2 clients via state channel bytes 40-42
-	// (scaled by speed_adjust=6.0 → int8). PS2 clients use it for dead-reckoning
-	// between state updates. Zero velocity forces PS2 to compute implicit velocity
-	// from position deltas, causing overshoot/slingshot on stop.
-	const velEncode = 65535.0 / 30.6 // 2142.16 — converts u/s to uint16 offset
-	rawVX := int(float64(e.VelX)*velEncode) + 0x8000
-	rawVZ := int(float64(e.VelZ)*velEncode) + 0x8000
-	if rawVX < 0 {
-		rawVX = 0
-	} else if rawVX > 0xFFFF {
-		rawVX = 0xFFFF
-	}
-	if rawVZ < 0 {
-		rawVZ = 0
-	} else if rawVZ > 0xFFFF {
-		rawVZ = 0xFFFF
-	}
-	buf[10] = byte(rawVX >> 8)
-	buf[11] = byte(rawVX)
-	// PS2 pcap: VelY bytes are always 0xF739 (even when idle). Not actually velocity —
-	// the server code comments `// float vy= ???`. Match PS2 exactly.
-	buf[12] = 0xF7
-	buf[13] = 0x39
-	buf[14] = byte(rawVZ >> 8)
-	buf[15] = byte(rawVZ)
-
-	// [16-21] Target Velocity — 0x8000 (center) for now.
-	// PS2 pcap shows these are input-desired velocity, but populating them
-	// may confuse Sandstorm. Keep at center until proven safe.
-	buf[16] = 0x80
-	buf[17] = 0x00
-	buf[18] = 0x80
-	buf[19] = 0x00
-	buf[20] = 0x80
-	buf[21] = 0x00
-
-	// [22] Facing (0-255 → 0-360°)
-	buf[22] = facingByte
-
-	// [23] Turning — 0x80 = center (no turn)
-	buf[23] = 0x80
-
-	// [24-29] All 0x80 center values.
-	// PS2 pcap shows byte 24 varies (stick mag), byte 26 varies (accel state),
-	// byte 28 = smoothed facing. But changing these from 0x80 causes overshoot
-	// on Sandstorm — byte 24 may act as a speed multiplier server-side.
-	buf[24] = 0x80
-	buf[25] = 0x80
-	buf[26] = 0x80
-	buf[27] = 0x80
-	buf[28] = facingByte // same as byte 22
-	buf[29] = 0x80
-
-	// [30-34] Flags/state
-	// PS2 pcap: byte 32 = 0x01 for first packet (world entry), 0x05 for all subsequent.
-	// Bit 2 (0x04) signals "fully in world" state.
-	buf[30] = 0x00
-	buf[31] = 0x01
-	if e.State.WorldEntryAcked {
-		buf[32] = 0x05 // in world
-	} else {
-		buf[32] = 0x01 // initial/entering
-	}
-	buf[33] = 0x00
-	buf[34] = 0x00
-
-	// [35] Animation byte → Sandstorm copies to state channel byte 58.
-	// PS2 clients use this for remote entity animation (idle/walk/run).
-	// Without it, PS2 shows idle while position moves → sliding.
-	// Combat anim (0x09) is NOT sent here — combat is driven by Attack
-	// opcode (0x000F), not the animation byte.
-	if e.EmoteAnimByte != 0 {
-		buf[35] = e.EmoteAnimByte
-	} else {
-		buf[35] = e.AnimByte
-	}
-
-	// [36] Auto-attack toggle — set to 1 when player presses spacebar/cross to engage.
 	if e.CombatEngaged {
-		buf[36] = 0x01
+		s.AutoAttack = 1
 	}
-
-	// [37-40] Target ObjectID (uint32 LITTLE-ENDIAN). 0xFFFFFFFF = no target.
-	// PS2 pcap confirms LE format: target 0x013CC7F3 at bytes 37-40 = F3 C7 3C 01.
-	targetID := e.TargetObjectID
-	if targetID == 0 {
-		targetID = 0xFFFFFFFF
+	if setLocation {
+		s.Flags = WalkOnFloor | s.Flags&WalkTurnTrack
+		s.Floor = p.Y
+		return s
 	}
-	buf[37] = byte(targetID)
-	buf[38] = byte(targetID >> 8)
-	buf[39] = byte(targetID >> 16)
-	buf[40] = byte(targetID >> 24)
-
-	return buf
+	s.Velocity = [3]float32{e.VelX, e.VelY, e.VelZ}
+	s.Force = [3]float32{e.ForceX, 0, e.ForceZ}
+	s.LocoState = e.AnimByte
+	return s
 }
 
-// sendPositionUpdate sends a 0x40 client update with the current position.
+// buildPositionBuffer is the 41-byte 0x40 (selfstate.go has the layout).
+func (e *Engine) buildPositionBuffer() []byte {
+	s := e.selfState(false)
+	return s.Encode()
+}
+
+// sendSelfState writes the 0x40 and flushes, as one CLIENT frame does: the
+// writer, then TickNet's drdp_flush. A state the server already has is not
+// sent again (QueueClientUpdate).
+func (e *Engine) sendSelfState(setLocation bool) {
+	s := e.selfState(setLocation)
+	e.State.Conn.QueueClientUpdate(s.Encode())
+	e.State.Conn.Flush()
+	e.lastPositionSend = time.Now()
+	e.lastFlush = e.lastPositionSend
+}
+
+// sendPositionUpdate is the periodic 0x40 (Engine.Tick).
 func (e *Engine) sendPositionUpdate() {
-	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
+	e.sendSelfState(false)
 }
 
-// ForcePositionFlush queues an immediate 0x40 position update with the current
-// target ObjectID and flushes it. Call after setting TargetObjectID to ensure
-// Sandstorm sees the target in the 0x40 buffer before processing UseSkill.
+// ForcePositionFlush writes the 0x40 now instead of at its next interval.
+// CLIENT has no such call -- the 0x40 goes out on its interval only, and
+// every message that names a target carries it (0x0010, 0x0032, 0x000F) --
+// so this only brings the next write forward; it restarts the interval.
 func (e *Engine) ForcePositionFlush() {
 	if e.State.Conn == nil || e.State.Phase != PhaseInWorld {
 		return
 	}
-	buf := e.buildPositionBuffer()
-	targetInBuf := uint32(buf[37]) | uint32(buf[38])<<8 | uint32(buf[39])<<16 | uint32(buf[40])<<24
-	log.Printf("FLUSH: 0x40 target=0x%08X facing=0x%02X anim=0x%02X", targetInBuf, buf[22], buf[35])
-	e.State.Conn.QueueClientUpdate(buf)
-	e.State.Conn.Flush()
+	e.sendPositionUpdate()
 }
 
 // sendTeleportArrival sends EnableChannel (0x0049) + fresh 0x40 after a teleport.
@@ -779,11 +679,9 @@ func (e *Engine) sendTeleportArrival() {
 		log.Printf("WARNING: EnableChannel send window full")
 	}
 
-	// 2. Send 0x40 with new position
-	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
-
-	// 3. Flush both in one packet
-	e.State.Conn.Flush()
+	// 2. The 0x40 at the new position, as SetLocation leaves the walker
+	// (MoveTo/Respawn), and 3. both in one packet.
+	e.sendSelfState(true)
 
 	log.Printf("sendTeleportArrival: 0x0049(token=%d) world=%d + 0x40 at (%.1f, %.1f, %.1f)",
 		e.State.TeleportToken, world, e.State.Player.X, e.State.Player.Y, e.State.Player.Z)
@@ -810,8 +708,8 @@ func (e *Engine) StopMovement() {
 	e.VelX = 0
 	e.VelY = 0
 	e.VelZ = 0
-	e.StickMagnitude = 0x80
-	e.AccelState = 0x80
+	e.ForceX, e.ForceZ = 0, 0
+	e.AnimByte = 0
 }
 
 // Follow starts continuously following an entity by objectID.
@@ -872,6 +770,10 @@ func (e *Engine) updateMovement() {
 	dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
 
 	if dist <= e.moveArrivalDist {
+		// Standing: nothing left to send but a walker at rest.
+		e.VelX, e.VelZ = 0, 0
+		e.ForceX, e.ForceZ = 0, 0
+		e.AnimByte = 0
 		if e.followTarget == 0 {
 			// Only print arrival for goto, not follow (follow re-acquires target each tick)
 			e.moveTargetActive = false
@@ -895,233 +797,202 @@ func (e *Engine) updateMovement() {
 	// the 0x40 facing byte encoding (heading * 128/PI) handles any range.
 	p.Facing = float32(math.Atan2(float64(dx), float64(dz)))
 
-	// Set velocity for 0x40 encoding (headless has no speed ramping).
-	e.VelX = dx * ratio / 0.1 // approximate velocity from step/tick (100ms tick)
+	// The walker's state for the 0x40: velocity from the step (100 ms
+	// tick, no ramping), the thrust that holds that speed, and the
+	// locomotion UpdateLocomotion gives it (a run past 3.58, a walk past 0.5).
+	e.VelX = dx * ratio / 0.1
 	e.VelZ = dz * ratio / 0.1
-
-	// PS2 0x40 auxiliary fields for headless client.
-	e.StickMagnitude = 254 // full deflection (no analog)
-	e.AccelState = 0x80    // steady (no ramping in headless)
-	e.SmoothedFacing = p.Facing // no lag (headless doesn't turn gradually)
+	speed := step / 0.1
+	e.ForceX, e.ForceZ = 0, 0
+	if speed > 0 {
+		accel := DriveAccel(speed) / speed
+		e.ForceX, e.ForceZ = e.VelX*accel, e.VelZ*accel
+	}
+	switch {
+	case speed > 3.0+(8.83333-3.0)*0.1:
+		e.AnimByte = 3
+	case speed > 0.5:
+		e.AnimByte = 1
+	default:
+		e.AnimByte = 0
+	}
 }
 
-// SendSay sends a local say chat message.
-// Wire format: int32(charCount) + UTF-16LE(text)
+// SendSay is "/say": 0x000E 0, the say message 0x000B (the line and the
+// target), and 0x000E back to the kept chat mode (func_00BCFE78).
 func (e *Engine) SendSay(text string) {
 	if e.State.Conn == nil {
 		return
 	}
-	// Ensure server chat mode is say (0)
-	if e.chatMode != 0 {
-		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{0})
-		e.chatMode = 0
-	}
-	runes := []rune(text)
-	data := make([]byte, 4+len(runes)*2)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
-		log.Printf("WARNING: Say send window full")
-	}
+	e.State.ChatSay(text, e.TargetObjectID)
 	log.Printf("Sent say chat: %s", text)
 }
 
-// SendShout sends a zone-wide shout chat message.
-// Wire format: byte(chatModeFlag) + int32(charCount) + UTF-16LE(text)
+// SendShout is "/shout": 0x000E 3, 0x0C01 {2, the line} (func_00CBBE10),
+// and 0x000E back.
 func (e *Engine) SendShout(text string) {
 	if e.State.Conn == nil {
 		return
 	}
-	runes := []rune(text)
-	data := make([]byte, 1+4+len(runes)*2)
-	data[0] = 1 // chat mode flag
-	binary.LittleEndian.PutUint32(data[1:5], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[5+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClientShout, data) {
-		log.Printf("WARNING: Shout send window full")
-	}
+	e.State.ChatShout(text)
 	log.Printf("Sent shout chat: %s", text)
 }
 
-// SendGroupChat sends a group chat message.
-// PS2 client sets chat mode persistently via ChangeChatMode, then sends text
-// through ClientSayChat. Server routes by active mode, not a separate opcode.
+// SendGroupChat is "/group": 0x000E 2, the say message 0x000B, and 0x000E
+// back. The server routes 0x000B by the mode, not by an opcode of its own.
 func (e *Engine) SendGroupChat(text string) {
 	if e.State.Conn == nil {
 		return
 	}
-	// Ensure server chat mode is group (2)
-	if e.chatMode != 2 {
-		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{2})
-		e.chatMode = 2
-	}
-
-	// Send text via normal say opcode (server routes by mode)
-	runes := []rune(text)
-	data := make([]byte, 4+len(runes)*2)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
-		log.Printf("WARNING: GroupChat send window full")
-	}
+	e.State.ChatGroup(text, e.TargetObjectID)
 	log.Printf("Sent group chat: %s", text)
 }
 
-// SendGuildChat sends a guild chat message.
-// Same pattern as group chat: set mode to 3 (guild), then send via ClientSayChat.
+// SendGuildChat is "/guild": 0x000E 4, the guild message 0x0578 {12, the
+// line} (func_00BEF1B0), and 0x000E back.
 func (e *Engine) SendGuildChat(text string) {
 	if e.State.Conn == nil {
 		return
 	}
-	if e.chatMode != 3 {
-		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{3})
-		e.chatMode = 3
-	}
-	runes := []rune(text)
-	data := make([]byte, 4+len(runes)*2)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
-		log.Printf("WARNING: GuildChat send window full")
-	}
+	e.State.ChatGuild(text)
 	log.Printf("Sent guild chat: %s", text)
 }
 
-// SendGuildCreate sends guild creation request (opcode 0x0469).
-// PS2 wire: int32(nameLen) + ASCII(name)
+// SendChat is a typed line with no /command, in the kept chat mode: a shout
+// in mode 3, a guild message in 4, else the say message (no 0x000E).
+func (e *Engine) SendChat(text string) {
+	if e.State.Conn == nil {
+		return
+	}
+	e.State.ChatLine(text, e.TargetObjectID)
+	log.Printf("Sent chat (mode %d): %s", e.State.ChatMode, text)
+}
+
+// SendChatCommand sends a whole /command line as the say message, slash and
+// all: "/tell" and "/t" (the server reads the name out of it), and S2's
+// forwarded commands.
+func (e *Engine) SendChatCommand(line string) {
+	if e.State.Conn == nil {
+		return
+	}
+	e.State.ChatCommand(line, e.TargetObjectID)
+	log.Printf("Sent chat command: %s", line)
+}
+
+// SendReply is "/reply": "/t <the last teller> <text>" as the say message.
+// It reports false, and sends nothing, with nobody to reply to.
+func (e *Engine) SendReply(text string) bool {
+	if e.State.Conn == nil {
+		return false
+	}
+	return e.State.ChatReply(text, e.TargetObjectID)
+}
+
+// SetChatMode is the chat window's mode choice (GroupChanged in the world).
+func (e *Engine) SetChatMode(mode byte) {
+	if e.State.Conn == nil {
+		e.State.ChatMode = mode
+		return
+	}
+	e.State.SetChatMode(mode)
+}
+
+// SendGuildCreate is 0x0578 {1, the name} (func_00BEEC08).
 func (e *Engine) SendGuildCreate(name string) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4+len(name))
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
-	copy(data[4:], name)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildCreate, data) {
-		log.Printf("WARNING: GuildCreate send window full")
-	}
+	e.State.GuildCreate(name)
 	log.Printf("Sent GuildCreate: %s", name)
 }
 
-// SendGuildLeave sends leave guild request (opcode 0x046B). No payload.
+// SendGuildLeave is 0x0578 {3} (func_00BEED98, the "Leave the guild?" answer).
 func (e *Engine) SendGuildLeave() {
 	if e.State.Conn == nil {
 		return
 	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildLeave, nil) {
-		log.Printf("WARNING: GuildLeave send window full")
-	}
+	e.State.GuildLeave()
 	log.Printf("Sent GuildLeave")
 }
 
-// SendGuildSetMOTD sends guild MOTD update (opcode 0x046F).
-// PS2 wire: int32(motdLen) + UTF-16(motd)
+// SendGuildDisband is 0x0578 {2} (func_00BEECD8, "Disband the guild?").
+func (e *Engine) SendGuildDisband() {
+	if e.State.Conn == nil {
+		return
+	}
+	e.State.GuildDisband()
+	log.Printf("Sent GuildDisband")
+}
+
+// SendGuildSetMOTD sets the guild's charter, 0x0578 {11, the text}
+// (func_00BEF0E0): the text 0x0468/1 sends back after the guild's name.
 func (e *Engine) SendGuildSetMOTD(motd string) {
 	if e.State.Conn == nil {
 		return
 	}
-	runes := []rune(motd)
-	data := make([]byte, 4+len(runes)*2)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildSetMOTD, data) {
-		log.Printf("WARNING: GuildSetMOTD send window full")
-	}
+	e.State.GuildCharter(motd)
 	log.Printf("Sent GuildSetMOTD: %s", motd)
 }
 
-// SendGuildInvite sends guild invite (opcode 0x046A).
-// PS2 wire: int32(nameLen) + ASCII(name)
+// SendGuildInvite is 0x0578 {8, the name, the guild's name} (func_00BEF478);
+// inviting oneself shows word 679 instead.
 func (e *Engine) SendGuildInvite(name string) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4+len(name))
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
-	copy(data[4:], name)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildInvite, data) {
-		log.Printf("WARNING: GuildInvite send window full")
-	}
+	e.State.InviteToGuild(name)
 	log.Printf("Sent GuildInvite: %s", name)
 }
 
-// SendGuildKick sends guild kick (opcode 0x046C).
+// SendGuildKick removes a member, 0x0578 {6, the member's id} (func_00BEF008).
+// The PS2 picks the member out of the member list; a name not in it sends
+// nothing.
 func (e *Engine) SendGuildKick(name string) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4+len(name))
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
-	copy(data[4:], name)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildKick, data) {
-		log.Printf("WARNING: GuildKick send window full")
+	if e.State.GuildRemove(name) {
+		log.Printf("Sent GuildKick: %s", name)
 	}
-	log.Printf("Sent GuildKick: %s", name)
 }
 
-// SendGroupInvite sends a group invite to a target player (opcode 0x0625).
-// Wire format: uint32(targetObjectID) + uint32(nameLen) + ASCII(name)
+// SendGroupInvite is VIClient::InviteToGroup: its checks and texts, then
+// 0x0625 {id, name}, and the invitations waiting here declined.
 func (e *Engine) SendGroupInvite(targetObjectID uint32, targetName string) {
 	if e.State.Conn == nil {
 		return
 	}
-	nameBytes := []byte(targetName)
-	data := make([]byte, 8+len(nameBytes))
-	binary.LittleEndian.PutUint32(data[0:4], targetObjectID)
-	binary.LittleEndian.PutUint32(data[4:8], uint32(len(nameBytes)))
-	copy(data[8:], nameBytes)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGroupInvite, data) {
-		log.Printf("WARNING: GroupInvite send window full")
+	if e.State.InviteToGroup(targetObjectID, targetName) {
+		log.Printf("Sent group invite: target=0x%08X name=%s", targetObjectID, targetName)
 	}
-	log.Printf("Sent group invite: target=0x%08X name=%s", targetObjectID, targetName)
 }
 
-// SendAcceptGroupInvite accepts a pending group invite (opcode 0x0622).
-// Wire format: uint32(groupID)
+// SendAcceptGroupInvite is VIClient::AcceptInvite: the oldest invitation
+// taken, 0x0622 {its id}, the rest declined. groupID is the id the menu
+// shows, which is the oldest invitation's.
 func (e *Engine) SendAcceptGroupInvite(groupID uint32) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data[0:4], groupID)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeAcceptGroupInvite, data) {
-		log.Printf("WARNING: AcceptGroupInvite send window full")
-	}
+	e.State.AcceptGroupInvite()
 	log.Printf("Sent accept group invite: groupID=%d", groupID)
 }
 
-// SendDeclineGroupInvite declines a pending group invite (opcode 0x0624).
-// Wire format: uint32(groupID)
+// SendDeclineGroupInvite is VIClient::DeclineInvite: 0x0624 {id, 1}.
 func (e *Engine) SendDeclineGroupInvite(groupID uint32) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data[0:4], groupID)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeDeclineGroupInvite, data) {
-		log.Printf("WARNING: DeclineGroupInvite send window full")
-	}
+	e.State.DeclineGroupInvite()
 	log.Printf("Sent decline group invite: groupID=%d", groupID)
 }
 
-// SendLeaveGroup leaves the current group (opcode 0x0623).
-// Wire format: (no payload)
+// SendLeaveGroup is VIClient::LeaveGroup: 0x0623, out of the group.
 func (e *Engine) SendLeaveGroup() {
 	if e.State.Conn == nil {
 		return
 	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeLeaveGroup, nil) {
-		log.Printf("WARNING: LeaveGroup send window full")
-	}
+	e.State.LeaveGroup()
 	log.Printf("Sent leave group")
 }
 
@@ -1173,20 +1044,15 @@ func (e *Engine) SendMerchantDiag(objectID uint32) {
 	log.Printf("Sent MerchantDiag: objectID=%d", objectID)
 }
 
-// SendMerchantBuy sends opcode 0x004A — buy item from merchant.
-// PS2 wire format (verified via pcap): zigzag(merchantSlot) + zigzag(quantity) + uint32(npcObjectID)
-// The NPC ObjectID prevents cross-merchant item key spoofing.
+// SendMerchantBuy is VIClient::MerchantRequest (0x00BCCA38, byte-exact):
+// SendOpSigned2Int(0x004A, slot, quantity, the merchant), the merchant being
+// the id 0x00B7 opened the window with (VIClient+0x1B300), not the target.
 func (e *Engine) SendMerchantBuy(merchantSlot int, quantity int) {
 	if e.State.Conn == nil {
 		return
 	}
-	npcObjID := e.State.Player.Target // merchant we're interacting with
-	buf := make([]byte, 16)
-	w := buffer.NewWriter(buf)
-	w.Write7BitEncodedInt64(int64(merchantSlot))
-	w.Write7BitEncodedInt64(int64(quantity))
-	w.WriteUint32(npcObjID)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantBuy, w.Bytes()) {
+	npcObjID := e.State.MerchantID
+	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantBuy, merchantBuyPayload(merchantSlot, quantity, npcObjID)) {
 		log.Printf("WARNING: MerchantBuy send window full")
 	}
 	log.Printf("Sent MerchantBuy: slot=%d qty=%d npc=0x%08X", merchantSlot, quantity, npcObjID)
@@ -1203,34 +1069,28 @@ func (e *Engine) SendMerchantBuyRaw(data []byte) {
 	log.Printf("Sent MerchantBuyRaw: %d bytes hex=%X", len(data), data)
 }
 
-// SendMerchantSell sends opcode 0x004B — sell item to merchant.
-// PS2 wire format (verified via pcap): uint32(invSlot) + zigzag(quantity)
-func (e *Engine) SendMerchantSell(invSlot int, quantity int) {
+// SendMerchantSell is VIClient::SellItem (0x00BCCA80, byte-exact):
+// SendOpIntSignedInt(0x004B, the item's KEY, quantity, the merchant). key is
+// the record's key (GetSlotId), not its place in the list.
+func (e *Engine) SendMerchantSell(key int, quantity int) {
 	if e.State.Conn == nil {
 		return
 	}
-	buf := make([]byte, 16)
-	w := buffer.NewWriter(buf)
-	w.WriteInt32(int32(invSlot))
-	w.Write7BitEncodedInt64(int64(quantity))
-	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantSell, w.Bytes()) {
+	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantSell, merchantSellPayload(key, quantity, e.State.MerchantID)) {
 		log.Printf("WARNING: MerchantSell send window full")
 	}
-	log.Printf("Sent MerchantSell: invSlot=%d qty=%d", invSlot, quantity)
+	log.Printf("Sent MerchantSell: key=%d qty=%d npc=0x%08X", key, quantity, e.State.MerchantID)
 }
 
-// SendInteractItem sends opcode 0x003E — interact with an inventory item.
-// PS2 wire format: invSlot(uint32 LE) + target(uint32 LE, 0xFFFFFFFF) + action(byte, 0x00)
-// The server determines equip/unequip/use based on item state.
+// SendInteractItem is VIClient::UseItem (0x00BCABA0, byte-exact):
+// SendOpIntIntByte(0x003E, the item's key, the target, 0). The target is
+// m_target, -1 with none: a PS2 using an item on a merchant sends the
+// merchant (ps2_main_capture). The server decides equip, unequip or use.
 func (e *Engine) SendInteractItem(invSlot int) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 9)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(invSlot))
-	binary.LittleEndian.PutUint32(data[4:8], 0xFFFFFFFF)
-	data[8] = 0x00
-	if !e.State.Conn.QueueReliable(protocol.OpcodeInteractItem, data) {
+	if !e.State.Conn.QueueReliable(protocol.OpcodeInteractItem, useItemPayload(uint32(invSlot), noTarget(e.TargetObjectID), 0)) {
 		log.Printf("WARNING: InteractItem send window full")
 	}
 	log.Printf("Sent InteractItem: invSlot=%d opcode=0x003E", invSlot)
@@ -1275,19 +1135,19 @@ func (e *Engine) SendBlacksmithOpen(npcData uint32) {
 	log.Printf("Sent BlackSmithMenu: data=0x%08X", npcData)
 }
 
-// SendRepairItem sends opcode 0x0062 — repair a specific item.
-// PS2 wire: invSlot(uint32 LE) + repairCost(uint32 LE).
-func (e *Engine) SendRepairItem(invSlot int, repairCost uint32) {
+// SendRepairItem is VIClient::Send0062 (0x00BCCC70, byte-exact):
+// SendOpIntInt(0x0062, the item's key, the blacksmith 0x0061 named).
+func (e *Engine) SendRepairItem(invSlot int, blacksmith uint32) {
 	if e.State.Conn == nil {
 		return
 	}
 	data := make([]byte, 8)
 	binary.LittleEndian.PutUint32(data[0:4], uint32(invSlot))
-	binary.LittleEndian.PutUint32(data[4:8], repairCost)
+	binary.LittleEndian.PutUint32(data[4:8], blacksmith)
 	if !e.State.Conn.QueueReliable(protocol.OpcodeRequestRepair, data) {
 		log.Printf("WARNING: RequestRepair send window full")
 	}
-	log.Printf("Sent RequestRepair: invSlot=%d cost=%d", invSlot, repairCost)
+	log.Printf("Sent RequestRepair: invSlot=%d blacksmith=0x%08X", invSlot, blacksmith)
 }
 
 // SendCloseBlacksmith sends opcode 0x0063 — close blacksmith window.
@@ -1302,14 +1162,23 @@ func (e *Engine) SendCloseBlacksmith() {
 	e.State.BlacksmithOpen = false
 }
 
-// SendPetCommand sends a PetCommands opcode (0x0041) with a 1-byte command.
-// PS2 sends byte 0x05 once before all other combat commands. Likely "engage combat"
-// or "pet attack" — the PS2 always sends it even without a pet.
+// SendPetCommand is VIClient::PetCommand (0x00BD7430): with no pet (0x007E's
+// id, HasPet), "You do not have a pet." (1021) and nothing sent; else 0x0041
+// and the command byte. The pet menu sends 0-4 and 7, and 8 with the target
+// after it (SendOpByteRaw, pet attack); 5 is only ever the "Dismiss pet?"
+// prompt's yes (Send0041), and no CLIENT path sends 6.
 func (e *Engine) SendPetCommand(cmd byte) {
 	if e.State.Conn == nil {
 		return
 	}
+	if e.State.PetID == 0xFFFFFFFF {
+		e.State.socialShowWord(1021)
+		return
+	}
 	data := []byte{cmd}
+	if cmd == 8 {
+		data = binary.LittleEndian.AppendUint32(data, noTarget(e.TargetObjectID))
+	}
 	if !e.State.Conn.QueueReliable(protocol.OpcodePetCommands, data) {
 		log.Printf("WARNING: PetCommand send window full")
 	}
@@ -1425,15 +1294,15 @@ func (e *Engine) SendClearSpellBar() {
 	log.Printf("Sent ClearSpellBar")
 }
 
-// SendWhoList sends a who list request (opcode 0x0E01).
-// Format: byte(1) + byte(token). Token is incremented per request.
+// SendWhoList is VIClientPart38334::Open (0x00C03038): Close (the token one
+// more), then 0x0E01 {1, the token, zigzag}. A raw byte stood in for the
+// zigzag and went bad at the 64th request, a one-byte varint that is not one.
 func (e *Engine) SendWhoList() {
 	if e.State.Conn == nil {
 		return
 	}
-	e.whoToken += 2
-	data := []byte{1, e.whoToken}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeWhoList, data) {
+	e.whoToken++
+	if !e.State.Conn.QueueReliable(protocol.OpcodeWhoList, whoPayload(e.whoToken)) {
 		log.Printf("WARNING: WhoList send window full")
 	}
 	log.Printf("Sent WhoList request token=%d", e.whoToken)

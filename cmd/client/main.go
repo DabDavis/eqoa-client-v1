@@ -2,7 +2,6 @@ package main
 
 import (
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -65,17 +64,14 @@ type Client struct {
 	camDist        float32 // distance from player
 	camMaxDist     float32 // max zoom-out distance (settings adjustable, hard max 300)
 	camSensitivity float32 // camera sensitivity multiplier (default 1.0)
-	camAngleVel    float32 // PS2 VIWalkCamera: angular velocity for orbit damping
-	camPitchVel    float32 // PS2 VIWalkCamera: pitch velocity for orbit damping
-	camDistVel     float32 // PS2 VIWalkCamera: distance velocity for zoom damping
-	camFollow      bool    // PS2 VIWalkCamera mode: false=tether (default), true=follow
-	camSavedDist   float32 // saved distance for camera mode toggle
-	camFollowDist  float32 // locked follow cam distance
-	firstPerson    bool    // true = first-person camera mode
-	camMode        int     // 0=tether, 1=follow, 2=first-person
+	wcam           walkCamera // VIWalkCamera's state and CLIENT's camera styles (walkcamera.go)
+	firstPerson    bool    // the walk camera is in mode 0 (setCameraMode keeps it)
 	invertPitch    bool    // invert controller pitch (stick up = look down)
-	camCollision   bool    // camera terrain/wall collision clamping
-	camCollDist    float32 // smoothed collision distance (fraction 0-1, prevents bouncing)
+	camCollision   bool    // the camera sweeps against the world (CLIENT always does; on by default)
+	camFixedFollow bool    // VIGameOptions::m_x06: third person is style 2, the fixed follow, not style 3
+	camFreePitch   bool    // Go extra: W/S pitch the third-person orbit (the PS2 snaps the pitch back)
+	camRememberZoom bool   // Go extra: the first world entry keeps the character's saved zoom
+	camPanelView   bool    // ApplyRaceCamera while the main menu is open (CLIENT's; on by default)
 	safeX, safeY, safeZ float32 // last known position outside walls
 	safeValid      bool         // true once first safe position is recorded
 
@@ -219,11 +215,9 @@ type Client struct {
 	// Chat input state
 	chatTyping      bool   // true when text input mode is active
 	chatBuffer      string // current text being typed
-	chatDefaultMode int    // default chat channel: 0=say, 1=shout, 2=group, 3=guild
 	chatModePopup    bool   // true when chat mode picker is visible
 	chatScrollOffset int    // lines scrolled up from bottom (0 = latest)
 	chatDragging     bool   // true while dragging chat scrollbar
-	lastTellSender  string // name of last player who sent a tell (for /r)
 	wrapCache       map[wrapCacheKey][]string // cached wrapText results
 
 	// Login screen state
@@ -351,6 +345,9 @@ type Client struct {
 	// Current world ID — 0=Tunaria (default), changes via MemoryDump/Teleport
 	currentWorld byte
 
+	// arrival is a Respawn placement waiting for its zone (arrival.go).
+	arrival *game.Arrival
+
 	// --offline mode (offline.go); nil in a normal session.
 	offline *offlineConfig
 
@@ -375,6 +372,7 @@ type Client struct {
 	loadScrAngle     float32        // current gear rotation angle (degrees)
 	loadScrFade      float32        // seconds remaining for loading overlay (0 = hidden)
 	lastMemDumpCount int            // tracks MemoryDumpCount to detect coaching/death
+	lastTeleportCount int           // tracks TeleportCount (0x00B2)
 
 	// Bone-attached particle emitters (CSprite PartEmitters 0x2960).
 	// PS2: CreateParticleEmitters spawns per-entity, UpdateParticleEmitters tracks bones.
@@ -500,10 +498,9 @@ func runClient() {
 	}
 
 	client := &Client{
-		camAngle:        -math.Pi * 0.75,
-		camPitch:        0.5236, // PS2 default: PI/6 (30 degrees)
-		camDist:         11.75, // PS2 VIWalkCamera default: InitParms+0x254
-		camMaxDist:      8,
+		camMaxDist:      8, // style 3's ceiling (VIClient::SetCameraStyle)
+		camCollision:    true,
+		camPanelView:    true,
 		camSensitivity:  1.0,
 		onGround:        true,
 		terrainZoneIdx:  -1,
@@ -789,6 +786,7 @@ func runClient() {
 		// SetAction callback — spell effects trigger cast/action animations.
 		// PS2 VICSprite::SetAction at 0x00421770: Fields[0] is a CPlayList slot number
 		// (e.g. 37=spell damage, 38=spell alt, 39=spell buff, 34=hit stun).
+		engine.WalkerSteers = true // the walk control turns to the target (input.go)
 		engine.SetSetActionCallback(func(actorObjID uint32, actionType int32) int {
 			return client.triggerSpellAnim(actorObjID, byte(actionType))
 		})
@@ -895,8 +893,17 @@ func runClient() {
 					// Subsequent MemoryDump = coaching or death respawn
 					client.loadScrFade = 4.0
 					log.Printf("MemoryDump #%d: loading screen triggered", engine.State.MemoryDumpCount)
+					// Every Msg000D puts the camera back behind the player.
+					client.cameraWorldEntry()
 				}
 				client.lastMemDumpCount = engine.State.MemoryDumpCount
+			}
+			// A 0x00B2 (respawn, GM teleport) shows the loading screen too; its
+			// camera half runs when the arrival sets the walker down (arrival.go).
+			if engine.State.TeleportCount > client.lastTeleportCount {
+				client.lastTeleportCount = engine.State.TeleportCount
+				client.loadScrFade = 4.0
+				log.Printf("Teleport #%d: loading screen triggered", engine.State.TeleportCount)
 			}
 
 			// Detect world change (login to different continent) — reload terrain ESF.
@@ -948,9 +955,11 @@ func runClient() {
 				if cfg.InvertPitch {
 					client.invertPitch = true
 				}
-				if cfg.CamCollision {
-					client.camCollision = true
-				}
+				client.camCollision = !cfg.CamNoCollision
+				client.camFixedFollow = cfg.CamFixedFollow
+				client.camFreePitch = cfg.CamFreePitch
+				client.camRememberZoom = cfg.CamRememberZoom
+				client.camPanelView = !cfg.CamNoPanelView
 
 				// Audio
 				if cfg.MasterVolume > 0 {
@@ -1020,19 +1029,12 @@ func runClient() {
 						p.RobeTint = ch.RobeTint
 					}
 				}
-				if save, ok := loadCharSave(engine.State.Player.Name); ok {
-					client.camDist = save.CamDist
-					client.camPitch = save.CamPitch
-					client.camAngle = save.CamAngle
-					log.Printf("CHARSAVE: restored camera for %s", engine.State.Player.Name)
-				} else {
-					// No saved camera — set PS2 race-specific defaults.
-					p := &engine.State.Player
-					rp := getRaceParams(p.Race, p.Sex)
-					client.camDist = rp.CamDist * raceCamScale
-					client.camPitch = rp.CamPitch
-					log.Printf("RACECAM: race %d sex %d → dist=%.1f pitch=%.3f",
-						p.Race, p.Sex, client.camDist, client.camPitch)
+				// Msg000D's camera: behind the player in the third-person
+				// style, 3.38 away (walkcamera.go).
+				client.cameraWorldEntry()
+				if save, ok := loadCharSave(engine.State.Player.Name); ok && client.camRememberZoom && save.CamDist > 0 {
+					client.setOrbitDistance(save.CamDist)
+					log.Printf("CHARSAVE: restored camera zoom %.2f for %s", client.camDist, engine.State.Player.Name)
 				}
 				if client.offline != nil {
 					client.offlineEnterWorld()
@@ -1065,7 +1067,9 @@ func runClient() {
 					client.handleCharSelectInput()
 				}
 			case game.PhaseInWorld:
+				client.updateArrival()
 				client.handleInWorldInput()
+				client.processWalkCamera()
 			}
 
 			// A server-ordered disconnect (0x0729, 0x07A4, 0x0777, ...).
@@ -1099,6 +1103,7 @@ func runClient() {
 			case game.PhaseInWorld:
 				// Always call drawWorld so terrain zone detection + loading runs
 				client.drawWorld()
+				client.drawFade()
 				if client.loadScrFade > 0 {
 					client.loadScrAngle += 60.0 * rl.GetFrameTime()
 					// Fade alpha: opaque for first 3s, fade out over last 1s

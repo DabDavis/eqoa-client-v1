@@ -275,6 +275,10 @@ type SocialState struct {
 	CMTree   []CMTreeEntry
 	CMPoints uint32
 
+	// ChatMode is VIClient+0x382E4, the chat mode GroupChanged keeps and
+	// sends (ChatModeSay .. ChatModeGuild); typed text goes out in it.
+	ChatMode byte
+
 	// sendHook, when set, takes the replies these handlers send (tests).
 	sendHook func(op protocol.GameOpcode, payload []byte)
 }
@@ -388,13 +392,16 @@ func (gs *GameState) NextDialogue() bool {
 // --- the group -------------------------------------------------------------
 
 // socialLeaveGroup is the tail 0x069A, 0x062F, LeaveGroup and DisbandGroup
-// share: no group, no members, no leader. (CLIENT also drops a group chat
-// mode back to Say; the Go chat mode lives in the Engine.)
+// share: no group, no members, no leader, and a group chat mode back to say
+// (`if (m_p382E4 == 2) GroupChanged(0)`).
 func (gs *GameState) socialLeaveGroup() {
 	gs.GroupActive = false
 	gs.GroupID = 0
 	gs.GroupMembers = nil
 	gs.GroupIsLeader = false
+	if gs.ChatMode == ChatModeGroup {
+		gs.GroupChanged(ChatModeSay)
+	}
 }
 
 // socialSyncInvites drops the first pending invitation once the client has
