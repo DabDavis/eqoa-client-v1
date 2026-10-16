@@ -781,7 +781,7 @@ func (c *Client) setCameraLocation(pitch float32) {
 	c.moveCamera()
 }
 
-// resetCameraBehind is the camera half of VIClient::MoveTo (0x00BC4C08) and
+// resetCameraBehind is the camera half of VIClient::MoveTo (0x00BD53A0 [V]) and
 // Respawn, which Msg00B2 (0x00BD38C8 [V]) runs: SetLocation at the walker's
 // new position and heading, then SetOrbitAngleBehind. The style is kept.
 // Whoever places the walker on the ground calls it afterwards.
