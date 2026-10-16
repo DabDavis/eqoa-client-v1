@@ -118,11 +118,11 @@ func (gs *GameState) handleQuestDialogueResp(msg *protocol.Message) {
 		return
 	}
 	gs.ProfanityFilter = on != 0
-	text := gs.socialWord(550) + ": "
+	text := gs.wordText(550) + ": "
 	if on != 0 {
-		text += gs.socialWord(551)
+		text += gs.wordText(551)
 	} else {
-		text += gs.socialWord(552)
+		text += gs.wordText(552)
 	}
 	gs.socialShowText(text)
 }
@@ -192,7 +192,7 @@ func (gs *GameState) handleQuestStageComplete(msg *protocol.Message) {
 	gs.TrainingPoints = tp
 	log.Printf("TrainingPoints: %d -> %d (flag %d)", old, tp, flag)
 	if tp != old {
-		gs.socialShowDialog(0, gs.socialWord(625))
+		gs.socialShowDialog(0, gs.wordText(625))
 	}
 }
 
@@ -250,7 +250,7 @@ func (gs *GameState) handleGuildWorldEntry(msg *protocol.Message) {
 		case 2:
 			gs.socialShowWord(566)
 		case 6:
-			gs.socialShowText(socialFormat(gs.socialWord(567), guildCreateCost))
+			gs.socialShowText(socialFormat(gs.wordText(567), guildCreateCost))
 		case 7:
 			gs.socialShowWord(568)
 		}
@@ -461,7 +461,7 @@ func (gs *GameState) handleNPCMessage(msg *protocol.Message) {
 		word = 611
 	}
 	gs.Summon = &SummonRequest{Name: name, Resurrect: c != 0}
-	text := name + gs.socialWord(word)
+	text := name + gs.wordText(word)
 	log.Printf("Summon: %s", text)
 	gs.socialShowText(text)
 }
@@ -621,7 +621,7 @@ func (gs *GameState) handleIgnoreListResult(msg *protocol.Message) {
 		gs.socialShowWord(1544)
 	case 5:
 		gs.TradeskillSerial = s.u32()
-		gs.socialLine(gs.socialWord(1567), ChatError, socialRed)
+		gs.socialLine(gs.wordText(1567), ChatError, socialRed)
 	case 12:
 		result := s.u8()
 		gs.TradeskillSerial = s.u32()
@@ -917,19 +917,19 @@ func (gs *GameState) handleGuildInviteStuff(msg *protocol.Message) {
 		}
 		switch {
 		case gs.socialBusy():
-			gs.socialShowText(socialFormat(gs.socialWord(650), name))
+			gs.socialShowText(socialFormat(gs.wordText(650), name))
 			reply(2)
 		case gs.InGuild:
 			reply(4)
 		default:
 			gs.GuildInvite = &GuildInviteEntry{ID: id, Name: name, GuildName: guild}
-			gs.socialShowText(fmt.Sprintf("%s %s (%s)", gs.socialWord(535), name, guild))
+			gs.socialShowText(fmt.Sprintf("%s %s (%s)", gs.wordText(535), name, guild))
 		}
 		log.Printf("GuildInvite: from %s (0x%08X) to %q", name, id, guild)
 	case 2:
 		s.zigzag()
 		name := s.str8(24)
-		gs.socialShowText(socialFormat(gs.socialWord(557), name))
+		gs.socialShowText(socialFormat(gs.wordText(557), name))
 	case 3:
 		code := s.u8()
 		name := s.str8(24)
@@ -937,7 +937,7 @@ func (gs *GameState) handleGuildInviteStuff(msg *protocol.Message) {
 		if !ok {
 			word = 558
 		}
-		gs.socialShowText(socialFormat(gs.socialWord(word), name))
+		gs.socialShowText(socialFormat(gs.wordText(word), name))
 	default:
 		log.Printf("GuildInvite: sub-type %d ignored", sub)
 	}
@@ -960,14 +960,14 @@ func (gs *GameState) handleBuffNotification(msg *protocol.Message) {
 	gs.BuddyRequestName = name
 	switch {
 	case gs.socialBusy():
-		gs.socialShowText(socialFormat(gs.socialWord(649), name))
+		gs.socialShowText(socialFormat(gs.wordText(649), name))
 		gs.socialSendMsg(protocol.GameOpcode(0x0368), id, 1)
 		gs.BuddyRequestID = 0xFFFFFFFF
 	case len(gs.Buddies) >= 32:
 		gs.socialSendMsg(protocol.GameOpcode(0x0368), id, 8)
 		gs.BuddyRequestID = 0xFFFFFFFF
 	default:
-		gs.socialShowText(gs.socialWord(519) + " " + name)
+		gs.socialShowText(gs.wordText(519) + " " + name)
 	}
 	log.Printf("BuddyInvite: from %s (0x%08X)", name, id)
 }
@@ -1000,36 +1000,6 @@ func (gs *GameState) handleCombatEnd(msg *protocol.Message) {
 	gs.serverDisconnect(0, true)
 }
 
-// handleNPCInteractResult handles opcodes 0x0729 / 0x0773 — NPC interaction result.
-// PS2: reads entityID(uint32) + actionType(uint32) + nameString(24 bytes).
-// Server confirms which NPC was interacted with and the result type.
-func (gs *GameState) handleNPCInteractResult(msg *protocol.Message) {
-	data := msg.Data()
-	payload := data[2:] // skip opcode
-	if len(payload) < 8 {
-		return
-	}
-	entityID := binary.LittleEndian.Uint32(payload[0:4])
-	actionType := binary.LittleEndian.Uint32(payload[4:8])
-	name := ""
-	if len(payload) >= 32 {
-		nameBytes := payload[8:32]
-		for i, b := range nameBytes {
-			if b == 0 {
-				name = string(nameBytes[:i])
-				break
-			}
-		}
-	}
-	log.Printf("NPCInteractResult: entity=0x%08X action=%d name=%q", entityID, actionType, name)
-
-	// PS2: calls SetAction on the NPC actor to play interaction animation
-	// (turn to face player, gesture, etc). actionType maps to a CPlayList slot.
-	if gs.SpellFXSys != nil && gs.SpellFXSys.OnSetAction != nil && entityID != 0 {
-		gs.SpellFXSys.OnSetAction(entityID, int32(actionType))
-	}
-}
-
 // handleColoredChat — see state.go for existing implementation of 0x0A7A / 0x0A7B.
 
 // handleAddBuddyFailed is 0x03D8: "Add buddy failed: Your buddy's buddy list
@@ -1052,7 +1022,7 @@ func (gs *GameState) handleBuddyListStuff(msg *protocol.Message) {
 		log.Printf("InviteResult: code %d from %q not shown", code, name)
 		return
 	}
-	gs.socialShowText(socialFormat(gs.socialWord(word), name))
+	gs.socialShowText(socialFormat(gs.wordText(word), name))
 }
 
 // handleFactionPage is 0x07E2, VIClientPart4F078::Recv07E2 (0x00BEA820): a
@@ -1145,7 +1115,7 @@ func (gs *GameState) handleClassMasteryServer(msg *protocol.Message) {
 		}
 		if old := gs.CMPoints; points > old {
 			if n := points - old; n >= 2 {
-				gs.socialShowText(socialFormat(gs.socialWord(1627), n))
+				gs.socialShowText(socialFormat(gs.wordText(1627), n))
 			} else {
 				gs.socialShowWord(1628)
 			}

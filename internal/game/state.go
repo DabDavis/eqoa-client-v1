@@ -636,8 +636,20 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleErrorMessage(msg)
 	case protocol.OpcodeGroupChat:
 		gs.handleGroupChat(msg)
-	case protocol.OpcodeNPCInteractResult2:
-		gs.handleNPCInteractResult(msg)
+	case protocol.OpcodeNPCInteractResult2: // 0x0773: a group invitation
+		gs.handleGroupInvite(msg)
+	case protocol.OpcodeGroupStuff: // 0x069C
+		gs.handleGroupStuff(msg)
+	case protocol.GameOpcode(0x0774): // the invitation was cancelled
+		gs.handleGroupInviteCancel(msg)
+	case protocol.OpcodeGroupInviteAcceptedMessage: // 0x0770
+		gs.handleGroupInviteAccepted(msg)
+	case protocol.OpcodeBuddyListFull: // 0x03D7
+		gs.handleBuddyListFull(msg)
+	case protocol.OpcodeAddPetToGroup: // 0x007E: the pet is set
+		gs.handlePetSet(msg)
+	case protocol.OpcodeRandomName: // 0x0012
+		gs.handleRandomName(msg)
 	case protocol.OpcodeCreateGroup:
 		gs.handleCreateGroup(msg)
 	case protocol.OpcodeRemoveGroupMember:
@@ -1922,7 +1934,7 @@ func (gs *GameState) handleAdminCode(msg *protocol.Message) {
 	case 50:
 		// The prompt is a game-window dialog the Go client does not have;
 		// its text goes to the chat window.
-		text := gs.sessionWord(1189) + " " + psWString(r, 64)
+		text := gs.word(1189) + " " + psWString(r, 64)
 		log.Printf("AdminCode: prompt %q", text)
 		gs.addChatMessage(text, ChatSystem)
 	default:
@@ -2036,7 +2048,7 @@ func (gs *GameState) handleGroupInvite(msg *protocol.Message) {
 	gs.GroupInviter = gs.GroupInvites[0].Name
 	log.Printf("GroupInvite: %s (id=0x%08X x=0x%08X), %d pending", name, id, x, len(gs.GroupInvites))
 	if !gs.socialBusy() {
-		gs.socialLine(socialFormat(gs.socialWord(636), name), ChatSystem, socialWhite)
+		gs.socialLine(socialFormat(gs.wordText(636), name), ChatSystem, socialWhite)
 	}
 }
 
@@ -3836,17 +3848,17 @@ func (gs *GameState) handleGuildInfo(msg *protocol.Message) {
 		gs.socialLine(text, ChatGuild, socialGuild)
 	case 6, 7, 8, 9, 10, 11, 12, 16:
 		word := map[byte]int{6: 578, 7: 579, 8: 579, 9: 580, 10: 581, 11: 582, 12: 583, 16: 1041}[sub]
-		gs.socialLine(gs.socialWord(word), ChatGuild, socialWhite)
+		gs.socialLine(gs.wordText(word), ChatGuild, socialWhite)
 	case 13:
 		gs.GuildChatVisible = true
-		gs.socialLine(gs.socialWord(647), ChatGuild, socialWhite)
+		gs.socialLine(gs.wordText(647), ChatGuild, socialWhite)
 	case 14:
 		gs.GuildChatVisible = false
-		gs.socialLine(gs.socialWord(648), ChatGuild, socialWhite)
+		gs.socialLine(gs.wordText(648), ChatGuild, socialWhite)
 	case 15:
 		who := s.str8(24)
 		added := s.str8(24)
-		gs.socialLine(socialFormat(gs.socialWord(717), who, added), ChatGuild, socialWhite)
+		gs.socialLine(socialFormat(gs.wordText(717), who, added), ChatGuild, socialWhite)
 	default:
 		log.Printf("GuildInfo: sub-type %d ignored (%d bytes)", sub, len(msg.Data()))
 	}

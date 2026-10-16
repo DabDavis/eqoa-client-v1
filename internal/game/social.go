@@ -202,11 +202,6 @@ type CMTreeEntry struct {
 
 // SocialState is what the social handlers keep. GameState embeds it.
 type SocialState struct {
-	// Words is the string table, WORDS.TXT. A field of the same name on
-	// GameState itself takes precedence over this one; either way an empty
-	// table falls back to socialWords' retail English.
-	Words Words
-
 	// Buddies is m_buddies, a map keyed and ordered by id.
 	Buddies []BuddyEntry
 
@@ -288,86 +283,11 @@ type SocialState struct {
 
 // --- text ----------------------------------------------------------------
 
-// socialWords are the retail English strings these handlers print, for when
-// no WORDS.TXT is loaded (the headless tool, tests).
-var socialWords = map[int]string{
-	519:  "Buddy invite from . . .",
-	535:  "Guild invite from . . .",
-	546:  "You are not qualified for that operation",
-	550:  "Profanity Filter",
-	551:  "On",
-	552:  "Off",
-	557:  "%s has accepted your invitation.",
-	558:  "%s has declined your invitation.",
-	559:  "%s is busy and cannot accept invitations.",
-	560:  "%s cannot accept invitations.",
-	563:  "Guild create failed: ",
-	564:  "Guild disband failed: ",
-	565:  "One or more group members are already in guilds.",
-	566:  "That guild name belongs to another guild.",
-	567:  "You must have at least %u Tunar to create a guild.",
-	568:  "You must be the leader of a full group to create a guild.",
-	570:  "You are not in a guild.",
-	576:  "%s is already in a guild and cannot accept invitations.",
-	578:  "The group leader has created a guild.",
-	579:  "Your guild rank has changed.",
-	580:  "Guild joined.",
-	581:  "The guild charter has changed.",
-	582:  "The guild has been disbanded.",
-	583:  "You have been removed from the guild.",
-	584:  "Invite failed: The guild is full.",
-	586:  "%s has a full buddy list and cannot accept invitations.",
-	587:  "Invitation to %s has expired.",
-	589:  "Invitation failed: Too many open invites.",
-	590:  "Add buddy failed: Your buddy list is full.",
-	591:  "Add buddy failed: Your buddy's buddy list is full.",
-	592:  "%s is already in your buddy list.",
-	610:  "wants to summon you, do you accept?",
-	611:  "wants to resurrect you, do you accept?",
-	625:  "You have received more training points!",
-	627:  "Recipient not found.",
-	628:  "%s is already in a group.",
-	630:  "The group leader has ejected you.",
-	631:  "The group has been disbanded.",
-	632:  "You have not been invited into this group.",
-	633:  "The group is full.",
-	634:  "Your group has been lost.",
-	635:  "Invitation cancelled.",
-	636:  "%s sends you a group invitation.  Accept?",
-	642:  "%s is ignoring you.",
-	647:  "Messages from your guild are visible.",
-	648:  "Messages from your guild are hidden.",
-	649:  "%s sends you a buddy list invitation, but you are busy.",
-	650:  "%s sends you a guild invitation, but you are busy.",
-	717:  "%s has added %s to the guild.",
-	745:  "\"Member\" is the lowest rank and cannot be demoted.",
-	838:  "There is no target for assisting.",
-	839:  "Your mail has been sent.",
-	840:  "Message deleted.",
-	1022: "%s is still loading.",
-	1041: "The guild has been disbanded by a server administrator.",
-	1437: "You damaged your pole",
-	1544: "You have scribed a new recipe.",
-	1567: "You have not yet recovered.",
-	1627: "You have earned %d mastery points.",
-	1628: "You have earned 1 mastery point.",
-}
 
 // guildCreateCost is the Tunar a guild costs, the word CLIENT formats into
 // string 567 (data_00CD7A50).
 const guildCreateCost = 5000
 
-// socialWord is VIStringTable::GetString(n): the loaded table's line, else
-// the retail one.
-func (gs *GameState) socialWord(n int) string {
-	if s := gs.Words.Get(n); s != "" {
-		return s
-	}
-	if s, ok := socialWords[n]; ok {
-		return s
-	}
-	return fmt.Sprintf("#%d", n)
-}
 
 // socialFormat is the part of VIString::snprintf16 the words use: %s and %S
 // take a string, %d and %u a number, %% is a percent sign.
@@ -416,7 +336,7 @@ func (gs *GameState) socialLine(text string, ch ChatChannel, c [3]uint8) {
 // socialShowWord is ShowMsg(id); socialShowText is ShowText. Both are a
 // white chat line.
 func (gs *GameState) socialShowWord(id int) {
-	gs.socialLine(gs.socialWord(id), ChatSystem, socialWhite)
+	gs.socialLine(gs.wordText(id), ChatSystem, socialWhite)
 }
 
 func (gs *GameState) socialShowText(text string) {
@@ -540,7 +460,7 @@ func (gs *GameState) handleGroupStuff(msg *protocol.Message) {
 		gs.socialShowWord(627)
 	case 1, 2, 4, 5:
 		name := s.str8(24)
-		gs.socialShowText(socialFormat(gs.socialWord(word[sub]), name))
+		gs.socialShowText(socialFormat(gs.wordText(word[sub]), name))
 	default:
 		log.Printf("GroupStuff: sub %d ignored", sub)
 	}
@@ -570,7 +490,7 @@ func (gs *GameState) handleGroupInviteCancel(msg *protocol.Message) {
 func (gs *GameState) handleGroupInviteAccepted(msg *protocol.Message) {
 	s := newSocialStream(msg)
 	name := s.str8(24)
-	gs.socialShowText(socialFormat(gs.socialWord(557), name))
+	gs.socialShowText(socialFormat(gs.wordText(557), name))
 }
 
 // --- buddies -----------------------------------------------------------------

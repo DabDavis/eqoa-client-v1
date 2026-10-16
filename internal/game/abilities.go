@@ -429,25 +429,7 @@ func (gs *GameState) handleAbilityRemove(msg *protocol.Message) {
 	gs.refreshHotbar()
 }
 
-// abilityWords are the retail English strings this file prints, for when no
-// WORDS.TXT is loaded (the headless tool, tests).
-var abilityWords = map[int]string{
-	721:  "You have gained a new ability.",
-	824:  "You have memorized %S.",
-	825:  "You have forgotten %S.",
-	1196: "You are outmatched. Attacking again is not advised.",
-}
 
-// wordText is string id n from the client's WORDS.TXT, or its retail text.
-func (gs *GameState) wordText(n int) string {
-	if s := gs.Words.Get(n); s != "" {
-		return s
-	}
-	if s, ok := abilityWords[n]; ok {
-		return s
-	}
-	return fmt.Sprintf("#%d", n)
-}
 
 // addWordLine is VIWndGame::AddText: one line in the chat window, in a colour.
 func (gs *GameState) addWordLine(text string, r, g, b uint8) {

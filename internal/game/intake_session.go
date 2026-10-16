@@ -159,47 +159,7 @@ func psSigned(r *buffer.Reader) (int32, error) {
 
 // ----------------------------------------------------------------- words --
 
-// sessionWords are the retail WORDS.TXT strings this file shows, for when
-// the client has no word table (tests, headless, before one is loaded).
-// A word id is its line in WORDS.TXT (Words.Get).
-var sessionWords = map[int]string{
-	269:  "Character create failed",
-	270:  "Bad Login/Password",
-	272:  "Disconnected",
-	431:  "Server not found. (DNS error)",
-	593:  "Not Subscribed.",
-	594:  "Network Error.",
-	619:  "You have logged in from another location.",
-	620:  "Server not ready, please try again later. (nodbs)",
-	621:  "Server not ready, please try again later. (loginto)",
-	666:  "The server that you were connected to is currently unavailable.  Try back again later",
-	667:  "Connection problem or server currently unavailable",
-	676:  "That character is in an area of the world that is currently unavailable.  Please try again later.",
-	677:  "Your character is in an area of the world that is temporarily unavailable.",
-	716:  "You have been ejected by a server administrator.",
-	718:  "We are updating the game, please try again later.",
-	719:  "Disconnected (server restarted).",
-	758:  "Connecting...",
-	819:  "Code",
-	820:  "Logged out.",
-	821:  "ISP Connection Lost.",
-	822:  "Connected",
-	828:  "Failed: invalid name",
-	829:  "Failed: name already taken",
-	1017: "Connection Problem",
-	1024: "The server has been shutdown by a server administrator.",
-	1189: "Give item:",
-	1420: "This character has been modified by a customer service representative.",
-	1662: "Although you are registered to play EverQuest Online Adventures: Frontiers, you are not using a Frontiers disc. You cannot access characters that are currently located in or bound to the Frontiers areas. If you would like full access to the Frontiers features, please insert a copy of EverQuest Online Adventures: Frontiers and reset your console.",
-}
 
-// sessionWord is m_ui.m_words.GetString(n): the loaded table's, else retail's.
-func (gs *GameState) sessionWord(n int) string {
-	if s := gs.Words.Get(n); s != "" {
-		return s
-	}
-	return sessionWords[n]
-}
 
 // ------------------------------------------------------------ disconnect --
 
@@ -233,11 +193,11 @@ func (gs *GameState) ConnectStatusString(reason int, code int, hasCode bool) str
 	if reason < 0 || reason >= len(connectStatusWords) {
 		return "" // "ConnectStatusString() : error"
 	}
-	w := gs.sessionWord(connectStatusWords[reason])
+	w := gs.word(connectStatusWords[reason])
 	if hasCode {
 		switch reason {
 		case 0:
-			return fmt.Sprintf("%s (%s: %d)", w, gs.sessionWord(819), code)
+			return fmt.Sprintf("%s (%s: %d)", w, gs.word(819), code)
 		case 10:
 			return fmt.Sprintf("%s (%d)", w, code)
 		}
@@ -331,7 +291,7 @@ func (gs *GameState) handleServerDisconnect(msg *protocol.Message) {
 // 0x07F2/0x07F4 show 1662, 0x07F0/0x07F1/0x07F3 676.
 func (gs *GameState) charSelectMsg(word int) {
 	gs.Phase = PhaseCharSelect
-	gs.Session.CharSelectMessage = gs.sessionWord(word)
+	gs.Session.CharSelectMessage = gs.word(word)
 	gs.StatusMsg = gs.Session.CharSelectMessage
 	log.Printf("CharSelectMsg(%d): %q", word, gs.Session.CharSelectMessage)
 }
@@ -354,7 +314,7 @@ func (gs *GameState) handleCharSelectMsg(msg *protocol.Message) {
 // login window shows the word and m_charCount comes down by one. The Go client
 // counts characters off the list the server sends, so only the text is kept.
 func (gs *GameState) createFailed(word int) {
-	gs.CreateError = gs.sessionWord(word)
+	gs.CreateError = gs.word(word)
 	log.Printf("Character create failed (word %d): %q", word, gs.CreateError)
 }
 
