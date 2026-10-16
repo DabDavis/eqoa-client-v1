@@ -31,7 +31,12 @@ See [root CLAUDE.md](../CLAUDE.md) for project overview, research notes, ISO rev
 | `VIRadialFloraSystem` | 3×3 grid of 40-unit swatches, real FloraSprite meshes | `internal/terrain/flora.go` |
 | `VIWorld::StreamLeaf` | zones load within 900, unload past 950 (3D) | `cmd/client/render.go` |
 | `VIWalkControl::Move` (env half) | `ZoneTerrain.ProbeLiquid()` — the liquid bits at feet+1.2 ±0.1 and mud at the feet | `internal/terrain/water.go` |
-| `VIWalkCamera::Process` | Camera orbit in `handleInWorldInput()` | `cmd/client/input.go` |
+| `VIWalkCamera` (all of it: `Process`, `UpdateCameraPhysics`, `MoveCamera`, `SetCamera`, `Find(Best)OrbitAngle`, the setters) | `processWalkCamera` / `walkCameraView`: the mode-3 DRAG orbit (the angle re-derived from where the eye was), the pitch snap to 15°, the zoom-in to 3.5 and the 60° / eight-angle wall swing, all against the walker's scene sweep | `cmd/client/walkcamera.go`, `internal/terrain/camsweep.go` |
+| `VIClient::SetCameraStyle` / `InitCameraStyle` / `ToggleCameraStyle` / `ApplyOptions` | Styles 0 first person (race eye height), 2 fixed follow, 3 third person (default: 3.38 behind, 1.5..8, 15°, turn 2π), 1 orbit; U / Select = first ⇄ third; Fixed Follow Camera = `VIGameOptions::m_x06` | `cmd/client/walkcamera.go` |
+| `GetRaceCamera` + the two `VIRaceCamera` tables (0x00CDD8A0 / 0x00CDDD38, by `ExpansionFlags() & 2`) | `getRaceCamera`; 3 camera settings + eye height per race, pinned to the image | `cmd/client/racecam.go` |
+| `VIClient::ApplyRaceCamera` / `ApplyDefaultCamera` | the camera in FRONT of the player while the main menu is open (Character View Camera) | `cmd/client/walkcamera.go` |
+| `VIClient::ResetCamera` + `DeathCamera` | the death camera: backs away, rises, swings | `cmd/client/walkcamera.go` |
+| `VIWalkControl::SetTargetHeading` / `TurnLeft` / `PitchDown` + `UpdatePhysics`' angular half | the bang-bang turn with the overshoot snap, at the style's turn rate; first-person look | `cmd/client/walkcamera.go` |
 | `VIParticleEmitter::Update` | Analytical particle physics (birth/death/position/size/color) | `internal/game/particles.go` |
 | `VIParticleSprite::Raster` | Billboard quad rendering (camera-facing textured quads) | `internal/game/particles.go` |
 | `VISpellEffectSystem::Play` | Spell effect playback with timed event sequences | `internal/game/spelldriver.go` |
@@ -56,9 +61,9 @@ Code addresses (the old table listed name-string addresses):
 
 | PS2 VI Function | Purpose | Code Address (SUPPORT) |
 |---|---|---|
-| `VIWalkControl::UpdatePhysics` | Ground half: force/velocity damping and the bang-bang turn (the air half is ported) | `0x00486198` |
+| `VIWalkControl::UpdatePhysics` | Ground half: force/velocity damping (the air half and the angular half are ported) | `0x00486198` |
 | `VIWalkControl::UpdateLocomotion` | Locomotion state from measured displacement (only the forward run/walk thresholds are ported) | `0x00487178` |
-| `VIWalkCamera::UpdateCameraPhysics` | Drag camera, `MoveCamera` + `FindOrbitAngle` wall swing | `0x00482758` |
+| `VICameraEffect` manual camera (`VIClient::BeginManualCamera` 0x00BCE270) | the look-around VIWndGame starts 300 ms after a target cycle while modal | `0x0041DBA8` |
 | `VIWalkControl::CalcPitchRollToLandscape` | Terrain-following rotation | `0x00485FE8` |
 | `VIRStrip4` (VU1) | Character lighting — not decompiled; characters are drawn unlit | — |
 
@@ -85,7 +90,8 @@ cmd/client/                          # Raylib 3D client (~23k lines)
   charsave.go                        # Per-character JSON state persistence
   isoprompt.go                       # ISO path entry with file browser + drag-and-drop
   transmog.go                        # Client-side cosmetic equipment override
-  racecam.go                         # Per-race camera params (from CLIENT.AUT 0x00CDD8A0)
+  racecam.go                         # VIRaceCamera tables + GetRaceCamera (CLIENT 0x00CDD8A0 / 0x00CDDD38)
+  walkcamera.go                      # VIWalkCamera + CLIENT's camera styles, presets, death camera, the walker's turn
   gamepad.go                         # PS2 DualShock 2 button mapping
   entitysound.go                     # Animation-triggered positional audio
   screenshot.go                      # PrintScreen/F9 capture
@@ -510,7 +516,7 @@ ISO Prompt → Title Screen → Login → Character Select → [Create/Delete] �
 - **Character Select** (`charselect.go`): Up to 8 chars with 3D model preview, delete confirmation, per-race BGM.
 - **Character Create** (`charcreate.go`): 5-step wizard (race/gender, class, appearance, stats, name). Hardcoded base stats from Sandstorm.
 - **Loading Screen** (`loadingscreen.go`): Procedural 256x256 rotating gear, alpha fade transitions.
-- **Race Camera** (`racecam.go`): Per-race/gender camera params from CLIENT.AUT 0x00CDD8A0.
+- **Race Camera** (`racecam.go`): `VIRaceCamera`, three camera settings and an eye height per race; the table is picked by `ExpansionFlags() & 2`, not by sex.
 
 ## Character Persistence
 
@@ -577,11 +583,11 @@ configured server's folder as it last stood.
 ```bash
 xvfb-run -a ./client --offline --iso "$ISO" [--char NAME] [--pos X,Y,Z] [--facing DEG] \
     [--hour H[,H...]] [--world N] [--weather WXTYPE] [--npc 0xMODEL[:dead]]... [--npc-dist D] \
-    [--spell 0xEFFECT] [--cam DIST,PITCHDEG,ANGLEDEG] [--size WxH] \
-    [--shot out.png [--shot-wait S] [--shot-frames N]]
+    [--spell 0xEFFECT] [--cam DIST,PITCHDEG,ANGLEDEG] [--race N[:f]] [--camstyle N] [--menu] \
+    [--size WxH] [--shot out.png [--shot-wait S] [--shot-frames N]]
 ```
 
-`--shot` captures once the world has streamed in, one file per `--hour`. Repeating an hour (`--hour 12,12,12`) takes a sequence `--shot-frames` apart. `--spell` plays an effect from the player at the first NPC. Under Xvfb the client runs at about 5 fps, and physics runs during the loading screen.
+`--race` puts the default character on that race's model (`:f` female); `--camstyle` sets `SetCameraStyle`'s style at entry and `--menu` opens the main menu (the Character View Camera); `--cam` turns Free Camera Pitch on so style 3 keeps the given pitch. `--shot` captures once the world has streamed in, one file per `--hour`. Repeating an hour (`--hour 12,12,12`) takes a sequence `--shot-frames` apart. `--spell` plays an effect from the player at the first NPC. Under Xvfb the client runs at about 5 fps, and physics runs during the loading screen.
 
 ## Problem Reports (F3)
 
@@ -650,7 +656,7 @@ These are Dab's Mod's crash reports (`port/src/crashreport.c`), in two halves.
 
 ## Gamepad Support
 
-`cmd/client/gamepad.go`: PS2 DualShock 2 mapping → Raylib gamepad. Left stick = movement, right stick = camera orbit/zoom/swim, D-pad = targeting, cross/circle/square/triangle = actions. Auto-shows spell bar on first gamepad frame.
+`cmd/client/gamepad.go`: PS2 DualShock 2 mapping → Raylib gamepad. Left stick = movement, right stick = camera orbit/zoom/swim (third person) or turn/look (first person, fixed follow), Select = first ⇄ third person (CLIENT's pad code 145), D-pad = targeting, cross/circle/square/triangle = actions. Auto-shows spell bar on first gamepad frame.
 
 ## Runtime Robustness Invariants (do NOT regress — 2026-07-21)
 

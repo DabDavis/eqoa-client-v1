@@ -154,7 +154,6 @@ func (c *Client) modelHeight(modelID uint32, fallback float32) float32 {
 	return fallback
 }
 
-// buildCamera constructs the camera matching drawWorld's logic.
 // camTrig returns the four camera trig values used for camera positioning and movement.
 func (c *Client) camTrig() (cosP, sinP, cosA, sinA float32) {
 	cosP = float32(math.Cos(float64(c.camPitch)))
@@ -164,135 +163,10 @@ func (c *Client) camTrig() (cosP, sinP, cosA, sinA float32) {
 	return
 }
 
-// currentCamera computes camera trig values and builds the camera in one call.
+// currentCamera is the frame's camera: VIWalkCamera::SetCamera
+// (walkcamera.go), DeathCamera while dead.
 func (c *Client) currentCamera(p game.Entity) rl.Camera3D {
-	cosP, sinP, cosA, sinA := c.camTrig()
-	return c.buildCamera(p, cosP, sinP, cosA, sinA)
-}
-
-func (c *Client) buildCamera(p game.Entity, cosP, sinP, cosA, sinA float32) rl.Camera3D {
-	firstPerson := c.camDist < 0.1
-
-	var camX, camY, camZ float32
-	var targX, targY, targZ float32
-
-	if firstPerson {
-		eyeHeight := c.modelHeight(p.ModelID, 5.0) * 0.9
-		camX = p.X
-		camY = p.Y + eyeHeight
-		camZ = p.Z
-		targX = camX - cosP*cosA
-		targY = camY - sinP
-		targZ = camZ - cosP*sinA
-	} else {
-		camX = p.X + c.camDist*cosP*cosA
-		camY = p.Y + c.camDist*sinP
-		camZ = p.Z + c.camDist*cosP*sinA
-		// PS2 VIWalkCamera targets a fixed attachment point on the character
-		// (shoulder/chest height), NOT a distance-dependent offset.
-		// Race HeightMult from CLIENT.AUT 0x00CDD8A0 scales the target height.
-		rp := c.playerRaceParams()
-		mh := c.modelHeight(p.ModelID, 5.0)
-		targHeight := mh * (rp.HeightMax / rp.HeightMult)
-		if targHeight < 0.5 {
-			targHeight = mh * 0.5
-		}
-		targX = p.X
-		targY = p.Y + targHeight
-		targZ = p.Z
-
-		// PS2 MoveCamera (0x00482AF0): camera-terrain collision.
-		// PS2 uses VICollSphere (radius ~1.57) swept from player to camera,
-		// with fallback to FindOrbitAngle if too close. We ray-march with
-		// terrain + wall checks and use sweepSphereVsWalls for the full path.
-		const camClearance = float32(1.2)  // PS2 collisionRadius ≈ PI/2
-		const camSteps = 20                // dense sampling for indoor walls
-		if c.camCollision && c.terrainLoader != nil && c.camDist > 0.5 {
-			zt := c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
-			if zt != nil {
-				startX, startY, startZ := targX, targY, targZ
-				dx := camX - startX
-				dy := camY - startY
-				dz := camZ - startZ
-
-				bestT := float32(1.0)
-				step := float32(1.0) / float32(camSteps)
-
-				for i := 1; i <= camSteps; i++ {
-					t := float32(i) * step
-					sx := startX + dx*t
-					sy := startY + dy*t
-					sz := startZ + dz*t
-
-					clipped := false
-
-					// Terrain floor check
-					if groundY, ok := zt.SampleHeight(sx, sz, sy); ok {
-						if sy < groundY+camClearance {
-							clipped = true
-						}
-					}
-
-					// Wall check via swept sphere every 4th step (perf: ~5 sphere sweeps)
-					if !clipped && i > 1 && i%4 == 0 {
-						prevT := float32(i-4) * step
-						px := startX + dx*prevT
-						py := startY + dy*prevT
-						pz := startZ + dz*prevT
-						_, _, _, hitT, hit := zt.SweepSphereVsWalls(
-							px, py, pz, sx, sy, sz, 0.5)
-						if hit && hitT < 0.9 {
-							clipped = true
-						}
-					}
-
-					if clipped {
-						pullT := float32(i-1) * step
-						if pullT < 0.05 {
-							pullT = 0.05
-						}
-						if pullT < bestT {
-							bestT = pullT
-						}
-						break
-					}
-				}
-
-				// Smooth collision distance to prevent bouncing on beams/overhangs.
-				// Pull IN is instant (safety), pull OUT ramps smoothly.
-				if bestT < c.camCollDist {
-					// Blocked closer — snap immediately (safety)
-					c.camCollDist = bestT
-				} else {
-					// Clear further — ramp out slowly (prevents bounce)
-					dt := rl.GetFrameTime()
-					rampSpeed := float32(2.0) // recover to full distance in ~0.5s
-					c.camCollDist += (bestT - c.camCollDist) * dt * rampSpeed
-					if c.camCollDist > bestT {
-						c.camCollDist = bestT
-					}
-				}
-
-				useT := c.camCollDist
-				camX = startX + dx*useT
-				camY = startY + dy*useT
-				camZ = startZ + dz*useT
-				if groundY, ok := zt.SampleHeight(camX, camZ, camY); ok {
-					if camY < groundY+camClearance {
-						camY = groundY + camClearance
-					}
-				}
-			}
-		}
-	}
-
-	return rl.Camera3D{
-		Position:   rl.Vector3{X: camX, Y: camY, Z: camZ},
-		Target:     rl.Vector3{X: targX, Y: targY, Z: targZ},
-		Up:         rl.Vector3{X: 0, Y: 1, Z: 0},
-		Fovy:       60,
-		Projection: rl.CameraPerspective,
-	}
+	return c.walkCameraView(p)
 }
 
 // conColorToRL converts a server con color byte to an rl.Color.

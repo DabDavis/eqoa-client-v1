@@ -2,7 +2,6 @@ package main
 
 import (
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -65,17 +64,14 @@ type Client struct {
 	camDist        float32 // distance from player
 	camMaxDist     float32 // max zoom-out distance (settings adjustable, hard max 300)
 	camSensitivity float32 // camera sensitivity multiplier (default 1.0)
-	camAngleVel    float32 // PS2 VIWalkCamera: angular velocity for orbit damping
-	camPitchVel    float32 // PS2 VIWalkCamera: pitch velocity for orbit damping
-	camDistVel     float32 // PS2 VIWalkCamera: distance velocity for zoom damping
-	camFollow      bool    // PS2 VIWalkCamera mode: false=tether (default), true=follow
-	camSavedDist   float32 // saved distance for camera mode toggle
-	camFollowDist  float32 // locked follow cam distance
-	firstPerson    bool    // true = first-person camera mode
-	camMode        int     // 0=tether, 1=follow, 2=first-person
+	wcam           walkCamera // VIWalkCamera's state and CLIENT's camera styles (walkcamera.go)
+	firstPerson    bool    // the walk camera is in mode 0 (setCameraMode keeps it)
 	invertPitch    bool    // invert controller pitch (stick up = look down)
-	camCollision   bool    // camera terrain/wall collision clamping
-	camCollDist    float32 // smoothed collision distance (fraction 0-1, prevents bouncing)
+	camCollision   bool    // the camera sweeps against the world (CLIENT always does; on by default)
+	camFixedFollow bool    // VIGameOptions::m_x06: third person is style 2, the fixed follow, not style 3
+	camFreePitch   bool    // Go extra: W/S pitch the third-person orbit (the PS2 snaps the pitch back)
+	camRememberZoom bool   // Go extra: the first world entry keeps the character's saved zoom
+	camPanelView   bool    // ApplyRaceCamera while the main menu is open (CLIENT's; on by default)
 	safeX, safeY, safeZ float32 // last known position outside walls
 	safeValid      bool         // true once first safe position is recorded
 
@@ -504,10 +500,9 @@ func runClient() {
 	}
 
 	client := &Client{
-		camAngle:        -math.Pi * 0.75,
-		camPitch:        0.5236, // PS2 default: PI/6 (30 degrees)
-		camDist:         11.75, // PS2 VIWalkCamera default: InitParms+0x254
-		camMaxDist:      8,
+		camMaxDist:      8, // style 3's ceiling (VIClient::SetCameraStyle)
+		camCollision:    true,
+		camPanelView:    true,
 		camSensitivity:  1.0,
 		onGround:        true,
 		terrainZoneIdx:  -1,
@@ -899,6 +894,8 @@ func runClient() {
 					// Subsequent MemoryDump = coaching or death respawn
 					client.loadScrFade = 4.0
 					log.Printf("MemoryDump #%d: loading screen triggered", engine.State.MemoryDumpCount)
+					// Every Msg000D puts the camera back behind the player.
+					client.cameraWorldEntry()
 				}
 				client.lastMemDumpCount = engine.State.MemoryDumpCount
 			}
@@ -952,9 +949,11 @@ func runClient() {
 				if cfg.InvertPitch {
 					client.invertPitch = true
 				}
-				if cfg.CamCollision {
-					client.camCollision = true
-				}
+				client.camCollision = !cfg.CamNoCollision
+				client.camFixedFollow = cfg.CamFixedFollow
+				client.camFreePitch = cfg.CamFreePitch
+				client.camRememberZoom = cfg.CamRememberZoom
+				client.camPanelView = !cfg.CamNoPanelView
 
 				// Audio
 				if cfg.MasterVolume > 0 {
@@ -1024,19 +1023,12 @@ func runClient() {
 						p.RobeTint = ch.RobeTint
 					}
 				}
-				if save, ok := loadCharSave(engine.State.Player.Name); ok {
-					client.camDist = save.CamDist
-					client.camPitch = save.CamPitch
-					client.camAngle = save.CamAngle
-					log.Printf("CHARSAVE: restored camera for %s", engine.State.Player.Name)
-				} else {
-					// No saved camera — set PS2 race-specific defaults.
-					p := &engine.State.Player
-					rp := getRaceParams(p.Race, p.Sex)
-					client.camDist = rp.CamDist * raceCamScale
-					client.camPitch = rp.CamPitch
-					log.Printf("RACECAM: race %d sex %d → dist=%.1f pitch=%.3f",
-						p.Race, p.Sex, client.camDist, client.camPitch)
+				// Msg000D's camera: behind the player in the third-person
+				// style, 3.38 away (walkcamera.go).
+				client.cameraWorldEntry()
+				if save, ok := loadCharSave(engine.State.Player.Name); ok && client.camRememberZoom && save.CamDist > 0 {
+					client.setOrbitDistance(save.CamDist)
+					log.Printf("CHARSAVE: restored camera zoom %.2f for %s", client.camDist, engine.State.Player.Name)
 				}
 				if client.offline != nil {
 					client.offlineEnterWorld()
@@ -1071,6 +1063,7 @@ func runClient() {
 			case game.PhaseInWorld:
 				client.updateArrival()
 				client.handleInWorldInput()
+				client.processWalkCamera()
 			}
 
 			// A server-ordered disconnect (0x0729, 0x07A4, 0x0777, ...).
