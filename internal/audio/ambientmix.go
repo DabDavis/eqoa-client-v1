@@ -8,8 +8,12 @@ import (
 )
 
 // ambientFadeMs is VISceneSoundTrack::m_p10: a track change waits this long
-// after the last one, and a track fades in or out over the same 15 s.
+// after the last one, and a track fades in or out over the same 15,000 ticks.
 const ambientFadeMs = 15000
+
+// ps2TicksPerSecond is VITimer::GetTime's rate (SUPPORT vitimer.cpp: 2 a
+// compare interrupt at 9.216 MHz / 18,750), which VIScene::GetTime runs at.
+const ps2TicksPerSecond = 983.04
 
 // ambientGain is this client's mix level for the ambient XMs, under the
 // level SetSoundTrack computes (which peaks at 1).
@@ -198,7 +202,9 @@ func (s *System) SetAmbient(track int32, tracks map[int32]*AmbientTrack, rain, o
 	if s.ambStart.IsZero() {
 		s.ambStart = time.Now()
 	}
-	now := time.Since(s.ambStart).Milliseconds()
+	// The scene's clock is VITimer's: 983.04 ticks a real second, so the
+	// 15,000 of a fade or a hold-off are 15.26 s.
+	now := int64(time.Since(s.ambStart).Seconds() * ps2TicksPerSecond)
 	ready := func(id int32) bool { t, ok := tracks[id]; return ok && t != nil && len(t.PCM) > 0 }
 	act, moved := s.ambMix.Step(track, ready, now, rain, outdoors, inLiquid)
 	if moved {
@@ -216,5 +222,24 @@ func (s *System) SetAmbient(track int32, tracks map[int32]*AmbientTrack, rain, o
 		if v.active {
 			rl.SetMusicVolume(v.music, act[j].vol*ambientGain)
 		}
+	}
+}
+
+// StopSoundTrack is VIScene::StopSoundTrack (viscene.cpp:718), which CLIENT
+// calls as the player arrives anywhere (Msg000D, Respawn, MoveTo): both
+// slots stop and are cleared, and the next SetAmbient takes its track at
+// once, as before the first one ever (m_p00 = 1), at full volume.
+func (s *System) StopSoundTrack() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ambVoices[0].stop()
+	s.ambVoices[1].stop()
+	if s.ambMix.inited {
+		s.ambMix.slot[0].clear()
+		s.ambMix.slot[1].clear()
+		s.ambMix.first = true
 	}
 }

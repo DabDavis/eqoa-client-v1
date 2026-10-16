@@ -1118,7 +1118,7 @@ func handleCommand(engine *game.Engine, line string) {
 
 			for frame := 0; time.Since(startTime) < 30*time.Second; frame++ {
 				gameMu.Lock()
-				gs.InterpolateEntities(dt)
+				gs.UpdateEntityMotion()
 
 				for id, ent := range gs.Entities {
 					if !ent.Interpolating {

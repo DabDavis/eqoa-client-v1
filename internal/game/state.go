@@ -147,7 +147,6 @@ type Entity struct {
 	AttackCount       int       // attack counter (driven by damage indications)
 	LastAttackAnimTime time.Time // throttle for entity attack animation triggers
 	CastAnimEnd   time.Time // when NPC casting animation ends
-	GroundSnapped bool      // true after idle Y snap applied (reset on move)
 
 	// State channel fields from ObjectUpdate (confirmed by PS2 CLIENT decompilation)
 	World     byte   // offset 16: continent (0=Tunaria)
@@ -212,14 +211,20 @@ type Entity struct {
 	Experience    int64
 	ExperienceMax int64
 
-	// PS2 VIWalkControl interpolation (InitParms exponential decay + velocity dead reckoning).
-	// smoothRate values from InitParms disassembly (25 live instances confirmed).
-	TargetX, TargetY, TargetZ float32 // latest server position
-	TargetFacing              float32 // latest server facing
-	VelX, VelY, VelZ          float32 // decoded velocity from state channel offsets 40-42
-	PrevVelX, PrevVelZ        float32 // velocity from previous update (for direction change detection)
+	// The last update's position and facing as the wire carried them, and
+	// the velocity (VICreatureEntity +0x218). X/Y/Z and Facing are where it
+	// is drawn; Motion is how CLIENT gets it there (entitymotion.go).
+	TargetX, TargetY, TargetZ float32
+	TargetFacing              float32
+	VelX, VelY, VelZ          float32
+	Motion                    EntityMotion
 	Interpolating             bool    // false until first position received
 	UpdateInterval            float32 // exponential moving average of seconds between state updates
+	// CombatFlag is VICreatureEntity +0x263, byte 155: LeaderByte263
+	// (0x00BD9350) plays the battle music while the player's own (or, in a
+	// group, the leader's) is set. ps2_main_capture.pcap: 0x24 from six
+	// seconds into a fight to its end.
+	CombatFlag byte
 }
 
 // ChatChannel represents the type of chat message.
@@ -359,9 +364,22 @@ type GameState struct {
 	// Whether the initial 0x40 world-entry handshake completed
 	WorldEntryAcked bool
 
-	// SampleHeightFunc is set by the visual client to provide terrain height lookup.
-	// Returns (groundY, true) if terrain exists at (x,z) near refY, else (0, false).
-	SampleHeightFunc func(x, z, refY float32) (float32, bool)
+	// CreatureFloorFunc is set by the visual client: a creature's floor probe
+	// (0x00CBCE40, entitymotion.go), the floor the sphere meets within 1.5
+	// of (x, y, z), or false when it meets none. Without it nothing is set
+	// down (the headless tool).
+	CreatureFloorFunc func(x, y, z float32) (float32, bool)
+
+	// PendingArrival is the arrival the visual client has yet to take
+	// (arrival.go); Fade is the screen fade.
+	PendingArrival *Arrival
+	Fade           ScreenFade
+
+	// NoCreatureSteps and NoEntityBlend are CLIENT's m_p2BD48 and m_p2BD4C
+	// cleared — the console's switches for UpdateCreatures' steps and
+	// Extrapolate's blend. Both are on (false here) from the constructor.
+	NoCreatureSteps bool
+	NoEntityBlend   bool
 
 	// Target response from server (opcode 0x0010)
 	TargetConColor  byte   // 0=red,1=yellow,2=white,3=dkblue,4=ltblue,5=green
@@ -429,11 +447,16 @@ type GameState struct {
 	AdminMenuType byte  // menu type from server
 	AdminMenuCode int64 // menu code from server
 
-	// Time of day (from OpcodeTime 0x0013)
-	TimeEpoch1   uint64    // server epoch1 (ms)
-	TimeEpoch2   uint64    // server epoch2 (ms) — used for day/night cycle
-	TimeReceived time.Time // wall clock when received
-	TimeValid    bool      // true after first OpcodeTime
+	// Time of day (from OpcodeTime 0x0013): its two times, and the two
+	// VISyncTime clocks SetTime feeds them to (+0x2EC30, +0x2EC50).
+	TimeEpoch1 uint64 // server epoch1
+	TimeEpoch2 uint64 // server epoch2 — the day/night cycle's
+	TimeValid  bool   // true after first OpcodeTime
+	clockA     syncTime
+	clockB     syncTime
+
+	// PS2Clock, when set, replaces VITimer::GetTime (tests pin the clock).
+	PS2Clock func() int64
 
 	// Buff state (from channel 0x43, variable slot count)
 	Buffs []BuffSlot // active buffs/debuffs (server sends variable count)
@@ -589,6 +612,7 @@ func NewGameState(host string, gamePort, authPort, patchPort int, username strin
 		SelectedChar:      -1,         // no character selected yet
 		itemLists:         newItemLists(),
 		stateChannelCount: make(map[byte]int),
+		Fade:              ScreenFade{Color: [4]float32{0, 0, 0, 1}},
 	}
 	gs.Session.P07578 = 100 // VIClient's constructor (0x00BBF814): the 0x40 interval
 	return gs
@@ -1284,39 +1308,43 @@ func (gs *GameState) handleTime(msg *protocol.Message) {
 		epoch2, _ := reader.ReadUint64()
 		gs.TimeEpoch1 = epoch1
 		gs.TimeEpoch2 = epoch2
-		gs.TimeReceived = time.Now()
-		gs.TimeValid = true
+		gs.setTime(int64(epoch1), int64(epoch2))
 		log.Printf("Time: epoch1=%d epoch2=%d (delta=%dms)", epoch1, epoch2, epoch2-epoch1)
 	}
 }
 
-// GameDayMs is the length of a game day in real milliseconds: CLIENT
-// func_00BC7B70 takes the clock modulo 3,600,000, so a day lasts 60 minutes.
+// setTime is VIClient::SetTime (0x00BD0508's 0x0013, [V]): each time into its
+// VISyncTime against the frame clock.
+func (gs *GameState) setTime(a, b int64) {
+	now := gs.ps2Now()
+	gs.clockA.Set(a, now)
+	gs.clockB.Set(b, now)
+	gs.TimeValid = true
+}
+
+// GameDayMs is the length of a game day in VITimer ticks: CLIENT's
+// UpdateTimeOfDay takes the clock modulo 3,600,000, which at 983.04 ticks a
+// second is 61.04 real minutes.
 const GameDayMs = 3_600_000
 
 // GameHour returns the current game hour (0.0-24.0) based on server time.
 // Returns 12.0 (noon) if no time has been received yet.
 //
-// CLIENT func_00BC7B70 computes it every frame as
-// (VISyncTime::Get(+0x2EC50) mod 3,600,000) / 3,600,000 * 24 and hands it to
-// VIScene::SetTimeOfDay. The Time handler (func_00BD0508) syncs the SECOND
-// timestamp into +0x2EC50, and VISyncTime::Get advances it at 1:1 from the
-// moment it was synced, so the phase comes from epoch2 alone. The first
-// timestamp (+0x2EC30) plays no part in the hour.
+// VIClient::UpdateTimeOfDay (0x00BC7B70, [V]) computes it every frame as
+// (m_clockB.GetTime(now) mod 3,600,000) / 3,600,000 × 24 and hands it to
+// VIScene::SetTimeOfDay. m_clockB holds the 0x0013's SECOND time; the first
+// (m_clockA) plays no part in the hour. The clock runs in VITimer ticks, and
+// a later 0x0013 is blended in over a minute rather than jumped to.
 func (gs *GameState) GameHour() float32 {
 	if !gs.TimeValid {
 		return 12.0
 	}
-	elapsedMs := time.Since(gs.TimeReceived).Milliseconds()
-	if elapsedMs < 0 {
-		elapsedMs = 0
-	}
-	ms := (gs.TimeEpoch2 + uint64(elapsedMs)) % GameDayMs
+	ms := gs.clockB.Get(gs.ps2Now()) % GameDayMs
 	return float32(ms) / GameDayMs * 24
 }
 
 // SetGameHour pins the clock so GameHour reads h now and advances from there,
-// as if a Time opcode had just carried that hour. Offline mode uses it.
+// as if the first Time opcode had just carried that hour. Offline mode uses it.
 func (gs *GameState) SetGameHour(h float32) {
 	h = float32(math.Mod(float64(h), 24))
 	if h < 0 {
@@ -1324,8 +1352,8 @@ func (gs *GameState) SetGameHour(h float32) {
 	}
 	gs.TimeEpoch2 = uint64(float64(h) / 24 * GameDayMs)
 	gs.TimeEpoch1 = gs.TimeEpoch2
-	gs.TimeReceived = time.Now()
-	gs.TimeValid = true
+	gs.clockA, gs.clockB = syncTime{}, syncTime{}
+	gs.setTime(int64(gs.TimeEpoch1), int64(gs.TimeEpoch2))
 }
 
 func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
@@ -1458,6 +1486,15 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 	gs.parseMemoryDumpRemainder(reader)
 
 	gs.MemoryDumpCount++
+
+	// Msg000D puts the walker where the dump says (SetLocation, no cast),
+	// stops the battle music and the sound track, and fades in from black:
+	// SetFade(1, 0) then SetFade(0, 1), after a "respawn" cue (PlayCue,
+	// silent on the retail disc: no resident file holds a sound by that
+	// name).
+	gs.arrive(Arrival{World: newWorld, X: x, Y: y, Z: z, Heading: facing})
+	gs.SetFade(1, 0)
+	gs.SetFade(0, 1)
 	gs.Phase = PhaseInWorld
 	gs.StatusMsg = "In world"
 
@@ -1846,19 +1883,9 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 	gs.DialogueOptions = nil
 	gs.MerchantOpen = false // CLIENT closes the merchant (and the bank, trade, loot)
 
-	// Clear all entities from previous zone — PS2 VIEntity visibility is purely
-	// state-channel-driven, so old entities are invalid after zone transition.
-	oldCount := len(gs.Entities)
-	for id := range gs.Entities {
-		gs.SpellFXSys.NotifyActorWasDestroyed(id)
-	}
-	gs.Entities = make(map[uint32]*Entity)
-	gs.ChannelEntity = [29]uint32{}
-
-	// Reset state channel debug counters for entity channels
-	for ch := byte(1); ch <= 28; ch++ {
-		delete(gs.stateChannelCount, ch)
-	}
+	// The entities stay. Respawn → EnterWorld → LoadWorld keep m_entities,
+	// even across a world load (each is told OnWorldLoaded); the server
+	// removes the ones it no longer sends (flag 0 on their channels).
 
 	// Do NOT reset XOR delta bases on teleport. The server's XOR base
 	// (stc.seqnum2) still references our last ACK'd sequence. If we clear
@@ -1887,8 +1914,13 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 	}
 	gs.Player.World = world
 
-	log.Printf("Teleport: world=%d pos=(%.1f, %.1f, %.1f) facing=%.2f — cleared %d entities",
-		world, x, y, z, facing, oldCount)
+	// Respawn's placement: the walker is set down on the floor a sphere cast
+	// ±3 about the point finds, the follow is stopped, and the music and
+	// the camera go as at any arrival (arrival.go).
+	gs.arrive(Arrival{World: world, X: x, Y: y, Z: z, Heading: facing, Reach: 3, StopFollow: true})
+
+	log.Printf("Teleport: world=%d pos=(%.1f, %.1f, %.1f) facing=%.2f — %d entities kept",
+		world, x, y, z, facing, len(gs.Entities))
 }
 
 // handlePlayerSpeed is 0x00F8: a raw float into m_speed and SetSpeed — the
@@ -2292,6 +2324,9 @@ func (gs *GameState) decodePlayerState(data []byte) {
 	if len(data) >= 146 {
 		gs.Player.Class = data[145]
 	}
+	if len(data) >= 156 {
+		gs.Player.CombatFlag = data[155] // +0x263, LeaderByte263's
+	}
 	gs.Player.IsPlayer = true
 }
 
@@ -2333,13 +2368,16 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte, created bool) 
 		}
 	}
 
-	// Position: 3-byte big-endian signed mediums at offsets 6, 9, 12 (value / 128.0)
+	// VIEntity's reader (0x00CC4CC8): the position, three s24 BE / 128, then
+	// the heading and the pitch, s8 × 2π/256 (the roll is 0).
 	newX := decodeMediumBE(data[6:9])
 	newY := decodeMediumBE(data[9:12])
 	newZ := decodeMediumBE(data[12:15])
-
-	// Facing: offset 15 (0-255 mapped to 0-2*pi)
-	newFacing := float32(data[15]) / 256.0 * 2 * 3.14159265
+	newFacing := float32(int8(data[15])) * headingScale
+	var pitch float32
+	if len(data) >= 17 {
+		pitch = float32(int8(data[16])) * headingScale
+	}
 
 	// Debug: log position delta BEFORE updating target (so we see actual change)
 	if gs.DebugEntityMovement && !wasNew && ent.Interpolating {
@@ -2348,114 +2386,44 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte, created bool) 
 		dz := newZ - ent.TargetZ
 		dist := mathutil.Dist3D(newX, newY, newZ, ent.TargetX, ent.TargetY, ent.TargetZ)
 		elapsed := time.Since(prevUpdate)
-		if dist > 0.01 {
-			var rawVelX, rawVelY, rawVelZ int8
-			if len(data) >= 43 {
-				rawVelX = int8(data[40])
-				rawVelY = int8(data[41])
-				rawVelZ = int8(data[42])
-			}
+		if dist > 0.01 && len(data) >= 59 {
 			log.Printf("MOVE ch=%d %q dt=%dms delta=(%.2f,%.2f,%.2f) dist=%.2f vel=(%d,%d,%d) anim=%d",
 				channel, ent.Name, elapsed.Milliseconds(),
 				dx, dy, dz, dist,
-				rawVelX, rawVelY, rawVelZ, data[58])
+				int8(data[40]), int8(data[41]), int8(data[42]), data[58])
 		}
 	}
 
-	// Save old target for implicit velocity computation.
-	oldTargetX := ent.TargetX
-	oldTargetY := ent.TargetY
-	oldTargetZ := ent.TargetZ
-
-	// PS2 VIWalkControl: set target for interpolation.
 	ent.TargetX = newX
 	ent.TargetY = newY
 	ent.TargetZ = newZ
-	ent.TargetFacing = newFacing
+	ent.TargetFacing = facing0To2Pi(newFacing)
 
-	// Decode velocity from state channel offsets 40-42 (signed bytes).
-	// Sandstorm velocity bytes encode direction with magnitude ~30 for walking NPCs.
-	// VICreatureEntity's reader (0x00CC2DB0) scales them by 21/128 (func_00CC2890:
-	// byte × scale × 1/128) into +0x218. Bytes 43-44, 45-47 and 48-49 follow the
-	// same way at 8, 63 and 32 (two, three and two components).
-	if len(data) >= 43 {
-		rawVX := float32(int8(data[40]))
-		rawVY := float32(int8(data[41]))
-		rawVZ := float32(int8(data[42]))
-		mag := float32(math.Sqrt(float64(rawVX*rawVX + rawVY*rawVY + rawVZ*rawVZ)))
-		if mag > 0.5 {
-			const velScale = float32(21.0 / 128.0)
-			ent.VelX = rawVX * velScale
-			ent.VelY = rawVY * velScale
-			ent.VelZ = rawVZ * velScale
-		} else {
-			// No explicit velocity — compute implicit velocity from successive
-			// target positions. Fixes Go server NPCs that don't send velocity
-			// bytes, preventing pulsing/snapping during patrol movement.
-			elapsed := float32(time.Since(prevUpdate).Seconds())
-			if elapsed > 0.01 && elapsed < 2.0 && ent.Interpolating {
-				dx := newX - oldTargetX
-				dy := newY - oldTargetY
-				dz := newZ - oldTargetZ
-				dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
-				if dist > 0.1 {
-					ent.VelX = dx / elapsed
-					ent.VelY = dy / elapsed
-					ent.VelZ = dz / elapsed
-				} else {
-					ent.VelX = 0
-					ent.VelY = 0
-					ent.VelZ = 0
-				}
-			} else {
-				ent.VelX = 0
-				ent.VelY = 0
-				ent.VelZ = 0
-			}
+	// VICreatureEntity's reader (0x00CC2DB0) goes on: the velocity (+0x218)
+	// is bytes 40-42, three s8 × 21/128 (func_00CC2890), and byte 141
+	// (+0x255) is set while the creature's own VIWalkControl walks it. A
+	// plain VIEntity (0x81) has neither.
+	creature := data[5] == entityTypeCreature
+	var vel [3]float32
+	walking := false
+	if creature && len(data) >= 43 {
+		for i := range vel {
+			vel[i] = float32(int8(data[40+i])) * creatureVelScale
 		}
 	}
+	if creature && len(data) >= 142 {
+		walking = data[141] != 0
+	}
+	ent.VelX, ent.VelY, ent.VelZ = vel[0], vel[1], vel[2]
 
-	// Animation byte: read early so we can gate velocity.
+	// The locomotion animation, +0x254 (byte 58): UpdateCreatures hands it
+	// to the sprite (SetLocomotion) when the creature is not walking.
 	if len(data) >= 59 {
 		ent.Animation = data[58]
 	}
 
-	// PS2: locomotion animation is derived from velocity (UpdateLocomotion),
-	// NOT from the state channel animation byte.
-	// For remote PLAYERS: animation byte is authoritative (0=idle means stopped).
-	// Sandstorm sends stale velocity bytes on stop, so zero velocity when idle.
-	// For NPCs: animation byte is always 0 (server doesn't set it), so don't
-	// zero velocity — let the animation system derive locomotion from movement.
-	if ent.Animation == 0 && ent.IsPlayer {
-		ent.VelX = 0
-		ent.VelY = 0
-		ent.VelZ = 0
-	}
-
-	// Snap entity position to server on every update. Dead-reckoning between
-	// updates provides smooth movement; this reset prevents drift accumulation.
-	if ent.Interpolating && !wasNew {
-		ent.X = newX
-		ent.Y = newY
-		ent.Z = newZ
-	}
-	// Save velocity for next update's direction change detection.
-	ent.PrevVelX = ent.VelX
-	ent.PrevVelZ = ent.VelZ
-
-	if wasNew {
-		// First appearance — snap position, enable interpolation
-		ent.X = newX
-		ent.Y = newY
-		ent.Z = newZ
-		ent.Facing = newFacing
-		ent.VelX = 0
-		ent.VelY = 0
-		ent.VelZ = 0
-		ent.PrevVelX = 0
-		ent.PrevVelZ = 0
-		ent.Interpolating = true
-	}
+	gs.entityUpdate(ent, wasNew, creature, [3]float32{newX, newY, newZ}, [3]float32{newFacing, pitch, 0}, vel, walking)
+	ent.Interpolating = true
 
 	// World: offset 16 (continent ID, 0=Tunaria)
 	if len(data) >= 18 {
@@ -2605,6 +2573,11 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte, created bool) 
 	if len(data) >= 148 {
 		ent.NPCFlags = uint16(data[146]) | uint16(data[147])<<8
 	}
+	// +0x260..+0x264 are bytes 152-156 (+0x262 the Flag4/Flag8 byte); +0x263,
+	// byte 155, is what LeaderByte263 tests for the battle music.
+	if len(data) >= 156 {
+		ent.CombatFlag = data[155]
+	}
 
 	// Log new and changed entities
 	if wasNew {
@@ -2640,81 +2613,6 @@ func (gs *GameState) PurgeStaleEntities(timeout time.Duration) int {
 		}
 	}
 	return purged
-}
-
-// InterpolateEntities applies PS2 VIWalkControl smoothing each frame.
-//
-// Per entity per frame:
-//   1. Dead reckoning:  pos += vel * dt (only when entity is moving)
-//   2. Correction:      pos += (target - pos) * (1 - pow(smoothRate, dt))
-//
-// Key fixes over naive implementation:
-//   - Velocity zeroed when anim=0 (entity stopped) — prevents runaway dead reckoning
-//   - Velocity decayed when state data is stale (>2s since update) — prevents drift
-//
-// PS2 InitParms defaults (25 live EE instances confirmed):
-//   smoothRateX=0.02, smoothRateY=0.80, smoothRateZ=0.01, smoothRateHeading=0.02
-//   stepRemote=200ms (remote entity physics tick)
-func (gs *GameState) InterpolateEntities(dt float32) {
-	const (
-		smoothRateHeading = float64(0.02)
-	)
-
-	corrH := float32(1.0 - math.Pow(smoothRateHeading, float64(dt)))
-
-	for _, ent := range gs.Entities {
-		if !ent.Interpolating {
-			continue
-		}
-		// Dead entities: freeze position (no velocity, no correction).
-		if ent.HPFlag == 3 {
-			continue
-		}
-
-		// Dead-reckon X/Z from current position using velocity.
-		// Handler snaps position to server on each update, so drift is bounded
-		// to one update interval (~100ms).
-		moving := ent.VelX != 0 || ent.VelZ != 0
-		if moving {
-			ent.X += ent.VelX * dt
-			ent.Z += ent.VelZ * dt
-			ent.GroundSnapped = false
-		}
-
-		// Snap Y to terrain surface.
-		// Moving: every frame (slope following).
-		// Stopped: once immediately (fix patrol stop positions).
-		needSnap := moving || !ent.GroundSnapped
-		if gs.SampleHeightFunc != nil && needSnap {
-			if y, ok := gs.SampleHeightFunc(ent.X, ent.Z, ent.TargetY+2); ok {
-				ent.Y = y
-			} else {
-				ent.Y = ent.TargetY
-			}
-			if !moving {
-				ent.GroundSnapped = true
-			}
-		} else {
-			ent.Y = ent.TargetY
-		}
-
-		// Heading: exponential decay correction (shortest arc) for smooth turning.
-		facingDiff := ent.TargetFacing - ent.Facing
-		for facingDiff > math.Pi {
-			facingDiff -= 2 * math.Pi
-		}
-		for facingDiff < -math.Pi {
-			facingDiff += 2 * math.Pi
-		}
-		ent.Facing += facingDiff * corrH
-
-		for ent.Facing < 0 {
-			ent.Facing += 2 * math.Pi
-		}
-		for ent.Facing >= 2*math.Pi {
-			ent.Facing -= 2 * math.Pi
-		}
-	}
 }
 
 // decodeMediumBE decodes a 3-byte big-endian signed integer and returns float32(val) / 128.0.
