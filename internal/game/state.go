@@ -447,8 +447,6 @@ type GameState struct {
 	HitFXTarget         uint32    // target ObjectID for pending hit FX
 	LastAutoAttackEvent time.Time // last CastingCombat auto-attack involving player (combat-end detection)
 	LastMeleeHitFX      time.Time // throttle: last time melee hit FX was played on a target
-	LastProcFXTime      time.Time // throttle: PS2 proc cooldown ~3500ms (func_00BC76A0)
-	CombatAttackFXHash  uint32    // PS2 func_00CBE0A8: resolved spell FX DictID for current weapon/class
 	FloatingTexts   []FloatingText // rising/fading damage/heal numbers
 
 	// Blacksmith/repair window (0x0061 opens it, 0x0063 closes it; BlacksmithID is in itemLists)
@@ -496,6 +494,7 @@ type GameState struct {
 	// Avoids O(n) entity scans in decodeEntityState.
 	ChannelEntity [29]uint32
 	RoutingState // the pump's and the state channels' own state (intake_routing.go)
+	CombatState  // the target info's validity, the handlers' auto-attack stops (combat.go)
 
 	// Quest tracker (from opcodes 0x0045/0x007B/0x007F)
 	QuestTrackerID    uint32   // active tracked quest ID (0xFFFFFFFF = none)
@@ -2150,6 +2149,7 @@ func (gs *GameState) handleClassicTargetInfo(msg *protocol.Message) {
 	}
 	gs.TargetFaceColor = disp
 	gs.TargetConColor = con
+	gs.TargetInfoValid = true
 	log.Printf("ClassicTargetInfo: dataLen=%d faceColor=%d conColor=%d flag=%d guild=%q title=%q",
 		len(data), disp, con, flag, gs.TargetGuildName, gs.TargetTitle)
 }
@@ -3396,12 +3396,15 @@ func (gs *GameState) resolveObjectName(objectID uint32) string {
 }
 
 // handleCharacterDied is 0x005E (Msg005E, 0x00BDAEB8). It has no payload:
-// my character takes its death pose, the spells it cast stop, and the cast
-// window clears. Not ported: the "death" cue at 0.4, UI mode 0, auto-attack
-// off (m_autoAttack = 0), every pending group invite declined (op 1572,
-// reason 3), the camera reset. The XP-loss, death-text and chat fields this
-// handler used to read are not on the wire.
+// my character takes its death pose, the spells it cast stop, the cast
+// window clears, and auto-attack and following go off (StopAutoAttack,
+// m_p00078 = 0). Not ported: the "death" cue at 0.4, UI mode 0, every
+// pending group invite declined (op 1572, reason 3), the camera reset. The
+// XP-loss, death-text and chat fields this handler used to read are not on
+// the wire.
 func (gs *GameState) handleCharacterDied(msg *protocol.Message) {
+	gs.stopAutoAttack = true
+	gs.stopFollow = true
 	if !gs.Player.Dead {
 		gs.SpellFXSys.StopIfThisWasCaster(gs.PlayerObjectID) // CLIENT: after SetDeath
 	}

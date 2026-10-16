@@ -25,7 +25,7 @@ type Engine struct {
 	startupCh    chan startupResult // off-thread startup I/O → main goroutine (#4)
 	tickCount    int
 	whoToken       byte   // Who list request token (increments by 2)
-	TargetObjectID uint32 // Current target ObjectID (sent in 0x40 position updates)
+	TargetObjectID uint32 // m_target (VIClient+0xC140), 0 for none: 0x40 bytes 37-40 carry it (0xFFFFFFFF for none)
 	chatMode       byte   // Current server-side chat mode (0=say, 3=group)
 
 	// Movement target (goto command)
@@ -80,8 +80,9 @@ type Engine struct {
 	AnimByte      byte // CPlayList slot: 0=idle, 1=walk, 3=run, 4=swim (matches PS2 wire format)
 	EmoteAnimByte byte // non-zero while an emote is playing (overrides AnimByte in 0x40)
 	InCombat      bool // true when server confirms auto-attack (sets animation byte to 0x09)
-	CombatEngaged bool // true when player pressed spacebar to initiate auto-attack
-	AttackSent    bool // true once the Attack opcode (0x000F) has been sent for current engage
+	CombatEngaged bool // m_autoAttack (VIClient+0x71E4), 0x40 byte 36: on while the attack button is held (combat.go)
+
+	targeting // CLIENT's swing timer, target cycling and following (combat.go)
 
 	// PS2 0x40 velocity encoding — world-space velocity set by movement handler each frame.
 	// Encoded as uint16 big-endian in 0x40 bytes 10-15, 0x8000 = center (zero velocity).
@@ -306,6 +307,7 @@ func (e *Engine) Tick() {
 		e.tickCount++
 		e.updateFollow()
 		e.updateMovement()
+		e.combatTick() // the frame's facing, auto-attack swing and assist target (combat.go)
 
 		// Send 0x40 position updates.
 		// The PS2 client sends 0x40 every frame even when idle. Sandstorm
@@ -318,13 +320,6 @@ func (e *Engine) Tick() {
 			// Sandstorm waits for this before processing position at new location.
 			e.sendTeleportArrival()
 		} else {
-			// Face target continuously while server-confirmed auto-attack is active.
-			// CombatEngaged = spacebar was pressed; InCombat = server confirmed via CastingCombat.
-			// Casting spells and being attacked by NPCs do NOT cause auto-facing.
-			if e.InCombat && e.CombatEngaged && e.TargetObjectID != 0 {
-				e.faceTarget(e.TargetObjectID)
-			}
-
 			// Throttle 0x40 to ~6/s (every ~166ms), matching PS2's observed
 			// rate of 5.87/s. PS2 runs at 30fps and sends 0x40 every ~5 frames.
 			// At 60fps visual client, this prevents queuing 6 XOR-chained
@@ -1144,34 +1139,23 @@ func (e *Engine) SendBootGroupMember(targetObjectID uint32) {
 	log.Printf("Sent boot group member: target=0x%08X", targetObjectID)
 }
 
-// SendTarget sends a target request for the given objectID.
+// SendTarget sends 0x0010, SendOpIntInt(16, m_p2BB68, m_target)
+// (0x00BE4FC0 [V]): two raw u32s, m_p2BB68 (0 in every capture) and the
+// target, 0xFFFFFFFF for none. SetTarget and CycleTarget (combat.go) decide
+// when.
 func (e *Engine) SendTarget(objectID uint32) {
-	if e.State.Conn == nil {
-		return
-	}
-
 	data := make([]byte, 8)
-	// PS2 pcap: first 4 bytes are always 0x00000000 (not an incrementing counter)
-	binary.LittleEndian.PutUint32(data[0:4], 0)
 	binary.LittleEndian.PutUint32(data[4:8], objectID)
-
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClassicTargetInfo, data) {
-		log.Printf("WARNING: Target send window full")
-	}
+	e.State.socialSend(protocol.OpcodeClassicTargetInfo, data)
 	log.Printf("Sent target request: objectID=0x%08X", objectID)
 }
 
-// SendInteract sends an interact request for the given objectID (opcode 0x0004).
+// SendInteract sends 0x0004, SendOpU32(4, m_target) [V]. InteractWithTarget
+// (combat.go) sends it only for a target that is not a merchant, a banker, a
+// blacksmith or a player.
 func (e *Engine) SendInteract(objectID uint32) {
-	if e.State.Conn == nil {
-		return
-	}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data[0:4], objectID)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeInteract, data) {
-		log.Printf("WARNING: Interact send window full")
-	}
-	log.Printf("Sent interact: objectID=%d", objectID)
+	e.State.combatSendU32(protocol.OpcodeInteract, objectID)
+	log.Printf("Sent interact: objectID=0x%08X", objectID)
 }
 
 // SendMerchantDiag sends opcode 0x004C — request merchant item list.
@@ -1332,45 +1316,20 @@ func (e *Engine) SendPetCommand(cmd byte) {
 	log.Printf("Sent PetCommand: cmd=0x%02X", cmd)
 }
 
-// SendAttack sends an auto-attack request (opcode 0x000F) to the given target.
-// Wire format: uint32 LE target ObjectID (4 bytes).
-// PS2 auto-faces the target on attack — we do the same by computing the
-// angle from player to target entity and updating facing before sending.
+// SendAttack sends 0x000F, SendOp000F (0x00BC8B08 [V]): the target as a raw
+// u32. ToggleAutoAttack (combat.go) decides when; it does not face the target
+// (the frame's FaceTargetHeading does) and sends at any range.
 func (e *Engine) SendAttack(objectID uint32) {
-	if e.State.Conn == nil {
-		return
-	}
-	// Auto-face target (PS2 behavior)
-	e.faceTarget(objectID)
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, objectID)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeAttack, data) {
-		log.Printf("WARNING: Attack send window full, command dropped")
-	}
-	log.Printf("Sent attack: objectID=%d", objectID)
-}
-
-// faceTarget computes the angle from the player to the target entity and
-// updates the player's facing direction. PS2 does this automatically on
-// attack/cast via VIWalkControl::SetTargetHeading.
-func (e *Engine) faceTarget(objectID uint32) {
-	if ent, ok := e.State.Entities[objectID]; ok {
-		dx := float64(ent.X - e.State.Player.X)
-		dz := float64(ent.Z - e.State.Player.Z)
-		if dx != 0 || dz != 0 {
-			e.State.Player.Facing = float32(math.Atan2(dx, dz))
-		}
-	}
+	e.State.combatSendU32(protocol.OpcodeAttack, objectID)
+	log.Printf("Sent attack: objectID=0x%08X", objectID)
 }
 
 // SendCast sends a UseSkill request (opcode 0x0032) to the server.
 // Wire format (9 bytes): uint32 LE zero + uint8 hotbarSlot + uint32 LE target ObjectID.
 // hotbarSlot = ParsedSpell.WhereOnHotBar (confirmed: NOT AbilityLevel).
-// Use 0xFFFFFFFF as objectID for self-cast.
+// CLIENT's Send0032 (0x00BCBEE8 [V]) always sends m_target, 0xFFFFFFFF with
+// none: pass the current target (CastAbility does) unless a tool means otherwise.
 func (e *Engine) SendCast(abilityByte uint8, objectID uint32) {
-	if e.State.Conn == nil {
-		return
-	}
 	data := make([]byte, 9)
 	// bytes 0-3: the ability stamp (Send0032), 0 on Sandstorm — every one of
 	// 35 PS2 pcap samples is zero
@@ -1378,9 +1337,7 @@ func (e *Engine) SendCast(abilityByte uint8, objectID uint32) {
 	data[4] = abilityByte
 	binary.LittleEndian.PutUint32(data[5:9], objectID)
 	log.Printf("CAST: ability=%d target=0x%08X hex=%X", abilityByte, objectID, data)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeUseSkill, data) {
-		log.Printf("WARNING: UseSkill send window full, command dropped")
-	}
+	e.State.socialSend(protocol.OpcodeUseSkill, data)
 }
 
 // SendDialogueOption sends a dialogue option selection (opcode 0x0035).

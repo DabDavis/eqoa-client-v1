@@ -3,8 +3,6 @@ package main
 import (
 	"log"
 	"math"
-	"strings"
-	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
@@ -182,25 +180,10 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 		gs.DialogueActive = false
 		gs.DialogueOptions = nil
 		c.dialogueCursor = 0
-	} else if gpPressed(rl.GamepadButtonRightFaceDown) && c.targetObjectID != 0 {
-		if c.animMgr.CombatEngaged {
-			c.animMgr.CombatEngaged = false
-			c.engine.CombatEngaged = false
-			c.engine.AttackSent = false
-			c.animMgr.InCombat = false
-			c.engine.InCombat = false
-			c.animMgr.playerCombat.inCombat = false
-			c.animMgr.playerCombat.combatAnim = 0
-			log.Printf("COMBAT: Gamepad Cross — disengaged")
-		} else {
-			// PS2 auto-approach: player runs to target first, Attack sent when in melee range.
-			c.animMgr.CombatEngaged = true
-			c.engine.CombatEngaged = true
-			c.engine.AttackSent = false
-			c.animMgr.playerCombat.attackCycleIdx = 0
-			c.animMgr.playerCombat.lastActivity = time.Now()
-			log.Printf("COMBAT: Gamepad Cross — engaged, will auto-approach")
-		}
+	} else if gpPressed(rl.GamepadButtonRightFaceDown) {
+		// The attack button (the PS2's code 134): ToggleAutoAttack on the press,
+		// MaybeStopAutoAttack on the release (top of handleInWorldInput).
+		c.attackPressed()
 	}
 
 	// --- Circle (B): Cast spell (if spell bar cursor visible) / Cancel dialogue/menu ---
@@ -233,14 +216,7 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 			gs.DialogueOptions = nil
 			c.dialogueCursor = 0
 		} else if c.targetObjectID != 0 {
-			if ent, ok := c.engine.State.Entities[c.targetObjectID]; ok && ent.IsNPC {
-				// NPC target: interact
-				c.engine.SendInteract(c.targetObjectID)
-				if ent.NPCType&0x0100 != 0 || strings.HasPrefix(ent.Name, "Merchant") {
-					c.engine.State.MerchantName = ent.Name
-					c.engine.SendMerchantDiag(c.targetObjectID)
-				}
-			}
+			c.engine.InteractWithTarget() // the PS2's code 133
 		}
 	}
 
@@ -257,15 +233,16 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 		} else if c.menuOpen {
 			c.menuOpen = false
 		} else if c.targetObjectID != 0 {
-			c.targetObjectID = 0
-			c.engine.TargetObjectID = 0
-			c.engine.SendTarget(0xFFFFFFFF)
-			c.engine.ForcePositionFlush()
+			c.engine.ClearTarget() // the PS2's code 132: no message
+			c.targetChanged()
 		}
 	}
 
-	// --- Start: Menu toggle ---
+	// --- Start: Menu toggle (opening it stops auto-attack, func_00C55A20) ---
 	if gpPressed(rl.GamepadButtonMiddleRight) {
+		if !c.menuOpen {
+			c.engine.StopAutoAttack()
+		}
 		c.menuOpen = !c.menuOpen
 		c.menuTab = 0
 		c.menuRow = 0
@@ -277,9 +254,9 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 		c.tabTarget()
 	}
 
-	// --- L1: Target self / cycle group members (not when menu open) ---
+	// --- L1: cycle the party: me, the roster, the pet (not when menu open) ---
 	if gpPressed(rl.GamepadButtonLeftTrigger1) && !c.menuOpen {
-		c.targetGroupCycle()
+		c.partyTarget()
 	}
 
 	// L2 is now used for the PS2 Hotkey Menu (handleHotkeyMenu in input.go).
@@ -312,89 +289,26 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 	return
 }
 
-// tabTargetReverse cycles to the previous nearest entity (reverse tab-target).
+// tabTargetReverse is the D-pad's left: a PC addition with no CLIENT
+// counterpart, so it is the scene cycle (CycleTarget) one entry back.
 func (c *Client) tabTargetReverse() {
 	gs := c.engine.State
-	p := &gs.Player
 	if len(gs.Entities) == 0 {
 		return
 	}
-
-	// Build sorted list by distance, pick the one before current target
-	type entDist struct {
-		id   uint32
-		dist float32
-	}
-	var sorted []entDist
-	for _, ent := range gs.Entities {
-		if ent.Name == "" {
-			continue
-		}
-		dx, dz := ent.X-p.X, ent.Z-p.Z
-		d := float32(math.Sqrt(float64(dx*dx + dz*dz)))
-		sorted = append(sorted, entDist{ent.ObjectID, d})
-	}
-	if len(sorted) == 0 {
+	// Cycling forward len-1 times lands one back; the 0x0010s go out as the
+	// PS2's own would for each step, so take the list once instead.
+	ids := gs.SceneTargetOrder(c.targetView())
+	if len(ids) == 0 {
 		return
 	}
-
-	// Sort by distance
-	for i := 0; i < len(sorted); i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			if sorted[j].dist < sorted[i].dist {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
-		}
-	}
-
-	// Find current target, go to previous
-	idx := -1
-	for i, e := range sorted {
-		if e.id == c.targetObjectID {
-			idx = i
-			break
-		}
-	}
-	idx--
-	if idx < 0 {
-		idx = len(sorted) - 1
-	}
-
-	newTarget := sorted[idx].id
-	c.targetObjectID = newTarget
-	c.engine.TargetObjectID = newTarget
-	c.engine.SendTarget(newTarget)
-	c.engine.ForcePositionFlush()
-}
-
-// targetGroupCycle cycles through self and group members (L1).
-// Order: self → group member 1 → group member 2 → ... → wrap to self.
-func (c *Client) targetGroupCycle() {
-	gs := c.engine.State
-	selfID := gs.PlayerObjectID
-	if selfID == 0 {
-		return
-	}
-
-	// Build ordered list: self first, then group members
-	ids := []uint32{selfID}
-	for _, gm := range gs.GroupMembers {
-		if gm.ObjectID != 0 && gm.ObjectID != selfID {
-			ids = append(ids, gm.ObjectID)
-		}
-	}
-
-	// Find current target in list and pick next
-	nextIdx := 0
+	at := 0
 	for i, id := range ids {
 		if id == c.targetObjectID {
-			nextIdx = (i + 1) % len(ids)
+			at = i
 			break
 		}
 	}
-
-	c.targetObjectID = ids[nextIdx]
-	c.engine.TargetObjectID = ids[nextIdx]
-	c.engine.SendTarget(ids[nextIdx])
-	c.engine.ForcePositionFlush()
+	c.engine.SetTarget(ids[(at+len(ids)-1)%len(ids)])
+	c.targetChanged()
 }

@@ -178,14 +178,8 @@ func (c *Client) executeHotkeyAction(label, msg string) {
 	if strings.HasPrefix(label, "|") {
 		code := label[1:]
 		switch code {
-		case "0":
-			c.playEmote(animEmoteWave, "waves")
-		case "1":
-			c.playEmote(animEmoteBow, "bows")
-		case "2":
-			c.playEmote(animEmotePoint, "points")
-		case "3":
-			c.playEmote(animEmoteCheer, "cheers")
+		case "0", "1", "2", "3": // PlayEmote: wave, bow, point, cheer
+			c.playEmote(int(code[0] - '0'))
 		case "4":
 			if c.targetObjectID != 0 {
 				c.engine.SendGroupInvite(c.targetObjectID, c.getTargetName())

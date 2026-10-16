@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"strings"
 	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -27,6 +26,13 @@ func (c *Client) handleInWorldInput() {
 
 	// The F3 report dialog holds the keyboard, as the menu and chat do: no
 	// movement, camera or hotkeys under it (report.go).
+	// The attack button's release is MaybeStopAutoAttack (VIWndGame::OnKeyUp),
+	// read before anything below can take the frame's input; a window opening
+	// does the same (func_00C50220), so a release is never lost behind one.
+	if !attackHeld() {
+		c.engine.MaybeStopAutoAttack()
+	}
+
 	if c.reportOpen() {
 		return
 	}
@@ -235,16 +241,18 @@ func (c *Client) handleInWorldInput() {
 		charHeight = float32(5.0) // approximate character height for water probing
 	)
 
-	// --- Targeting ---
-	// Escape: clear target, or open menu if nothing else to dismiss
+	// --- Targeting (VIWndGame::OnKeyDown, func_00C53DF8; the engine holds
+	// m_target and combat.go has CLIENT's functions) ---
+	c.targetObjectID = c.engine.TargetObjectID
+	// Escape: clear the target — ClearTarget (the pad's code 132) sends nothing,
+	// the next 0x40 carries it — or open the menu, which stops auto-attack
+	// (func_00C55A20).
 	if rl.IsKeyPressed(rl.KeyEscape) && !c.engine.State.DialogueActive {
 		if c.targetObjectID != 0 {
-			// Clear target — PS2 sends ClassicTargetInfo(0xFFFFFFFF) to deselect
-			c.targetObjectID = 0
-			c.engine.TargetObjectID = 0
-			c.engine.SendTarget(0xFFFFFFFF)
-			c.engine.ForcePositionFlush()
+			c.engine.ClearTarget()
+			c.targetChanged()
 		} else {
+			c.engine.StopAutoAttack()
 			c.menuOpen = true
 			c.menuTab = 0
 			c.menuRow = 0
@@ -253,19 +261,18 @@ func (c *Client) handleInWorldInput() {
 		}
 	}
 
-	// F1: target self
-	if rl.IsKeyPressed(rl.KeyF1) {
-		selfID := c.engine.State.PlayerObjectID
-		if selfID != 0 {
-			c.targetObjectID = selfID
-			c.engine.TargetObjectID = selfID
-			c.engine.SendTarget(selfID)
-		}
+	// F1: target self — SelectTarget(1), the PS2 keyboard's 1 (here 1-0 cast)
+	if rl.IsKeyPressed(rl.KeyF1) && c.engine.State.PlayerObjectID != 0 {
+		c.engine.SelectTarget(1)
+		c.targetChanged()
 	}
 
-	// Tab: cycle to next nearest entity by 3D distance
+	// Tab: CycleTarget over the scene; `: over the party
 	if rl.IsKeyPressed(rl.KeyTab) {
 		c.tabTarget()
+	}
+	if rl.IsKeyPressed(rl.KeyGrave) {
+		c.partyTarget()
 	}
 
 	// Left mouse button: screen-space proximity pick (skip if clicking UI)
@@ -273,13 +280,8 @@ func (c *Client) handleInWorldInput() {
 		c.mousePickTarget()
 	}
 
-	// Auto-clear stale target (entity left visibility, but not self-target)
-	if c.targetObjectID != 0 && c.targetObjectID != c.engine.State.PlayerObjectID {
-		if _, ok := c.engine.State.Entities[c.targetObjectID]; !ok {
-			c.targetObjectID = 0
-			c.engine.TargetObjectID = 0
-		}
-	}
+	// A target that leaves the scene stays the target, as m_target does: the
+	// 0x40 keeps carrying it and FindEntity simply fails until it is back.
 
 	// --- Dialogue / Interact ---
 	gs := c.engine.State
@@ -326,48 +328,24 @@ func (c *Client) handleInWorldInput() {
 			c.dialogueCursor = 0
 		}
 	} else if !c.chatTyping {
-		// X or Right-click: interact with current target
+		// X or Right-click: interact with the target — InteractWithTarget (the
+		// PS2's Q and code 133): 0x004C to a merchant, 0x124D to a banker,
+		// 0x0061 to a blacksmith, 0x0004 to anything else
 		if (rl.IsKeyPressed(rl.KeyX) || rl.IsMouseButtonPressed(rl.MouseButtonRight)) && c.targetObjectID != 0 {
-			c.engine.SendInteract(c.targetObjectID)
-			// If target is a merchant NPC, also send MerchantDiag to open the shop.
-			// PS2 flow: Interact → greeting → client sends 0x004C → server sends 0x00B7 items.
-			if ent, ok := c.engine.State.Entities[c.targetObjectID]; ok && ent.IsNPC {
-				if ent.NPCType&0x0100 != 0 || strings.HasPrefix(ent.Name, "Merchant") {
-					c.engine.State.MerchantName = ent.Name
-					c.engine.SendMerchantDiag(c.targetObjectID)
-				}
-			}
+			c.engine.InteractWithTarget()
 		}
 
 		// 1-9, 0: cast spell from hotbar slot (keys 1-9 -> slots 0-8, key 0 -> slot 9)
 		c.handleHotbarKeys()
 	}
 
-	// Space: toggle auto-attack on current target.
-	// Manual edge-detect because IsKeyPressed fires across multiple frames.
+	// Space: the attack button's press — ToggleAutoAttack, which sends 0x000F
+	// when a swing is due, at any range. Holding it keeps auto-attack on (the
+	// retail default; AutoAttackToggle makes a press toggle). Manual
+	// edge-detect because IsKeyPressed fires across multiple frames.
 	spaceDown := rl.IsKeyDown(rl.KeySpace)
-	if spaceDown && !c.spaceWasDown && c.targetObjectID != 0 {
-		if c.animMgr.CombatEngaged {
-			// Disengage auto-attack
-			c.animMgr.CombatEngaged = false
-			c.engine.CombatEngaged = false
-			c.engine.AttackSent = false
-			c.animMgr.InCombat = false
-			c.engine.InCombat = false
-			c.animMgr.playerCombat.inCombat = false
-			c.animMgr.playerCombat.combatAnim = 0
-			log.Printf("COMBAT: Space pressed — disengaged auto-attack")
-		} else {
-			// Engage auto-attack — don't send Attack opcode yet.
-			// PS2 auto-approach: player runs to target first, Attack sent when in melee range.
-			log.Printf("COMBAT: Space pressed — targetObjID=0x%08X, will auto-approach",
-				c.targetObjectID)
-			c.animMgr.CombatEngaged = true
-			c.engine.CombatEngaged = true
-			c.engine.AttackSent = false
-			c.animMgr.playerCombat.attackCycleIdx = 0
-			c.animMgr.playerCombat.lastActivity = time.Now()
-		}
+	if spaceDown && !c.spaceWasDown {
+		c.attackPressed()
 	}
 	c.spaceWasDown = spaceDown
 
@@ -542,103 +520,14 @@ func (c *Client) handleInWorldInput() {
 
 	p := &c.engine.State.Player
 
-	// Auto-Approach: when combat is engaged, run toward target.
-	// 1. Portal pathfinding for indoor rooms (doorways)
-	// 2. Bug Algorithm for wall avoidance (outdoor + within rooms)
-	const meleeRange = float32(1.5)
-	if c.engine.CombatEngaged && c.targetObjectID != 0 && (moveX == 0 && moveZ == 0) {
-		if ent, ok := c.engine.State.Entities[c.targetObjectID]; ok {
-			dx := ent.X - p.X
-			dz := ent.Z - p.Z
-			dist := float32(math.Sqrt(float64(dx*dx + dz*dz)))
-
-			if !c.engine.AttackSent && dist > meleeRange {
-				var zt *terrain.ZoneTerrain
-				if c.terrainLoader != nil && c.terrainZoneIdx >= 0 {
-					zt = c.terrainLoader.GetZoneTerrain(c.terrainZoneIdx)
-				}
-
-				// --- Local grid A*: compute path on target change or target moved ---
-				needPath := c.navGridPath == nil || c.portalTarget != c.targetObjectID
-				if !needPath {
-					tdx := ent.X - c.navGridTX
-					tdz := ent.Z - c.navGridTZ
-					if tdx*tdx+tdz*tdz > 9 { needPath = true }
-				}
-
-				if needPath {
-					c.portalTarget = c.targetObjectID
-					c.navGridPath = nil
-					c.navGridIdx = 0
-					c.navGridTX = ent.X
-					c.navGridTZ = ent.Z
-
-				if zt != nil {
-						// 2D grid A* — reliable for flat ground + doorways.
-						// May also climb wide ramps via natural terrain following.
-						// TODO: 2.5D grid for stairs/multi-level (grid25d.go preserved)
-						c.navGridPath = terrain.FindGridPath(zt, p.X, p.Y, p.Z, ent.X, ent.Y, ent.Z)
-						if c.navGridPath != nil {
-							log.Printf("NAV: path %d waypoints (%.0f,%.0f)→(%.0f,%.0f)",
-								len(c.navGridPath), p.X, p.Z, ent.X, ent.Z)
-						} else {
-							log.Printf("NAV: no path found")
-						}
-					}
-					if c.navGridPath == nil {
-						c.navGridPath = []terrain.GridWaypoint{{X: ent.X, Z: ent.Z, Y: ent.Y}}
-					}
-				}
-
-				// --- Follow waypoints ---
-				goalX, goalZ := ent.X, ent.Z
-				if c.navGridPath != nil && c.navGridIdx < len(c.navGridPath) {
-					wp := c.navGridPath[c.navGridIdx]
-					wdx := wp.X - p.X
-					wdz := wp.Z - p.Z
-					wdist := float32(math.Sqrt(float64(wdx*wdx + wdz*wdz)))
-					// Advance when close in XZ. The refY hint handles Y climbing
-					// separately — don't block advancement based on Y.
-					if wdist < 1.5 {
-						c.navGridIdx++
-					}
-					if c.navGridIdx < len(c.navGridPath) {
-						wp = c.navGridPath[c.navGridIdx]
-						goalX, goalZ = wp.X, wp.Z
-					}
-				}
-
-				gdx := goalX - p.X
-				gdz := goalZ - p.Z
-				gdist := float32(math.Sqrt(float64(gdx*gdx + gdz*gdz)))
-				if gdist > 0.1 {
-					dirX := gdx / gdist
-					dirZ := gdz / gdist
-
-					// TODO: 3D voxel sensor for stairs/ramps (disabled — causes vibration)
-					// Needs integration with SampleHeight ground-snap instead of
-					// overriding movement direction. Flat ground 2D grid works well.
-
-					moveX = dirX
-					moveZ = dirZ
-				}
-			}
-
-			if dist <= meleeRange && !c.engine.AttackSent {
-				c.engine.InCombat = true
-				c.engine.SendAttack(c.targetObjectID)
-				c.engine.ForcePositionFlush()
-				c.engine.AttackSent = true
-				c.navGridPath = nil
-				log.Printf("COMBAT: Auto-approach complete (dist=%.1f), Attack sent", dist)
-			}
-		}
-	}
-
-	// Reset state when combat disengaged
-	if !c.engine.CombatEngaged {
-		c.navGridPath = nil
-		c.portalTarget = 0
+	// Following (/follow: ToggleFollow): with no movement input the walker
+	// heads for the group member followed — FollowStep walks from 3 to 6 and
+	// runs past 6. CLIENT does not walk to an attack target.
+	followWalk := false
+	if heading, move, walk := c.engine.FollowStep(inputFwd); move && moveX == 0 && moveZ == 0 {
+		moveX = float32(math.Sin(float64(heading)))
+		moveZ = float32(math.Cos(float64(heading)))
+		followWalk = walk
 	}
 
 	// Get terrain for ground tracking (primary zone for collision).
@@ -692,7 +581,6 @@ func (c *Client) handleInWorldInput() {
 		// Cancel emote on movement
 		if c.animMgr.EmoteAnim != 0 {
 			c.animMgr.EmoteAnim = 0
-			c.engine.EmoteAnimByte = 0
 		}
 
 		// Always normalize to unit direction.
@@ -712,7 +600,7 @@ func (c *Client) handleInWorldInput() {
 		var targetSpeed float32
 		// PS2: first person backward/strafe = walk speed only, forward = run allowed.
 		fpWalkOnly := c.firstPerson && (inputFwd <= 0 || inputRight != 0)
-		if c.runMode && mag > runThreshold && !fpWalkOnly {
+		if c.runMode && mag > runThreshold && !fpWalkOnly && !followWalk {
 			targetSpeed = serverSpeed
 		} else {
 			targetSpeed = walkSpeedCap
@@ -828,6 +716,14 @@ func (c *Client) handleInWorldInput() {
 		p.Facing = facing
 	} else {
 		p.Facing = c.targetFacing
+	}
+	// The target facing (FaceTargetHeading): while auto-attack is on, or for a
+	// second after a swing's effect, the walker faces its target.
+	if !c.firstPerson {
+		if h, ok := c.engine.FaceTargetHeading(); ok {
+			p.Facing = h
+			c.targetFacing = h
+		}
 	}
 
 	// === PS2 0x40 Smoothed Facing + Turn Rate ===

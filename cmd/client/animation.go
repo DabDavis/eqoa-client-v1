@@ -260,192 +260,10 @@ func swingsPerAttack(class byte, level byte, dualWield bool) int {
 	return 1
 }
 
-// PS2 Combat Animation System (func_00CBDEF8 + func_00CC5190)
-//
-// The PS2 client runs a per-frame combat tick that resolves class/level/weapon
-// into an attack type (0-12), then maps that to a specific CPlayList animation slot.
-// This is independent of DamageIndication — animations are client-side timed.
-
-// combatAttackType represents the resolved attack type from func_00CBDEF8.
-// Each type maps to a specific CPlayList animation slot and spell FX.
-type combatAttackType int
-
-// resolveCombatAttackType ports PS2 func_00CBDEF8.
-// Jump table at 0x00CF3490 indexed by class (0-14).
-// Item proc type flags come from equipped items (item+0x2F0 types 14-20).
-// For our Go client, we simplify: hasPrimary/hasRanged/hasShield from equipment.
-func resolveCombatAttackType(class, level byte, hasPrimary, hasRanged, hasShield, hasDW bool) int {
-	switch class {
-	case 7, 8, 9, 10, 11, 12, 13, 14:
-		// Casters: ranged→8, shield→1, else→0 (no attack anim, just idle)
-		if hasRanged {
-			return 8
-		}
-		if hasPrimary {
-			return 1
-		}
-		return 0 // combat idle
-
-	case 2, 3:
-		// PAL/SK: shield melee, level 20/35 thresholds
-		if hasRanged {
-			if level < 20 {
-				return 8
-			}
-			return 9
-		}
-		if level < 20 {
-			if hasPrimary {
-				return 1
-			}
-			return 0
-		}
-		if level < 35 {
-			if hasShield {
-				return 3
-			}
-			return 2
-		}
-		// 35+
-		if hasShield {
-			return 7
-		}
-		return 5
-
-	case 0, 1, 4:
-		// WAR/RAN/MNK: full melee + DW, level 20/35
-		if hasRanged {
-			if level < 20 {
-				return 8
-			}
-			return 9
-		}
-		if level < 20 {
-			if hasPrimary {
-				return 1
-			}
-			return 0
-		}
-		if level < 35 {
-			if hasDW {
-				return 3
-			}
-			if hasShield {
-				return 3
-			}
-			return 2
-		}
-		// 35+
-		if hasDW {
-			return 8 // DW slash
-		}
-		if hasShield {
-			return 7
-		}
-		return 5
-
-	case 5, 6:
-		// BRD/RGE: DW melee focus
-		if hasRanged {
-			if level < 20 {
-				return 8
-			}
-			return 9
-		}
-		if level < 20 {
-			if hasPrimary {
-				return 1
-			}
-			return 0
-		}
-		if level < 35 {
-			if hasDW {
-				return 1
-			}
-			if hasShield {
-				return 3
-			}
-			return 2
-		}
-		// 35+
-		if hasDW {
-			return 8
-		}
-		if hasShield {
-			return 7
-		}
-		return 5
-	}
-	return 0
-}
-
-// combatAttackAnim ports PS2 func_00CC5190.
-// Jump table at 0x00CF3D70 maps attack type (0-10) → CPlayList animation slot.
-// The alt flag alternates primary/alt for dual-wield and multi-swing attacks.
-func combatAttackAnim(attackType int, alt bool) byte {
-	switch attackType {
-	case 0:
-		return 23 // combat idle (no attack)
-	case 1:
-		if alt {
-			return 24 // 2H slash alt
-		}
-		return 25 // 2H slash primary
-	case 2:
-		return 26 // 2H sword overhead
-	case 3:
-		if alt {
-			return 40 // DW throw left
-		}
-		return 41 // DW throw right
-	case 4:
-		return 42 // archery / HtoH
-	case 5:
-		if alt {
-			return 27 // 2H blunt alt
-		}
-		return 28 // 2H blunt primary
-	case 6:
-		return 29 // 2H blunt overhead
-	case 7:
-		return 31 // 1H blunt primary
-	case 8:
-		if alt {
-			return 32 // DW slash alt (left hand)
-		}
-		return 35 // DW slash primary (right hand)
-	case 9:
-		return 33 // 1H blunt alt
-	case 10:
-		return 36 // 2H blunt heavy
-	}
-	return 23 // default: combat idle
-}
-
-// combatAttackFXHash ports PS2 func_00CBE0A8.
-// Returns the spell effect DictID hash for the attack type.
-// Attack1-4 = melee hit effects, Range1-4 = ranged hit effects.
-func combatAttackFXHash(attackType int) uint32 {
-	switch attackType {
-	case 1:
-		return 0xDA9BEA12 // "Attack2"
-	case 2:
-		return 0xDA9BEA11 // "Attack1"
-	case 3:
-		return 0xDA9BEA13 // "Attack3"
-	case 4:
-		return 0xDA9BEA14 // "Attack4"
-	case 5:
-		return 0x45EAC4A0 // "Range1"
-	case 6:
-		return 0x45EAC4A1 // "Range2"
-	case 7:
-		return 0x45EAC4A2 // "Range3"
-	case 8:
-		return 0x45EAC4A3 // "Range4"
-	}
-	return 0 // no FX
-}
+// The swing CLIENT's auto-attack chooses (GetSwing, VISwing::Effect and
+// Delay, AttackAnim) is ported in internal/game/combat.go, where
+// AutoAttackTick plays it; Engine.Swing reports it. The animation layer below
+// animates the server's swings from the weapon pools.
 
 // isDualWield returns true if the entity has weapons in both hands (no shield).
 func isDualWield(primary, secondary, shield uint32) bool {
@@ -471,9 +289,8 @@ func isDualWieldFromItems(items []game.ParsedItem) bool {
 	return hasPrimary && hasSecondary
 }
 
-// combatState tracks combat animation state for any combatant (player or entity).
-// Hybrid architecture: DamageIndication-driven swings (server controls timing/count),
-// with PS2 func_00CBDEF8 attack type resolution for spell FX selection.
+// combatState tracks combat animation state for any combatant (player or entity):
+// DamageIndication-driven swings (the server controls timing and count).
 type combatState struct {
 	inCombat        bool
 	combatAnim      byte
@@ -486,12 +303,10 @@ type combatState struct {
 	castBarEnd      time.Time // when cast bar finishes (anim starts after this)
 	castAnimEnd     time.Time // when post-cast animation ends (computed once bar completes)
 	castingSelf     bool      // true = self-buff anim, false = offensive
-	combatAttackType int      // resolved attack type (0-12) from PS2 func_00CBDEF8
 }
 
 // resolveCombat is the shared combat animation loop used by both player and entities.
 // Server-driven: one swing per AttackCount bump (one per DamageIndication).
-// PS2 func_00CBDEF8 resolves class/level/weapon → attack type for spell FX.
 func (cs *combatState) resolveCombat(am *AnimationManager, ctrl *models.SpriteAnimController, now time.Time,
 	attackCount int, hitTime time.Time, attackAnims []byte,
 	cas combatAnimSet, modelID int32, serverDrivenCombat bool,
@@ -513,8 +328,8 @@ func (cs *combatState) resolveCombat(am *AnimationManager, ctrl *models.SpriteAn
 		cs.combatAnim = anim
 		cs.combatAnimEnd = now.Add(dur)
 		ctrl.SetAction(int(anim))
-		log.Printf("ANIM [%s]: ATTACK anim=%d atkType=%d dur=%v cycle=%d",
-			dbgLabel, anim, cs.combatAttackType, dur, cs.attackCycleIdx)
+		log.Printf("ANIM [%s]: ATTACK anim=%d dur=%v cycle=%d",
+			dbgLabel, anim, dur, cs.attackCycleIdx)
 		if serverDrivenCombat {
 			if cs.inCombat {
 				cs.lastActivity = now
@@ -747,19 +562,6 @@ func (am *AnimationManager) resolveAnim(ctrl *models.SpriteAnimController, now t
 		}
 	}
 
-	// PS2 func_00CBDEF8: resolve class/level/weapon → attack type for combat tick.
-	// Only for humanoid player/entity models — NPCs with profiles use attackAnims.
-	if isHumanoid {
-		hasPrimary := p.primaryWeapon != 0
-		hasRanged := false // TODO: detect ranged weapons from AttackType 7/8/9
-		hasShield := p.shield != 0
-		dw := isDualWield(p.primaryWeapon, p.secondaryWeapon, p.shield)
-		if p.isPC && p.parsedItems != nil {
-			dw = isDualWieldFromItems(p.parsedItems)
-		}
-		p.cs.combatAttackType = resolveCombatAttackType(p.class, p.level, hasPrimary, hasRanged, hasShield, dw)
-	}
-
 	// Combat animation routing — mutates controller state.
 	p.cs.resolveCombat(am, ctrl, now,
 		p.attackCount, p.hitTime, attackAnims,
@@ -811,8 +613,9 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		gs.PlayerInCombat = false
 	}
 
-	// PS2 opcode 0x0777: server explicitly ended combat.
-	// Clear all combat state immediately instead of waiting for 5s timeout.
+	// 0x077A: "You are outmatched" — the server stopped my auto-attack (the
+	// engine's StopAutoAttack runs off the same message). Clear the animation
+	// layer's combat state at once instead of waiting for the 5 s timeout.
 	if gs.CombatEnded {
 		gs.CombatEnded = false
 		am.playerCombat.inCombat = false
@@ -820,11 +623,9 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		am.InCombat = false
 		am.CombatEngaged = false
 		engine.InCombat = false
-		engine.CombatEngaged = false
-		engine.AttackSent = false
 		ctrl.InCombat = false
 		ctrl.ClearAction()
-		log.Printf("COMBAT: server ended combat (opcode 0x0777)")
+		log.Printf("COMBAT: server ended combat (opcode 0x077A)")
 	}
 
 	// Set controller dead/combat flags.
@@ -866,33 +667,25 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		dbgLabel:           "PLAYER",
 	})
 
-	// PS2 func_00CBE0A8: push resolved combat spell FX hash to GameState
-	// so DamageIndication handler can play the correct Attack1-4/Range1-4 effect.
-	gs.CombatAttackFXHash = combatAttackFXHash(am.playerCombat.combatAttackType)
-
 	// Sync exported combat state for input.go / engine.
 	if am.playerCombat.inCombat != am.InCombat {
 		am.InCombat = am.playerCombat.inCombat
 		engine.InCombat = am.InCombat
 		if !am.InCombat {
 			am.CombatEngaged = false
-			engine.CombatEngaged = false
-			engine.AttackSent = false
 			log.Printf("COMBAT: auto-ended (no activity for 5s)")
 		}
 	}
 
 	// Emote animation (play-once, overrides locomotion but not combat/death).
+	// The emote's opcode went out with it (Engine.PlayEmote); the 0x40
+	// update's animation byte is the walker's locomotion and never an emote.
 	if am.EmoteAnim != 0 {
 		if now.Before(am.EmoteEnd) {
 			ctrl.SetAction(int(am.EmoteAnim))
-			engine.EmoteAnimByte = am.EmoteAnim
 		} else {
 			am.EmoteAnim = 0
-			engine.EmoteAnimByte = 0
 		}
-	} else {
-		engine.EmoteAnimByte = 0
 	}
 
 	// Landing animation (brief crouch after fall — full body).

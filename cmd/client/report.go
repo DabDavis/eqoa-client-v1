@@ -965,7 +965,7 @@ func (c *Client) reportDumpWorld(f func(string, ...any), gs *game.GameState) {
 	f("position: %.2f %.2f %.2f, facing %.3f rad", p.X, p.Y, p.Z, p.Facing)
 	f("hp %d/%d, power %d/%d, dead %v, breath timer %.1f", p.HPInt, p.MaxHPInt, p.PowerInt, p.MaxPowerInt, p.Dead, c.breathTimer)
 	f("speed %.2f (server %.3f), velocity y %.2f, on ground %v, water %d, liquid 0x%X, auto-run %v, follow %v",
-		c.currentSpeed, p.Speed, c.velocityY, c.onGround, c.waterState, c.liquidFlags, c.autoRun, c.followTarget)
+		c.currentSpeed, p.Speed, c.velocityY, c.onGround, c.waterState, c.liquidFlags, c.autoRun, c.engine.Following())
 	f("camera: mode %d, angle %.3f, pitch %.3f, distance %.2f, collision %.2f",
 		c.camMode, c.camAngle, c.camPitch, c.camDist, c.camCollDist)
 	if c.weather != nil {
@@ -979,8 +979,11 @@ func (c *Client) reportDumpWorld(f func(string, ...any), gs *game.GameState) {
 		f("")
 		f("[target]")
 		f("%s", reportEntityLine(t, p))
-		f("con color %d, face %d", gs.TargetConColor, gs.TargetFaceColor)
+		f("con color %d, face %d, info valid %v", gs.TargetConColor, gs.TargetFaceColor, gs.TargetInfoValid)
 	}
+	kind, effect, delay := c.engine.Swing()
+	f("auto-attack %v (toggle mode %v), swing kind %d, effect 0x%08X, delay %d ms",
+		c.engine.CombatEngaged, c.engine.AutoAttackToggle, kind, effect, delay)
 
 	ents := make([]*game.Entity, 0, len(gs.Entities))
 	for _, e := range gs.Entities {

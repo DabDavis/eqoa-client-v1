@@ -417,34 +417,20 @@ func (c *Client) handleChatInput() {
 				Channel: game.ChatSystem,
 			})
 		case "follow":
-			if c.targetObjectID == 0 {
-				gs := c.engine.State
-				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-					Text: "You must have a target to follow.", Channel: game.ChatSystem,
-				})
-			} else {
-				c.followTarget = !c.followTarget
-				gs := c.engine.State
-				if c.followTarget {
-					gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-						Text: "Following target.", Channel: game.ChatSystem,
-					})
-				} else {
-					gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-						Text: "No longer following.", Channel: game.ChatSystem,
-					})
-				}
-			}
+			// ToggleFollow: a group member only (else word 1195), no message.
+			c.engine.ToggleFollow()
 		case "wave":
-			c.playEmote(animEmoteWave, "waves")
+			c.playEmote(game.EmoteWave)
 		case "bow":
-			c.playEmote(animEmoteBow, "bows")
+			c.playEmote(game.EmoteBow)
 		case "point":
-			c.playEmote(animEmotePoint, "points")
+			c.playEmote(game.EmotePoint)
 		case "cheer":
-			c.playEmote(animEmoteCheer, "cheers")
+			c.playEmote(game.EmoteCheer)
 		case "dance":
-			c.playEmote(animSpecialIdle, "dances")
+			// Not a PS2 emote (PlayEmote has four): the special idle, shown
+			// here only, with nothing sent.
+			c.playLocalAnim(animSpecialIdle)
 		default:
 			if cmd == "" {
 				// No prefix -> use default chat mode
@@ -517,8 +503,16 @@ func (c *Client) sendDefaultChat(text string) {
 	}
 }
 
-// playEmote starts an emote animation on the local player.
-func (c *Client) playEmote(animSlot byte, verb string) {
+// playEmote is VIClient::PlayEmote: the emote's opcode (Engine.PlayEmote)
+// and its action on my character.
+func (c *Client) playEmote(which int) {
+	if act := c.engine.PlayEmote(which); act >= 0 {
+		c.playLocalAnim(byte(act))
+	}
+}
+
+// playLocalAnim plays a play-once action on my character only.
+func (c *Client) playLocalAnim(animSlot byte) {
 	modelID := int32(c.engine.State.Player.ModelID)
 	if c.animMgr.DebugModelID != 0 {
 		modelID = c.animMgr.DebugModelID
@@ -881,14 +875,10 @@ func (c *Client) castHotbarSlot(slot int) {
 		return
 	}
 
-	targetID := c.targetObjectID
-	if targetID == 0 {
-		targetID = 0xFFFFFFFF // self-cast
-	}
-
-	log.Printf("Hotbar: casting slot %d = %s (target=0x%08X)", slot, sp.Name, targetID)
+	// Send0032 carries the current target, 0xFFFFFFFF with none.
+	log.Printf("Hotbar: casting slot %d = %s (target=0x%08X)", slot, sp.Name, c.engine.TargetObjectID)
 	gs.CastSpellName = sp.Name
-	c.engine.SendCast(uint8(sp.WhereOnHotBar), targetID)
+	c.engine.CastAbility(uint8(sp.WhereOnHotBar))
 }
 
 // handleHotbarKeys checks 1-9,0 keys and casts the spell in that hotbar slot.

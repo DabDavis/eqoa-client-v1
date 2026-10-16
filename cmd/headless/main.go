@@ -120,8 +120,9 @@ func main() {
 			// Periodic combat status when in combat
 			if gs.Player.AttackCount > 0 && time.Since(lastCombatLog) > 2*time.Second {
 				lastCombatLog = time.Now()
-				fmt.Printf("  [combat] attacks=%d target=0x%08X fxHash=0x%08X\n",
-					gs.Player.AttackCount, engine.TargetObjectID, gs.CombatAttackFXHash)
+				_, swingFX, _ := engine.Swing() // the effect AutoAttackTick plays
+				fmt.Printf("  [combat] attacks=%d target=0x%08X swing=0x%08X auto-attack=%v\n",
+					gs.Player.AttackCount, engine.TargetObjectID, swingFX, engine.CombatEngaged)
 			}
 
 			// CastingCombat count tracking
@@ -258,9 +259,14 @@ func handleCommand(engine *game.Engine, line string) {
 		fmt.Println("  stop            — Stop movement/follow")
 		fmt.Println("  target <id|name> — Target entity by object ID or closest name match")
 		fmt.Println("  tnear           — Target nearest entity")
+		fmt.Println("  tcycle [party]  — CycleTarget: the next in the party (me, roster, pet); the scene needs a camera")
+		fmt.Println("  tselect <1-6>   — SelectTarget: 1 me, 2-5 the roster, 6 the pet")
+		fmt.Println("  tclear          — ClearTarget (no message; the next 0x40 carries it)")
 		fmt.Println("  con             — Show current target info (name, level, distance)")
-		fmt.Println("  attack          — Auto-attack current target")
-		fmt.Println("  engage          — PS2 combat sequence: PetCmd(0x05) + Target + 0x40 flush")
+		fmt.Println("  attack [hold]   — Press the attack button (ToggleAutoAttack); released after 200 ms unless 'hold'")
+		fmt.Println("  release         — Release the attack button (MaybeStopAutoAttack)")
+		fmt.Println("  aamode [toggle|hold] — The auto-attack option (VIGameOptions m_x95); hold is retail's default")
+		fmt.Println("  engage          — PetCmd(0x05) + Target")
 		fmt.Println("  fight [slot] [count] [delay_ms] — Full combat test with proper timing")
 		fmt.Println("  cast <name|id>  — Cast spell by name or SpellID on current target")
 		fmt.Println("  cast raw <N>    — Send raw ability byte N (for pcap correlation)")
@@ -635,10 +641,8 @@ func handleCommand(engine *game.Engine, line string) {
 			lastTargetID = bestEnt.ObjectID
 			fmt.Printf("Matched: %s [%d] dist=%.1f\n", bestEnt.Name, bestEnt.ObjectID, bestDist)
 		}
-		engine.TargetObjectID = lastTargetID
-		engine.SendTarget(lastTargetID)
-		engine.ForcePositionFlush() // ensure 0x40 with target propagates immediately
-		fmt.Printf("Targeting objectID %d (0x40 flushed)\n", lastTargetID)
+		engine.SetTarget(lastTargetID) // 0x0010; the next 0x40 carries it too
+		fmt.Printf("Targeting objectID %d\n", lastTargetID)
 
 	case "tnear":
 		gs := engine.State
@@ -659,10 +663,37 @@ func handleCommand(engine *game.Engine, line string) {
 			}
 		}
 		lastTargetID = bestEnt.ObjectID
-		engine.TargetObjectID = lastTargetID
-		engine.SendTarget(lastTargetID)
-		engine.ForcePositionFlush() // ensure 0x40 with target propagates immediately
-		fmt.Printf("Targeting nearest: %s [%d] dist=%.1f (0x40 flushed)\n", bestEnt.Name, bestEnt.ObjectID, bestDist)
+		engine.SetTarget(lastTargetID)
+		fmt.Printf("Targeting nearest: %s [%d] dist=%.1f\n", bestEnt.Name, bestEnt.ObjectID, bestDist)
+
+	case "tcycle":
+		engine.CycleTarget(len(parts) > 1 && strings.ToLower(parts[1]) == "party", nil)
+		lastTargetID = engine.TargetObjectID
+		fmt.Printf("Target 0x%08X\n", lastTargetID)
+
+	case "tselect":
+		n := 1
+		if len(parts) > 1 {
+			n, _ = strconv.Atoi(parts[1])
+		}
+		engine.SelectTarget(n)
+		lastTargetID = engine.TargetObjectID
+		fmt.Printf("Target 0x%08X\n", lastTargetID)
+
+	case "tclear":
+		engine.ClearTarget()
+		lastTargetID = 0
+		fmt.Println("Target cleared")
+
+	case "release":
+		engine.MaybeStopAutoAttack()
+		fmt.Printf("Attack button released (auto-attack %v)\n", engine.CombatEngaged)
+
+	case "aamode":
+		if len(parts) > 1 {
+			engine.AutoAttackToggle = strings.ToLower(parts[1]) == "toggle"
+		}
+		fmt.Printf("Auto-attack option: toggle=%v\n", engine.AutoAttackToggle)
 
 	case "say":
 		if len(parts) < 2 {
@@ -1284,14 +1315,23 @@ func handleCommand(engine *game.Engine, line string) {
 		}
 
 	case "attack":
-		if lastTargetID == 0 {
+		if engine.TargetObjectID == 0 {
 			fmt.Println("No target. Use: target <objectID>")
 			return
 		}
-		engine.CombatEngaged = true // set byte 36 in 0x40 packet (auto-attack flag)
-		engine.SendAttack(lastTargetID)
-		engine.ForcePositionFlush() // send 0x40 (with new facing + target) + attack in one packet
-		fmt.Printf("Attacking objectID %d\n", lastTargetID)
+		// The attack button: ToggleAutoAttack sends 0x000F when a swing is due.
+		// A PS2 tap holds it ~100 ms (0x40 byte 36 pulses), so release after
+		// 200 ms unless asked to hold.
+		engine.ToggleAutoAttack()
+		fmt.Printf("Attack pressed on 0x%08X (auto-attack %v)\n", engine.TargetObjectID, engine.CombatEngaged)
+		if len(parts) < 2 || strings.ToLower(parts[1]) != "hold" {
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				gameMu.Lock()
+				engine.MaybeStopAutoAttack()
+				gameMu.Unlock()
+			}()
+		}
 
 	case "engage":
 		// PS2 combat sequence: PetCommand(0x05) → Target → then user casts/attacks
@@ -1300,9 +1340,8 @@ func handleCommand(engine *game.Engine, line string) {
 			return
 		}
 		engine.SendPetCommand(0x05)
-		engine.SendTarget(lastTargetID)
-		engine.ForcePositionFlush() // ensure 0x40 with target propagates
-		fmt.Printf("Engaged combat: PetCmd(0x05) + Target(%d) + 0x40 flush\n", lastTargetID)
+		engine.SetTarget(lastTargetID)
+		fmt.Printf("Engaged combat: PetCmd(0x05) + Target(%d)\n", lastTargetID)
 
 	case "fight":
 		// Full combat test: target → flush → wait → cast multiple slots with cooldown waits.
@@ -1333,10 +1372,9 @@ func handleCommand(engine *game.Engine, line string) {
 		tgt := lastTargetID
 		fmt.Printf("Fight sequence: slot=%d count=%d delay=%dms target=0x%08X\n", slot, count, delayMs, tgt)
 
-		// Step 1: Target + flush 0x40 to propagate target to server
-		engine.SendTarget(tgt)
-		engine.ForcePositionFlush()
-		fmt.Println("  [1] Target + 0x40 flush sent")
+		// Step 1: Target (0x0010; 0x0032 and 0x000F carry the target themselves)
+		engine.SetTarget(tgt)
+		fmt.Println("  [1] Target sent")
 
 		// Step 2: Wait for server to process 0x40 with target. Release gameMu so
 		// the tick loop keeps running during the wait.
@@ -1344,9 +1382,10 @@ func handleCommand(engine *game.Engine, line string) {
 		time.Sleep(500 * time.Millisecond)
 		gameMu.Lock()
 
-		// Step 3: Send attack to start auto-attack
-		engine.SendAttack(tgt)
-		fmt.Println("  [2] Attack sent")
+		// Step 3: press and release the attack button (ToggleAutoAttack)
+		engine.ToggleAutoAttack()
+		engine.MaybeStopAutoAttack()
+		fmt.Println("  [2] Attack pressed")
 
 		// Step 4: Cast spells with delays for cooldowns. Runs after this handler
 		// releases gameMu, so it takes the lock around each engine call.
@@ -1432,16 +1471,10 @@ func handleCommand(engine *game.Engine, line string) {
 			fmt.Println("No target. Use: target <objectID>")
 			return
 		}
-		engine.SendInteract(lastTargetID)
-		// Auto-send MerchantDiag for merchant NPCs
-		if ent, ok := engine.State.Entities[lastTargetID]; ok && ent.IsNPC {
-			if ent.NPCType&0x0100 != 0 || strings.HasPrefix(ent.Name, "Merchant") {
-				engine.State.MerchantName = ent.Name
-				engine.SendMerchantDiag(lastTargetID)
-				fmt.Printf("Sent MerchantDiag for %s\n", ent.Name)
-			}
-		}
-		fmt.Printf("Interacting with objectID %d\n", lastTargetID)
+		// InteractWithTarget: 0x004C to a merchant, 0x124D to a banker, 0x0061 to
+		// a blacksmith, 0x0004 to anything else (the engine's target).
+		engine.InteractWithTarget()
+		fmt.Printf("Interacting with objectID %d\n", engine.TargetObjectID)
 
 	case "shop":
 		if lastTargetID == 0 {

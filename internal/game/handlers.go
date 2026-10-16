@@ -130,7 +130,8 @@ func (gs *GameState) handleQuestDialogueResp(msg *protocol.Message) {
 // handleUpdateQuestProgress is 0x007B (Msg007B): the target an assist found,
 // a u32. 0xFFFFFFFF is "There is no target for assisting." (string 838, a
 // notice box on the PS2). Any other id becomes the target and the PS2 sends
-// 0x0010 for it; here it waits in AssistTarget for the client to take.
+// 0x0010 for it; here it waits in AssistTarget for the Engine's next frame
+// (SetAssistTarget, combat.go).
 func (gs *GameState) handleUpdateQuestProgress(msg *protocol.Message) {
 	s := newSocialStream(msg)
 	id := s.u32()
@@ -883,7 +884,8 @@ func (gs *GameState) handleTradeRequest(msg *protocol.Message) {
 func (gs *GameState) handleOutMatched(msg *protocol.Message) {
 	log.Printf("OutMatched")
 	gs.addWordLine(gs.wordText(1196), 255, 64, 64)
-	gs.CombatEnded = true // StopAutoAttack: the animation layer turns auto-attack off
+	gs.stopAutoAttack = true // StopAutoAttack, for the Engine (combat.go)
+	gs.CombatEnded = true    // the animation layer's own combat state
 	if gs.Conn != nil {
 		gs.Conn.QueueReliable(protocol.GameOpcode(0x077B), nil)
 	}

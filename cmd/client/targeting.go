@@ -3,10 +3,11 @@ package main
 import (
 	"log"
 	"math"
-	"sort"
+	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 
+	"github.com/eqoa/client/internal/frustum"
 	"github.com/eqoa/client/internal/game"
 	"github.com/eqoa/client/internal/mathutil"
 )
@@ -55,93 +56,82 @@ func (c *Client) mousePickTarget() {
 		checkEnt(&gs.Player)
 	}
 
+	// A pick is a PC addition; it takes CLIENT's SelectTarget tail (SetTarget:
+	// auto-attack off, 0x0010), and a miss its ClearTarget (no message).
 	if bestID != 0 {
-		c.targetObjectID = bestID
-		c.engine.TargetObjectID = bestID
-		c.engine.SendTarget(bestID)
-		c.engine.ForcePositionFlush()
-		c.animMgr.CombatEngaged = false // allow re-engage on new target
-		c.engine.CombatEngaged = false
-		c.engine.AttackSent = false
-		log.Printf("TARGET: mousePick → 0x%08X engine.TargetObjectID=0x%08X", bestID, c.engine.TargetObjectID)
+		c.engine.SetTarget(bestID)
+		log.Printf("TARGET: mousePick → 0x%08X", bestID)
 	} else {
-		c.targetObjectID = 0
-		c.engine.TargetObjectID = 0
+		c.engine.ClearTarget()
+	}
+	c.targetChanged()
+}
+
+// tabTarget is the target key (Tab, R1): CLIENT's CycleTarget over the
+// scene (combat.go), scored through this frame's camera.
+func (c *Client) tabTarget() {
+	c.engine.CycleTarget(false, c.targetView())
+	c.targetChanged()
+	log.Printf("TARGET: tab → 0x%08X", c.engine.TargetObjectID)
+}
+
+// partyTarget is the party key (`, L1): CycleTarget over me, the group
+// roster and the pet.
+func (c *Client) partyTarget() {
+	c.engine.CycleTarget(true, nil)
+	c.targetChanged()
+	log.Printf("TARGET: party → 0x%08X", c.engine.TargetObjectID)
+}
+
+// targetView is m_camera as CycleTarget reads it: the camera this frame
+// draws with, its frustum, and a point's clip-space x (GetWorldToScreen's
+// pixel back to -1..1).
+func (c *Client) targetView() *game.TargetView {
+	camera := c.currentCamera(c.engine.State.Player)
+	sw := float32(rl.GetScreenWidth())
+	sh := float32(rl.GetScreenHeight())
+	if sw <= 0 || sh <= 0 {
+		return nil
+	}
+	frust := frustum.FromCamera(camera, sw/sh)
+	look := rl.Vector3Normalize(rl.Vector3Subtract(camera.Target, camera.Position))
+	return &game.TargetView{
+		Pos: [3]float32{camera.Position.X, camera.Position.Y, camera.Position.Z},
+		Dir: [3]float32{look.X, look.Y, look.Z},
+		Visible: func(x, y, z float32) bool {
+			return frust.TestSphere(x, y, z, 0)
+		},
+		ClipX: func(x, y, z float32) float32 {
+			return rl.GetWorldToScreen(rl.Vector3{X: x, Y: y, Z: z}, camera).X/sw*2 - 1
+		},
 	}
 }
 
-// tabTarget cycles through nearby entities sorted by 3D distance from player.
-func (c *Client) tabTarget() {
-	gs := c.engine.State
-	if len(gs.Entities) == 0 {
-		return
+// targetChanged follows the engine's m_target into the client's copy, and
+// lets the animation layer re-engage on a new target.
+func (c *Client) targetChanged() {
+	if c.targetObjectID != c.engine.TargetObjectID {
+		c.animMgr.CombatEngaged = false
 	}
+	c.targetObjectID = c.engine.TargetObjectID
+}
 
-	p := gs.Player
-
-	camera := c.currentCamera(p)
-	sw := float32(rl.GetScreenWidth())
-	sh := float32(rl.GetScreenHeight())
-
-	// Build sorted list of visible entities by 3D distance (closest first)
-	type entDist struct {
-		id   uint32
-		dist float32
+// attackPressed is the attack button's press (Space, pad Cross; the PS2's
+// keys 32 and 134): ToggleAutoAttack. Its release is MaybeStopAutoAttack, at
+// the top of handleInWorldInput. When it engages, the animation layer starts
+// its own combat state for the server's swings.
+func (c *Client) attackPressed() {
+	c.engine.ToggleAutoAttack()
+	if c.engine.CombatEngaged && !c.animMgr.CombatEngaged {
+		c.animMgr.CombatEngaged = true
+		c.animMgr.playerCombat.attackCycleIdx = 0
+		c.animMgr.playerCombat.lastActivity = time.Now()
 	}
-	var sorted []entDist
-	for _, ent := range gs.Entities {
-		// Screen visibility check
-		height := c.modelHeight(ent.ModelID, 1.8) * ent.Scale
-		// Check entity is in front of camera (dot product with view direction > 0)
-		entPos := rl.Vector3{X: ent.X, Y: ent.Y + height*0.5, Z: ent.Z}
-		viewDir := rl.Vector3{
-			X: camera.Target.X - camera.Position.X,
-			Y: camera.Target.Y - camera.Position.Y,
-			Z: camera.Target.Z - camera.Position.Z,
-		}
-		toEnt := rl.Vector3{
-			X: entPos.X - camera.Position.X,
-			Y: entPos.Y - camera.Position.Y,
-			Z: entPos.Z - camera.Position.Z,
-		}
-		dot := viewDir.X*toEnt.X + viewDir.Y*toEnt.Y + viewDir.Z*toEnt.Z
-		if dot <= 0 {
-			continue // behind camera
-		}
-		screenPos := rl.GetWorldToScreen(entPos, camera)
-		if screenPos.X < 0 || screenPos.X > sw || screenPos.Y < 0 || screenPos.Y > sh {
-			continue
-		}
+}
 
-		d := mathutil.Dist3D(ent.X, ent.Y, ent.Z, camera.Position.X, camera.Position.Y, camera.Position.Z)
-		sorted = append(sorted, entDist{id: ent.ObjectID, dist: d})
-	}
-	if len(sorted) == 0 {
-		return
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].dist < sorted[j].dist
-	})
-
-	// Find current target in list and pick the next one (closest -> farthest -> wrap)
-	nextIdx := 0
-	if c.targetObjectID != 0 {
-		for i, ed := range sorted {
-			if ed.id == c.targetObjectID {
-				nextIdx = (i + 1) % len(sorted)
-				break
-			}
-		}
-	}
-
-	c.targetObjectID = sorted[nextIdx].id
-	c.engine.TargetObjectID = c.targetObjectID
-	c.engine.SendTarget(c.targetObjectID)
-	c.engine.ForcePositionFlush()
-	c.animMgr.CombatEngaged = false // allow re-engage on new target
-	c.engine.CombatEngaged = false
-	c.engine.AttackSent = false
-	log.Printf("TARGET: tab → 0x%08X engine.TargetObjectID=0x%08X", c.targetObjectID, c.engine.TargetObjectID)
+// attackHeld reports whether the attack button is down.
+func attackHeld() bool {
+	return rl.IsKeyDown(rl.KeySpace) || (gpAvailable() && gpDown(rl.GamepadButtonRightFaceDown))
 }
 
 // modelHeight returns the height of a model, or fallback if not loaded.

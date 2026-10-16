@@ -224,7 +224,6 @@ type Client struct {
 	chatScrollOffset int    // lines scrolled up from bottom (0 = latest)
 	chatDragging     bool   // true while dragging chat scrollbar
 	lastTellSender  string // name of last player who sent a tell (for /r)
-	followTarget    bool   // true when auto-following current target
 	wrapCache       map[wrapCacheKey][]string // cached wrapText results
 
 	// Login screen state

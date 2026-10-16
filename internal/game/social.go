@@ -237,7 +237,7 @@ type SocialState struct {
 	PetID uint32
 
 	// AssistTarget is 0x007B's id. CLIENT targets it at once and sends 0x0010;
-	// here it waits for the client to take it (AssistTargetPending).
+	// here the Engine's next frame does (AssistTargetPending, combat.go).
 	AssistTarget        uint32
 	AssistTargetPending bool
 
