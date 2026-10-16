@@ -354,6 +354,10 @@ type GameState struct {
 	// (world entry, coaching, death respawn). Visual client uses this
 	// to trigger loading screen.
 	MemoryDumpCount int
+	// TeleportCount increments on each 0x00B2. It shows the loading screen
+	// as a MemoryDump does, but Msg00B2's Respawn only swings the camera
+	// behind the walker; it does not reset the camera style (cameraWorldEntry).
+	TeleportCount int
 
 	// Status message for display
 	StatusMsg string
@@ -1896,7 +1900,7 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 	// result will naturally contain the new entity data.
 
 	// Trigger loading screen (coaching/GM teleport zone transition)
-	gs.MemoryDumpCount++
+	gs.TeleportCount++
 
 	// Signal engine to send EnableChannel + fresh 0x40 at new position
 	gs.TeleportPending = true

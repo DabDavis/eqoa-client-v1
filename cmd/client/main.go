@@ -375,6 +375,7 @@ type Client struct {
 	loadScrAngle     float32        // current gear rotation angle (degrees)
 	loadScrFade      float32        // seconds remaining for loading overlay (0 = hidden)
 	lastMemDumpCount int            // tracks MemoryDumpCount to detect coaching/death
+	lastTeleportCount int           // tracks TeleportCount (0x00B2)
 
 	// Bone-attached particle emitters (CSprite PartEmitters 0x2960).
 	// PS2: CreateParticleEmitters spawns per-entity, UpdateParticleEmitters tracks bones.
@@ -898,6 +899,13 @@ func runClient() {
 					client.cameraWorldEntry()
 				}
 				client.lastMemDumpCount = engine.State.MemoryDumpCount
+			}
+			// A 0x00B2 (respawn, GM teleport) shows the loading screen too; its
+			// camera half runs when the arrival sets the walker down (arrival.go).
+			if engine.State.TeleportCount > client.lastTeleportCount {
+				client.lastTeleportCount = engine.State.TeleportCount
+				client.loadScrFade = 4.0
+				log.Printf("Teleport #%d: loading screen triggered", engine.State.TeleportCount)
 			}
 
 			// Detect world change (login to different continent) — reload terrain ESF.

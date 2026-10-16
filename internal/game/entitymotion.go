@@ -60,23 +60,6 @@ type EntityMotion struct {
 	Walking  bool       // +0x255 (byte 141): driven by its own VIWalkControl
 }
 
-// wrapPi is func_00CC6920: an angle below −π is raised, and one at or above
-// π lowered, by 2π until it lies in [−π, π).
-func wrapPi(a float32) float32 {
-	const pi = float32(math.Pi)
-	if a < -pi {
-		for a < -pi {
-			a += 2 * pi
-		}
-	}
-	if pi <= a {
-		for pi <= a {
-			a -= 2 * pi
-		}
-	}
-	return a
-}
-
 // facing0To2Pi is a heading in Go's [0, 2π) facing convention.
 func facing0To2Pi(a float32) float32 {
 	f := float32(math.Mod(float64(a), 2*math.Pi))

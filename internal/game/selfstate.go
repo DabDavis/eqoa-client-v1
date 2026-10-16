@@ -157,13 +157,15 @@ func wrapPi(a float32) float32 {
 
 // selfStateDue is Process's test around the writer (0x00BC7F40): the first
 // call after VIClient::Connect (which stores -1 in +0x7570), and then once
-// the frame clock is interval ms past the last write. The interval is
+// the frame clock is interval ticks past the last write. The interval is
 // +0x7578: 100 from the constructor, whatever a 0x07B2 carries after.
 func selfStateDue(last, now time.Time, interval uint32) bool {
 	if last.IsZero() {
 		return true
 	}
-	return now.Sub(last) >= time.Duration(interval)*time.Millisecond
+	// The interval is in VITimer ticks (ps2clock.go), 983.04 a second: 100
+	// of them are 101.7 ms.
+	return now.Sub(last) >= time.Duration(float64(interval)/ps2TicksPerSecond*float64(time.Second))
 }
 
 // DriveAccel is the force VIWalkControl::Walk/Run adds for a walker heading

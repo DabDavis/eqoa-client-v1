@@ -48,6 +48,11 @@ func (c *Client) updateArrival() {
 	c.onGround = false
 	c.arrival = nil
 	log.Printf("Arrival: (%.1f, %.1f, %.1f) set down at y=%.2f (reach %.0f)", a.X, a.Y, a.Z, p.Y, a.Reach)
+	// Respawn's and MoveTo's last word: VIWalkCamera::SetLocation at the
+	// placed walker, then SetOrbitAngleBehind (walkcamera.go). A MemoryDump
+	// (Reach 0) gets cameraWorldEntry from main.go instead, which also
+	// restores the camera style.
+	c.resetCameraBehind()
 }
 
 // startArrival is what every arrival does at once: the battle music and the
@@ -64,10 +69,8 @@ func (c *Client) startArrival(a *game.Arrival) {
 		c.autoRun = false
 		c.engine.StopMovement()
 	}
-	// TODO(egress-camera): VIWalkCamera::SetLocation(p, heading) +
-	// SetOrbitAngleBehind — the camera lane's reset hook belongs here, with
-	// a.Heading. Msg000D, Respawn and MoveTo all put the camera behind the
-	// walker as it arrives.
+	// The camera goes behind the walker once it is set down (updateArrival,
+	// resetCameraBehind); a.Heading is already the player's facing.
 }
 
 // drawFade is VIClient::DrawFade (0x00BC55D8 [V]), last in the frame and over

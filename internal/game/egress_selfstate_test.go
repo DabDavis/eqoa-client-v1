@@ -206,10 +206,11 @@ func TestSelfStateDue(t *testing.T) {
 	if !selfStateDue(time.Time{}, t0, 100) {
 		t.Error("the first write after a connect is due at once")
 	}
-	if selfStateDue(t0, t0.Add(99*time.Millisecond), 100) {
+	// 100 VITimer ticks at 983.04 a second are 101.7 ms.
+	if selfStateDue(t0, t0.Add(101*time.Millisecond), 100) {
 		t.Error("due before the interval")
 	}
-	if !selfStateDue(t0, t0.Add(100*time.Millisecond), 100) {
+	if !selfStateDue(t0, t0.Add(102*time.Millisecond), 100) {
 		t.Error("not due at the interval")
 	}
 	if !selfStateDue(t0, t0, 0) {

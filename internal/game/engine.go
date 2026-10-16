@@ -324,8 +324,8 @@ func (e *Engine) Tick() {
 				e.faceTarget(e.TargetObjectID)
 			}
 
-			// VIClient::Process (0x00BC7F40): the 0x40 every +0x7578 ms --
-			// 100 from the constructor, 0x07B2 sets it -- and the frame's
+			// VIClient::Process (0x00BC7F40): the 0x40 every +0x7578 VITimer
+			// ticks -- 100 from the constructor, 0x07B2 sets it -- and the frame's
 			// flush with it. The captures' intervals are 100 and 133 ms (3 or
 			// 4 frames at 30 fps), and nothing while the state is unchanged.
 			if selfStateDue(e.lastPositionSend, time.Now(), e.State.Session.P07578) {

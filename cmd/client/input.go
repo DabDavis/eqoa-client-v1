@@ -23,8 +23,8 @@ func (c *Client) handleInWorldInput() {
 		c.safeValid = false
 		c.currentSpeed = 0
 		c.flyVelX, c.flyVelY, c.flyVelZ = 0, 0, 0
-		// Respawn's camera half: SetLocation, then SetOrbitAngleBehind.
-		c.resetCameraBehind()
+		// Respawn's camera half runs once the arrival sets the walker down
+		// (arrival.go: resetCameraBehind).
 	}
 
 	// The F3 report dialog holds the keyboard, as the menu and chat do: no
