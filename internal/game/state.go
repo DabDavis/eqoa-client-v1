@@ -669,8 +669,18 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleGrantXPOrItems(msg)
 	case protocol.OpcodeAddInvItem:
 		gs.handleInventoryItem(msg, "AddInvItem")
-	case protocol.OpcodeLoot:
-		gs.handleInventoryItem(msg, "Loot")
+	case protocol.OpcodeLoot: // 0x0018: a corpse's contents (Msg0018)
+		gs.handleLoot(msg)
+	case protocol.OpcodeRemoveInvItem: // 0x003C
+		gs.handleRemoveInvItem(msg)
+	case protocol.OpcodeInteractItem: // 0x003E (also the request's opcode)
+		gs.handleUseItemResult(msg)
+	case protocol.OpcodeClientLoot: // 0x0019
+		gs.handleLootOne(msg)
+	case protocol.OpcodeRemoveBankItem: // 0x1250
+		gs.handleBankWithdrawn(msg)
+	case protocol.OpcodeAddBankItem: // 0x1251
+		gs.handleBankDeposited(msg)
 	case protocol.OpcodeEquipItem:
 		gs.handleEquipItemConfirm(msg)
 	case protocol.OpcodeUnequipItem:
