@@ -590,6 +590,7 @@ func NewGameState(host string, gamePort, authPort, patchPort int, username strin
 		itemLists:         newItemLists(),
 		stateChannelCount: make(map[byte]int),
 	}
+	gs.Session.P07578 = 100 // VIClient's constructor (0x00BBF814): the 0x40 interval
 	return gs
 }
 

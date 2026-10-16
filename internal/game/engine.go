@@ -25,7 +25,7 @@ type Engine struct {
 	startupCh    chan startupResult // off-thread startup I/O → main goroutine (#4)
 	tickCount    int
 	whoToken       byte   // Who list request token (increments by 2)
-	TargetObjectID uint32 // Current target ObjectID (sent in 0x40 position updates)
+	TargetObjectID uint32 // Current target ObjectID (0x40 bytes 37-40, VIClient+0xC140; 0 = none)
 	chatMode       byte   // Current server-side chat mode (0=say, 3=group)
 
 	// Movement target (goto command)
@@ -71,28 +71,30 @@ type Engine struct {
 	isCSpriteCB    func(actorObjID uint32) bool
 	weaponTrailCB  func(actorObjID uint32, trailID int32, color [3]float32)
 
-	// 0x40 position send throttle — PS2 runs at 30fps and sends 0x40 at ~6/s
-	// (~every 5 frames). Visual client at 60fps must NOT queue per frame.
+	// lastPositionSend is VIClient+0x7570, when the 0x40 was last written;
+	// zero (Connect's -1) writes it on the next tick. See selfStateDue.
 	lastPositionSend time.Time
 
 	// Arrow-key walking (set by UI layer each frame)
 	Walking       bool
-	AnimByte      byte // CPlayList slot: 0=idle, 1=walk, 3=run, 4=swim (matches PS2 wire format)
-	EmoteAnimByte byte // non-zero while an emote is playing (overrides AnimByte in 0x40)
+	// AnimByte is the walker's m_locoState, 0x40 byte 35, which is also the
+	// CPlayList slot the sprite plays (VIWalkControl::UpdateSprite): 0 idle,
+	// 1 walk, 2 walk back, 3 run, 4/5 turn, 6 in the air, 10/11 strafe,
+	// 12/13 swim (UpdateLocomotion).
+	AnimByte      byte
+	EmoteAnimByte byte // non-zero while an emote is playing; NOT in the 0x40 (CLIENT's PlayEmote sends an opcode)
 	InCombat      bool // true when server confirms auto-attack (sets animation byte to 0x09)
 	CombatEngaged bool // true when player pressed spacebar to initiate auto-attack
 	AttackSent    bool // true once the Attack opcode (0x000F) has been sent for current engage
 
-	// PS2 0x40 velocity encoding — world-space velocity set by movement handler each frame.
-	// Encoded as uint16 big-endian in 0x40 bytes 10-15, 0x8000 = center (zero velocity).
-	VelX, VelY, VelZ float32
-
-	// PS2 0x40 auxiliary fields (set by visual client each frame)
-	StickMagnitude byte    // byte 24: analog stick deflection (128=center, 254=max). Keyboard: 254 when moving, 128 idle.
-	AccelState     byte    // byte 26: 0x80=steady/idle, 0xFF=accelerating, 0x00=decelerating
-	SmoothedFacing float32 // byte 28: exponentially smoothed facing (lags during turns)
-	TurnRate       float32 // byte 23: heading change rate in rad/s (0=no turn, positive=right, negative=left)
-	PrevFacing     float32 // previous frame facing for turn rate computation
+	// The walker's committed physics, which the 0x40 sends (selfstate.go),
+	// set by whatever moves the player: the visual client's walker, the
+	// headless goto, the crawler.
+	VelX, VelY, VelZ float32 // m_velocity: world space, units/s
+	ForceX, ForceZ   float32 // m_force: the walk/run thrust (DriveAccel along the move), 0 with no input
+	walkFlags        uint32  // m_flags, VIWalkFlags (SetWalkState)
+	walkFloor        float32 // m_floor, the last floor stood on
+	walkStateSet     bool    // a walker has called SetWalkState
 
 	// Deferred game server switch — avoids goroutine deadlock with Flush mutex.
 	// After server list arrives, we wait a few ticks for the ACK to go out,
@@ -307,10 +309,7 @@ func (e *Engine) Tick() {
 		e.updateFollow()
 		e.updateMovement()
 
-		// Send 0x40 position updates.
-		// The PS2 client sends 0x40 every frame even when idle. Sandstorm
-		// uses continuous 0x40 receipt to initialize EntityInRange (visibility).
-		// Without periodic updates, entity state channels never arrive.
+		// The 0x40: the world entry's, a teleport's, then the periodic one.
 		if !e.State.WorldEntryAcked {
 			e.sendWorldEntryTrigger()
 		} else if e.State.TeleportPending {
@@ -325,13 +324,12 @@ func (e *Engine) Tick() {
 				e.faceTarget(e.TargetObjectID)
 			}
 
-			// Throttle 0x40 to ~6/s (every ~166ms), matching PS2's observed
-			// rate of 5.87/s. PS2 runs at 30fps and sends 0x40 every ~5 frames.
-			// At 60fps visual client, this prevents queuing 6 XOR-chained
-			// messages per 100ms flush cycle.
-			if time.Since(e.lastPositionSend) >= 150*time.Millisecond {
+			// VIClient::Process (0x00BC7F40): the 0x40 every +0x7578 ms --
+			// 100 from the constructor, 0x07B2 sets it -- and the frame's
+			// flush with it. The captures' intervals are 100 and 133 ms (3 or
+			// 4 frames at 30 fps), and nothing while the state is unchanged.
+			if selfStateDue(e.lastPositionSend, time.Now(), e.State.Session.P07578) {
 				e.sendPositionUpdate()
-				e.lastPositionSend = time.Now()
 			}
 		}
 
@@ -582,190 +580,94 @@ func (e *Engine) SetPosition(x, y, z, facing float32) {
 	e.State.Player.Facing = facing
 }
 
-// sendWorldEntryTrigger sends the first 0x40 with the player's current position.
-// PS2 sends the first 0x40 in the SAME packet as the world entry opcodes
-// (CharacterInWorld + ChangeChatMode + FactionMessages + LootMessages).
-// The reliable messages were already queued by handleMemoryDump but NOT flushed.
-// We queue the 0x40, then flush everything together in one packet.
-func (e *Engine) sendWorldEntryTrigger() {
-	// Initialize smoothed facing to current facing to prevent initial lag.
-	p := &e.State.Player
-	e.SmoothedFacing = p.Facing
-	e.PrevFacing = p.Facing
-	e.AccelState = 0x80
-	e.StickMagnitude = 0x80
+// SetWalkState records the walker's flags and floor for the 0x40: its
+// VIWalkPhysics m_flags (VIWalkFlags) and m_floor, the last floor stood on.
+// A tool that never calls it sends a walker standing on landscape.
+func (e *Engine) SetWalkState(flags uint32, floor float32) {
+	e.walkFlags = flags
+	e.walkFloor = floor
+	e.walkStateSet = true
+}
 
-	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
-	e.State.Conn.Flush()
+// sendWorldEntryTrigger sends the first 0x40 with the player's current
+// position, in the same packet as the world entry's reliable messages, which
+// handleMemoryDump queued and did not flush: CLIENT's first frame after the
+// MemoryDump writes the 0x40 (Connect left +0x7570 at -1) and the frame's
+// drdp_flush carries both (every PS2 capture has 0x00CA beside its first
+// 0x40). The state is SetLocation's: still, on a floor.
+func (e *Engine) sendWorldEntryTrigger() {
+	e.sendSelfState(true)
 	e.State.WorldEntryAcked = true
 	log.Printf("sendWorldEntryTrigger: sent world entry batch + initial 0x40 in one packet")
 }
 
-// buildPositionBuffer builds a 41-byte 0x40 state buffer matching the PS2 format.
-// PS2 sends 41 bytes: position + velocity + facing + turning + flags + animation + target.
-func (e *Engine) buildPositionBuffer() []byte {
+// selfState is the walker as func_00BC2F30 reads it. At a SetLocation --
+// world entry, a teleport -- it is what VIWalkControl::SetLocation leaves:
+// no velocity, force or turn, flags onFloor plus the kept 0x100 bit, locomotion 0.
+func (e *Engine) selfState(setLocation bool) SelfState {
 	p := &e.State.Player
-
-	rawX := uint32(float64(p.X+4000.0) / 36000.0 * float64(0xFFFFFF))
-	rawY := uint32(float64(p.Y+1000.0) / 2000.0 * float64(0xFFFFFF))
-	rawZ := uint32(float64(p.Z+4000.0) / 36000.0 * float64(0xFFFFFF))
-
-	// Clamp to uint24 range
-	if rawX > 0xFFFFFF {
-		rawX = 0xFFFFFF
+	target := e.TargetObjectID
+	if target == 0 {
+		target = 0xFFFFFFFF
 	}
-	if rawY > 0xFFFFFF {
-		rawY = 0xFFFFFF
+	s := SelfState{
+		World:         p.World,
+		Position:      [3]float32{p.X, p.Y, p.Z},
+		Angles:        [3]float32{p.Facing, 0, 0},
+		TargetHeading: p.Facing,
+		Floor:         p.Y,
+		Flags:         WalkOnFloor | WalkTurnTrack | WalkLandscape,
+		Target:        target,
 	}
-	if rawZ > 0xFFFFFF {
-		rawZ = 0xFFFFFF
+	if e.walkStateSet {
+		s.Flags = e.walkFlags
+		s.Floor = e.walkFloor
 	}
-
-	// PS2 facing byte encoding:
-	// facingByte = heading * 128/PI + 128
-	// The +128 offset means: heading=0 (north/+Z) → byte 128, heading=PI (south) → byte 0.
-	// Java server reads: getByte(22) + 128, which undoes the offset to get unsigned 0-255.
-	// C# ConvertFacing: (sbyte)(byte - 128) * PI/128 recovers radians.
-	// PS2 pcap verified: facing byte 128 when facing north, 0 when facing south.
-	facingByte := byte(p.Facing*128/math.Pi) + 128
-
-	// Build 41-byte state buffer matching PS2 format exactly.
-	// The Java Sandstorm server reads the full buffer for enteredGame() / EntityInRange.
-	buf := make([]byte, 41)
-
-	// [0] World ID — must match server's world for entity visibility
-	buf[0] = p.World
-
-	// [1-9] Position: X, Y, Z as uint24 big-endian
-	buf[1] = byte(rawX >> 16)
-	buf[2] = byte(rawX >> 8)
-	buf[3] = byte(rawX)
-	buf[4] = byte(rawY >> 16)
-	buf[5] = byte(rawY >> 8)
-	buf[6] = byte(rawY)
-	buf[7] = byte(rawZ >> 16)
-	buf[8] = byte(rawZ >> 8)
-	buf[9] = byte(rawZ)
-
-	// [10-15] Velocity: VelX(uint16), VelY(uint16), VelZ(uint16) — big-endian
-	// 0x8000 = center (zero velocity). PS2 encodes actual movement velocity.
-	// Java Sandstorm decodes: vx = 15.3*2*raw/0xFFFF - 15.3 = 30.6*raw/65535 - 15.3
-	// Inverting: raw = (vx + 15.3) / 30.6 * 65535 = vx * 2142.0 + 32768
-	// So raw = 0x8000 + vx * 2142.0 (matching uint16 offset-from-center encoding).
-	//
-	// Sandstorm relays this velocity to PS2 clients via state channel bytes 40-42
-	// (scaled by speed_adjust=6.0 → int8). PS2 clients use it for dead-reckoning
-	// between state updates. Zero velocity forces PS2 to compute implicit velocity
-	// from position deltas, causing overshoot/slingshot on stop.
-	const velEncode = 65535.0 / 30.6 // 2142.16 — converts u/s to uint16 offset
-	rawVX := int(float64(e.VelX)*velEncode) + 0x8000
-	rawVZ := int(float64(e.VelZ)*velEncode) + 0x8000
-	if rawVX < 0 {
-		rawVX = 0
-	} else if rawVX > 0xFFFF {
-		rawVX = 0xFFFF
-	}
-	if rawVZ < 0 {
-		rawVZ = 0
-	} else if rawVZ > 0xFFFF {
-		rawVZ = 0xFFFF
-	}
-	buf[10] = byte(rawVX >> 8)
-	buf[11] = byte(rawVX)
-	// PS2 pcap: VelY bytes are always 0xF739 (even when idle). Not actually velocity —
-	// the server code comments `// float vy= ???`. Match PS2 exactly.
-	buf[12] = 0xF7
-	buf[13] = 0x39
-	buf[14] = byte(rawVZ >> 8)
-	buf[15] = byte(rawVZ)
-
-	// [16-21] Target Velocity — 0x8000 (center) for now.
-	// PS2 pcap shows these are input-desired velocity, but populating them
-	// may confuse Sandstorm. Keep at center until proven safe.
-	buf[16] = 0x80
-	buf[17] = 0x00
-	buf[18] = 0x80
-	buf[19] = 0x00
-	buf[20] = 0x80
-	buf[21] = 0x00
-
-	// [22] Facing (0-255 → 0-360°)
-	buf[22] = facingByte
-
-	// [23] Turning — 0x80 = center (no turn)
-	buf[23] = 0x80
-
-	// [24-29] All 0x80 center values.
-	// PS2 pcap shows byte 24 varies (stick mag), byte 26 varies (accel state),
-	// byte 28 = smoothed facing. But changing these from 0x80 causes overshoot
-	// on Sandstorm — byte 24 may act as a speed multiplier server-side.
-	buf[24] = 0x80
-	buf[25] = 0x80
-	buf[26] = 0x80
-	buf[27] = 0x80
-	buf[28] = facingByte // same as byte 22
-	buf[29] = 0x80
-
-	// [30-34] Flags/state
-	// PS2 pcap: byte 32 = 0x01 for first packet (world entry), 0x05 for all subsequent.
-	// Bit 2 (0x04) signals "fully in world" state.
-	buf[30] = 0x00
-	buf[31] = 0x01
-	if e.State.WorldEntryAcked {
-		buf[32] = 0x05 // in world
-	} else {
-		buf[32] = 0x01 // initial/entering
-	}
-	buf[33] = 0x00
-	buf[34] = 0x00
-
-	// [35] Animation byte → Sandstorm copies to state channel byte 58.
-	// PS2 clients use this for remote entity animation (idle/walk/run).
-	// Without it, PS2 shows idle while position moves → sliding.
-	// Combat anim (0x09) is NOT sent here — combat is driven by Attack
-	// opcode (0x000F), not the animation byte.
-	if e.EmoteAnimByte != 0 {
-		buf[35] = e.EmoteAnimByte
-	} else {
-		buf[35] = e.AnimByte
-	}
-
-	// [36] Auto-attack toggle — set to 1 when player presses spacebar/cross to engage.
 	if e.CombatEngaged {
-		buf[36] = 0x01
+		s.AutoAttack = 1
 	}
-
-	// [37-40] Target ObjectID (uint32 LITTLE-ENDIAN). 0xFFFFFFFF = no target.
-	// PS2 pcap confirms LE format: target 0x013CC7F3 at bytes 37-40 = F3 C7 3C 01.
-	targetID := e.TargetObjectID
-	if targetID == 0 {
-		targetID = 0xFFFFFFFF
+	if setLocation {
+		s.Flags = WalkOnFloor | s.Flags&WalkTurnTrack
+		s.Floor = p.Y
+		return s
 	}
-	buf[37] = byte(targetID)
-	buf[38] = byte(targetID >> 8)
-	buf[39] = byte(targetID >> 16)
-	buf[40] = byte(targetID >> 24)
-
-	return buf
+	s.Velocity = [3]float32{e.VelX, e.VelY, e.VelZ}
+	s.Force = [3]float32{e.ForceX, 0, e.ForceZ}
+	s.LocoState = e.AnimByte
+	return s
 }
 
-// sendPositionUpdate sends a 0x40 client update with the current position.
+// buildPositionBuffer is the 41-byte 0x40 (selfstate.go has the layout).
+func (e *Engine) buildPositionBuffer() []byte {
+	s := e.selfState(false)
+	return s.Encode()
+}
+
+// sendSelfState writes the 0x40 and flushes, as one CLIENT frame does: the
+// writer, then TickNet's drdp_flush. A state the server already has is not
+// sent again (QueueClientUpdate).
+func (e *Engine) sendSelfState(setLocation bool) {
+	s := e.selfState(setLocation)
+	e.State.Conn.QueueClientUpdate(s.Encode())
+	e.State.Conn.Flush()
+	e.lastPositionSend = time.Now()
+	e.lastFlush = e.lastPositionSend
+}
+
+// sendPositionUpdate is the periodic 0x40 (Engine.Tick).
 func (e *Engine) sendPositionUpdate() {
-	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
+	e.sendSelfState(false)
 }
 
-// ForcePositionFlush queues an immediate 0x40 position update with the current
-// target ObjectID and flushes it. Call after setting TargetObjectID to ensure
-// Sandstorm sees the target in the 0x40 buffer before processing UseSkill.
+// ForcePositionFlush writes the 0x40 now instead of at its next interval.
+// CLIENT has no such call -- the 0x40 goes out on its interval only, and
+// every message that names a target carries it (0x0010, 0x0032, 0x000F) --
+// so this only brings the next write forward; it restarts the interval.
 func (e *Engine) ForcePositionFlush() {
 	if e.State.Conn == nil || e.State.Phase != PhaseInWorld {
 		return
 	}
-	buf := e.buildPositionBuffer()
-	targetInBuf := uint32(buf[37]) | uint32(buf[38])<<8 | uint32(buf[39])<<16 | uint32(buf[40])<<24
-	log.Printf("FLUSH: 0x40 target=0x%08X facing=0x%02X anim=0x%02X", targetInBuf, buf[22], buf[35])
-	e.State.Conn.QueueClientUpdate(buf)
-	e.State.Conn.Flush()
+	e.sendPositionUpdate()
 }
 
 // sendTeleportArrival sends EnableChannel (0x0049) + fresh 0x40 after a teleport.
@@ -784,11 +686,9 @@ func (e *Engine) sendTeleportArrival() {
 		log.Printf("WARNING: EnableChannel send window full")
 	}
 
-	// 2. Send 0x40 with new position
-	e.State.Conn.QueueClientUpdate(e.buildPositionBuffer())
-
-	// 3. Flush both in one packet
-	e.State.Conn.Flush()
+	// 2. The 0x40 at the new position, as SetLocation leaves the walker
+	// (MoveTo/Respawn), and 3. both in one packet.
+	e.sendSelfState(true)
 
 	log.Printf("sendTeleportArrival: 0x0049(token=%d) world=%d + 0x40 at (%.1f, %.1f, %.1f)",
 		e.State.TeleportToken, world, e.State.Player.X, e.State.Player.Y, e.State.Player.Z)
@@ -815,8 +715,8 @@ func (e *Engine) StopMovement() {
 	e.VelX = 0
 	e.VelY = 0
 	e.VelZ = 0
-	e.StickMagnitude = 0x80
-	e.AccelState = 0x80
+	e.ForceX, e.ForceZ = 0, 0
+	e.AnimByte = 0
 }
 
 // Follow starts continuously following an entity by objectID.
@@ -877,6 +777,10 @@ func (e *Engine) updateMovement() {
 	dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
 
 	if dist <= e.moveArrivalDist {
+		// Standing: nothing left to send but a walker at rest.
+		e.VelX, e.VelZ = 0, 0
+		e.ForceX, e.ForceZ = 0, 0
+		e.AnimByte = 0
 		if e.followTarget == 0 {
 			// Only print arrival for goto, not follow (follow re-acquires target each tick)
 			e.moveTargetActive = false
@@ -900,14 +804,25 @@ func (e *Engine) updateMovement() {
 	// the 0x40 facing byte encoding (heading * 128/PI) handles any range.
 	p.Facing = float32(math.Atan2(float64(dx), float64(dz)))
 
-	// Set velocity for 0x40 encoding (headless has no speed ramping).
-	e.VelX = dx * ratio / 0.1 // approximate velocity from step/tick (100ms tick)
+	// The walker's state for the 0x40: velocity from the step (100 ms
+	// tick, no ramping), the thrust that holds that speed, and the
+	// locomotion UpdateLocomotion gives it (a run past 3.58, a walk past 0.5).
+	e.VelX = dx * ratio / 0.1
 	e.VelZ = dz * ratio / 0.1
-
-	// PS2 0x40 auxiliary fields for headless client.
-	e.StickMagnitude = 254 // full deflection (no analog)
-	e.AccelState = 0x80    // steady (no ramping in headless)
-	e.SmoothedFacing = p.Facing // no lag (headless doesn't turn gradually)
+	speed := step / 0.1
+	e.ForceX, e.ForceZ = 0, 0
+	if speed > 0 {
+		accel := DriveAccel(speed) / speed
+		e.ForceX, e.ForceZ = e.VelX*accel, e.VelZ*accel
+	}
+	switch {
+	case speed > 3.0+(8.83333-3.0)*0.1:
+		e.AnimByte = 3
+	case speed > 0.5:
+		e.AnimByte = 1
+	default:
+		e.AnimByte = 0
+	}
 }
 
 // SendSay sends a local say chat message.

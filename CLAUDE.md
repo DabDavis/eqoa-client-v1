@@ -698,24 +698,39 @@ A message at or below the channel's rx is dropped and the channel re-acked with 
 - Run live on Sandstorm 2026-10-15: world entry, the fragmented MemoryDump, ~110 s in world, 0 retransmits/drops.
 - **Sandstorm refuses VPN addresses**: a real login from one gets auth opcode 0x43 and a close (reported as "auth read failed: unexpected EOF").
 
-### Position Updates (0x40 — 41 bytes)
+### The player's own state, channel 0x40 (41 bytes) — `internal/game/selfstate.go`
+CLIENT's writer `func_00BC2F30`, read off the disassembly: the walk camera's COMMITTED
+`VIWalkPhysics` (`VIClient+0x6F00`), each vector quantised by `WriteQuantized` over a
+static box (built by `func_00CC6558`; a box axis with no extent writes nothing, so roll
+never goes out). Every one of the 3,315 0x40s in the PS2 captures re-encodes byte for
+byte (`TestSelfStateReencodesEveryCapturedBuffer`).
 ```
-[0]     World ID
-[1-9]   Position: X,Y,Z as uint24 big-endian
-[10-15] Velocity: uint16 (0x8000 = idle)
-[16-21] Unknown uint16×3
-[22]    Facing (0-255)
-[23]    Turning (0x80 = center)
-[24-29] Various center values
-[30-34] Flags
-[35]    Animation: 0=idle, 1=walk, 2=run
-[36]    Skip byte
-[37-40] Target ObjectID (0xFFFFFFFF = no target)
+[0]      world (m_worldId)            [22-23] heading ±π, pitch ±1.6 (wrapped to [-π,π))
+[1-9]    position, 3 B/axis           [24-25] angular velocity ±6.4, ±0.8
+         (-4000,-1000,-4000)..        [26-27] torque ±31.2, ±3.9
+         (32000,1000,32000)           [28]    target heading ±π
+[10-15]  velocity, 2 B/axis           [29-30] position.y − floor, ±2000
+         ±15.3, -84.5..3, ±15.3       [31-34] VIWalkFlags u32 LE (0x501 standing on landscape)
+[16-21]  force, 2 B/axis              [35]    m_locoState (0 idle 1 walk 2 back 3 run 6 air 12/13 swim)
+         ±62.6, ±12.51, ±62.52        [36]    auto-attack   [37-40] target u32 LE, -1 none
 ```
+Quantising: `(v − lo)` clamped to the range, × 2^(8n), ÷ range, truncated, high byte first.
+add/sub/mul chop, but **the divide rounds to nearest**: with a chopping divide 23 captured
+position axes are unreachable from any float32. Velocity y 0 is `0xF739`.
 
-**Encoding**: `uint24((X+4000)/36000 * 0xFFFFFF)` for X/Z, `uint24((Y+1000)/2000 * 0xFFFFFF)` for Y.
+**Cadence** (`VIClient::Process`, 0x00BC7F40): written every +0x7578 ms (100 from the
+constructor; 0x07B2 sets it; no capture carries one), and the frame's flush with it — the
+captures' intervals are 100 and 133 ms. **A state equal to the last is not sent at all**
+(`connection_send_state`'s iSame): no capture has two equal 0x40s in a row, and a PS2
+standing still sends none, for 23 s in `ps2_sandstorm.pcap` while Sandstorm went on
+sending entities. A newer state replaces one still queued; an unacked one is retransmitted
+under its own sequence (`Connection.QueueClientUpdate`). Go still sends each one whole
+(refnum 0), not as the PS2's XOR delta.
 
-**World entry**: All 4 reliable opcodes + first 0x40 in ONE packet. Then idle heartbeat every 3 ticks (~3.3/s).
+**World entry / teleport**: the first 0x40 is `SetLocation`'s state (flags 0x101, still)
+in the same packet as the world entry's reliable messages. Emotes are NOT in byte 35;
+CLIENT's `PlayEmote` sends an opcode. `ForcePositionFlush` has no CLIENT counterpart: it
+only brings the next write forward.
 
 ### Entity state channels (0x00-0x17, 162 bytes) — `ChannelEntity` (0x00BD41B8)
 **24 slots, channel 0 an ordinary one**: the player's own entity is the one whose id is the
