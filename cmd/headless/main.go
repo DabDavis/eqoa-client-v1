@@ -280,6 +280,8 @@ func handleCommand(engine *game.Engine, line string) {
 		fmt.Println("  unmemorize <slot>        — Remove spell from hotbar slot (server)")
 		fmt.Println("  clearbar                 — Clear all spells from hotbar (server)")
 		fmt.Println("  shout <message> — Send shout message")
+		fmt.Println("  tell <name> <m> — Send a tell (\"/t name m\" as say)")
+		fmt.Println("  reply <message> — Reply to the last tell")
 		fmt.Println("  gsay <message>  — Send group chat message")
 		fmt.Println("  ginvite <name>  — Invite player to group (by name)")
 		fmt.Println("  gaccept         — Accept pending group invite")
@@ -290,6 +292,7 @@ func handleCommand(engine *game.Engine, line string) {
 		fmt.Println("  guildsay <msg>  — Send guild chat message")
 		fmt.Println("  guildcreate <n> — Create guild with name")
 		fmt.Println("  guildleave      — Leave current guild")
+		fmt.Println("  guilddisband    — Disband the guild")
 		fmt.Println("  guildmotd <msg> — Set guild MOTD")
 		fmt.Println("  guildinvite <n> — Invite player to guild")
 		fmt.Println("  guildkick <n>   — Kick member from guild")
@@ -1635,6 +1638,25 @@ func handleCommand(engine *game.Engine, line string) {
 			gs.SetHotbarSlot(i, nil)
 		}
 
+	case "tell":
+		if len(parts) < 3 {
+			fmt.Println("Usage: tell <name> <message>")
+			return
+		}
+		// the whole line as the say message, as the PS2 sends a /tell
+		line := "/t " + strings.Join(parts[1:], " ")
+		engine.SendChatCommand(line)
+		fmt.Printf("Sent: %s\n", line)
+
+	case "reply":
+		if len(parts) < 2 {
+			fmt.Println("Usage: reply <message>")
+			return
+		}
+		if !engine.SendReply(strings.Join(parts[1:], " ")) {
+			fmt.Println("No one to reply to.")
+		}
+
 	case "shout":
 		if len(parts) < 2 {
 			fmt.Println("Usage: shout <message>")
@@ -1680,8 +1702,8 @@ func handleCommand(engine *game.Engine, line string) {
 			fmt.Println("No pending group invite.")
 			return
 		}
+		fmt.Printf("Accepting group invite from %s (groupID=%d)\n", gs.GroupInviter, gs.GroupInviteID)
 		engine.SendAcceptGroupInvite(gs.GroupInviteID)
-		fmt.Printf("Accepted group invite from %s (groupID=%d)\n", gs.GroupInviter, gs.GroupInviteID)
 
 	case "gdecline":
 		gs := engine.State
@@ -1689,8 +1711,8 @@ func handleCommand(engine *game.Engine, line string) {
 			fmt.Println("No pending group invite.")
 			return
 		}
+		fmt.Printf("Declining group invite from %s\n", gs.GroupInviter)
 		engine.SendDeclineGroupInvite(gs.GroupInviteID)
-		fmt.Printf("Declined group invite from %s\n", gs.GroupInviter)
 
 	case "gleave":
 		engine.SendLeaveGroup()
@@ -1717,6 +1739,10 @@ func handleCommand(engine *game.Engine, line string) {
 	case "guildleave":
 		engine.SendGuildLeave()
 		fmt.Println("Left guild.")
+
+	case "guilddisband":
+		engine.SendGuildDisband()
+		fmt.Println("Disbanding guild.")
 
 	case "guildmotd":
 		if len(parts) < 2 {

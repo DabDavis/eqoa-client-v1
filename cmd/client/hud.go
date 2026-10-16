@@ -358,43 +358,16 @@ func (c *Client) handleChatInput() {
 				c.engine.SendGuildChat(body)
 			}
 		case "t", "tell":
-			// Format: /t name message
-			parts := strings.SplitN(body, " ", 2)
-			if len(parts) < 2 || parts[1] == "" {
-				gs := c.engine.State
-				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-					Text: "Usage: /t <name> <message>", Channel: game.ChatSystem,
-				})
-			} else {
-				// Tell not yet routed by server — echo locally
-				gs := c.engine.State
-				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-					Text:   fmt.Sprintf("You tell %s: %s", parts[0], parts[1]),
-					Channel: game.ChatTell,
-				})
-				log.Printf("Tell to %s: %s (server routing not yet implemented)", parts[0], parts[1])
-			}
+			// The whole line, slash and name included, goes out as the say
+			// message: the server reads the name out of it (func_00BCFE78).
+			c.engine.SendChatCommand(text)
 		case "r", "reply":
-			if name := c.engine.State.Session.ReplyName; name != "" {
-				c.lastTellSender = name // 0x07A3's, VIClient::GetReplyName
-			}
-			if c.lastTellSender == "" {
+			// "/t <the last teller> <text>" (0x07A3's name, GetReplyName)
+			if !c.engine.SendReply(body) {
 				gs := c.engine.State
 				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
 					Text: "No one to reply to.", Channel: game.ChatSystem,
 				})
-			} else if body == "" {
-				gs := c.engine.State
-				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-					Text: "Usage: /r <message>", Channel: game.ChatSystem,
-				})
-			} else {
-				gs := c.engine.State
-				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-					Text:   fmt.Sprintf("You tell %s: %s", c.lastTellSender, body),
-					Channel: game.ChatTell,
-				})
-				log.Printf("Reply to %s: %s (server routing not yet implemented)", c.lastTellSender, body)
 			}
 		case "time":
 			gh := c.engine.State.GameHour()
@@ -452,11 +425,11 @@ func (c *Client) handleChatInput() {
 				break
 			}
 			// An unknown /command. Sandstorm's S2 sends the whole line,
-			// slash and all, to the server as say chat (0x000B) — its
-			// server-side commands arrive that way. Retail prints string 826
-			// as `%S "%s".` and sends nothing.
+			// slash and all, to the server as say chat (0x000B) in no chat
+			// mode — its server-side commands arrive that way. Retail prints
+			// string 826 as `%S "%s".` and sends nothing.
 			if models.ActiveRules == models.RulesSandstorm {
-				c.engine.SendSay(text)
+				c.engine.SendChatCommand(text)
 			} else {
 				gs := c.engine.State
 				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
@@ -481,7 +454,8 @@ func (c *Client) handleChatInput() {
 		if ch == 0 {
 			break
 		}
-		if len(c.chatBuffer) < 200 {
+		// func_00BCFE78 sends no line of 128 UTF-16 units or more.
+		if utf16Len(c.chatBuffer+string(rune(ch))) < 128 {
 			c.chatBuffer += string(rune(ch))
 		}
 	}
@@ -503,18 +477,45 @@ func parseChatCommand(text string) (cmd, body string) {
 	return strings.ToLower(text[1:]), ""
 }
 
-// sendDefaultChat sends a message using the currently selected default chat mode.
+// sendDefaultChat sends typed text in the kept chat mode, as the PS2 does
+// for a line with no /command: no 0x000E, the mode the server already has.
 func (c *Client) sendDefaultChat(text string) {
-	switch c.chatDefaultMode {
-	case 1:
-		c.engine.SendShout(text)
-	case 2:
-		c.engine.SendGroupChat(text)
-	case 3:
-		c.engine.SendGuildChat(text)
-	default:
-		c.engine.SendSay(text)
+	c.engine.SendChat(text)
+}
+
+// The chat window's four modes (0 say, 1 shout, 2 group, 3 guild) are the
+// PS2's chat modes 0, 3, 2 and 4 (GroupChanged, words 595-599).
+var chatUIModes = [4]byte{game.ChatModeSay, game.ChatModeShout, game.ChatModeGroup, game.ChatModeGuild}
+
+// chatUIMode is the window's mode for the kept chat mode (whisper shows as say).
+func (c *Client) chatUIMode() int {
+	for i, m := range chatUIModes {
+		if m == c.engine.State.ChatMode {
+			return i
+		}
 	}
+	return 0
+}
+
+// setChatUIMode picks a window mode: GroupChanged, so the server and the
+// "Chat Mode:" line follow.
+func (c *Client) setChatUIMode(mode int) {
+	if mode < 0 || mode >= len(chatUIModes) {
+		mode = 0
+	}
+	c.engine.SetChatMode(chatUIModes[mode])
+}
+
+// utf16Len is strlen16 of s.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		n++
+		if r >= 0x10000 {
+			n++
+		}
+	}
+	return n
 }
 
 // playEmote starts an emote animation on the local player.
@@ -561,7 +562,7 @@ func chatModeColor(mode int) rl.Color {
 // drawChatModeButton draws a small chat mode indicator at the top-right of the chat panel
 // and handles the popup context menu for switching modes.
 func (c *Client) drawChatModeButton(chatX, chatY, chatW int32) {
-	label := chatModeName(c.chatDefaultMode)
+	label := chatModeName(c.chatUIMode())
 	labelW := c.measureText(label, 11)
 	btnW := labelW + 12
 	btnH := int32(16)
@@ -580,7 +581,7 @@ func (c *Client) drawChatModeButton(chatX, chatY, chatW int32) {
 	}
 	rl.DrawRectangle(btnX, btnY, btnW, btnH, bg)
 	rl.DrawRectangleLines(btnX, btnY, btnW, btnH, colorBtnBorder)
-	c.drawText(label, btnX+6, btnY+2, 11, chatModeColor(c.chatDefaultMode))
+	c.drawText(label, btnX+6, btnY+2, 11, chatModeColor(c.chatUIMode()))
 
 	if clicked && btnHover {
 		c.chatModePopup = !c.chatModePopup
@@ -609,13 +610,13 @@ func (c *Client) drawChatModeButton(chatX, chatY, chatW int32) {
 		}
 		name := chatModeName(mode)
 		clr := chatModeColor(mode)
-		if mode == c.chatDefaultMode {
+		if mode == c.chatUIMode() {
 			name = "> " + name
 		}
 		c.drawText(name, popX+6, ry+2, 12, clr)
 
 		if clicked && rowHover {
-			c.chatDefaultMode = mode
+			c.setChatUIMode(mode)
 			c.chatModePopup = false
 		}
 	}

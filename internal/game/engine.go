@@ -24,9 +24,8 @@ type Engine struct {
 	sessionToken []byte // 32-byte token from TCP auth
 	startupCh    chan startupResult // off-thread startup I/O → main goroutine (#4)
 	tickCount    int
-	whoToken       byte   // Who list request token (increments by 2)
+	whoToken       int32  // VIClientPart38334+0x04: one more per who request (Close)
 	TargetObjectID uint32 // Current target ObjectID (0x40 bytes 37-40, VIClient+0xC140; 0 = none)
-	chatMode       byte   // Current server-side chat mode (0=say, 3=group)
 
 	// Movement target (goto command)
 	moveTargetActive bool
@@ -825,223 +824,181 @@ func (e *Engine) updateMovement() {
 	}
 }
 
-// SendSay sends a local say chat message.
-// Wire format: int32(charCount) + UTF-16LE(text)
+// SendSay is "/say": 0x000E 0, the say message 0x000B (the line and the
+// target), and 0x000E back to the kept chat mode (func_00BCFE78).
 func (e *Engine) SendSay(text string) {
 	if e.State.Conn == nil {
 		return
 	}
-	// Ensure server chat mode is say (0)
-	if e.chatMode != 0 {
-		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{0})
-		e.chatMode = 0
-	}
-	runes := []rune(text)
-	data := make([]byte, 4+len(runes)*2)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
-		log.Printf("WARNING: Say send window full")
-	}
+	e.State.ChatSay(text, e.TargetObjectID)
 	log.Printf("Sent say chat: %s", text)
 }
 
-// SendShout sends a zone-wide shout chat message.
-// Wire format: byte(chatModeFlag) + int32(charCount) + UTF-16LE(text)
+// SendShout is "/shout": 0x000E 3, 0x0C01 {2, the line} (func_00CBBE10),
+// and 0x000E back.
 func (e *Engine) SendShout(text string) {
 	if e.State.Conn == nil {
 		return
 	}
-	runes := []rune(text)
-	data := make([]byte, 1+4+len(runes)*2)
-	data[0] = 1 // chat mode flag
-	binary.LittleEndian.PutUint32(data[1:5], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[5+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClientShout, data) {
-		log.Printf("WARNING: Shout send window full")
-	}
+	e.State.ChatShout(text)
 	log.Printf("Sent shout chat: %s", text)
 }
 
-// SendGroupChat sends a group chat message.
-// PS2 client sets chat mode persistently via ChangeChatMode, then sends text
-// through ClientSayChat. Server routes by active mode, not a separate opcode.
+// SendGroupChat is "/group": 0x000E 2, the say message 0x000B, and 0x000E
+// back. The server routes 0x000B by the mode, not by an opcode of its own.
 func (e *Engine) SendGroupChat(text string) {
 	if e.State.Conn == nil {
 		return
 	}
-	// Ensure server chat mode is group (2)
-	if e.chatMode != 2 {
-		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{2})
-		e.chatMode = 2
-	}
-
-	// Send text via normal say opcode (server routes by mode)
-	runes := []rune(text)
-	data := make([]byte, 4+len(runes)*2)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
-		log.Printf("WARNING: GroupChat send window full")
-	}
+	e.State.ChatGroup(text, e.TargetObjectID)
 	log.Printf("Sent group chat: %s", text)
 }
 
-// SendGuildChat sends a guild chat message.
-// Same pattern as group chat: set mode to 3 (guild), then send via ClientSayChat.
+// SendGuildChat is "/guild": 0x000E 4, the guild message 0x0578 {12, the
+// line} (func_00BEF1B0), and 0x000E back.
 func (e *Engine) SendGuildChat(text string) {
 	if e.State.Conn == nil {
 		return
 	}
-	if e.chatMode != 3 {
-		e.State.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{3})
-		e.chatMode = 3
-	}
-	runes := []rune(text)
-	data := make([]byte, 4+len(runes)*2)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeClientSayChat, data) {
-		log.Printf("WARNING: GuildChat send window full")
-	}
+	e.State.ChatGuild(text)
 	log.Printf("Sent guild chat: %s", text)
 }
 
-// SendGuildCreate sends guild creation request (opcode 0x0469).
-// PS2 wire: int32(nameLen) + ASCII(name)
+// SendChat is a typed line with no /command, in the kept chat mode: a shout
+// in mode 3, a guild message in 4, else the say message (no 0x000E).
+func (e *Engine) SendChat(text string) {
+	if e.State.Conn == nil {
+		return
+	}
+	e.State.ChatLine(text, e.TargetObjectID)
+	log.Printf("Sent chat (mode %d): %s", e.State.ChatMode, text)
+}
+
+// SendChatCommand sends a whole /command line as the say message, slash and
+// all: "/tell" and "/t" (the server reads the name out of it), and S2's
+// forwarded commands.
+func (e *Engine) SendChatCommand(line string) {
+	if e.State.Conn == nil {
+		return
+	}
+	e.State.ChatCommand(line, e.TargetObjectID)
+	log.Printf("Sent chat command: %s", line)
+}
+
+// SendReply is "/reply": "/t <the last teller> <text>" as the say message.
+// It reports false, and sends nothing, with nobody to reply to.
+func (e *Engine) SendReply(text string) bool {
+	if e.State.Conn == nil {
+		return false
+	}
+	return e.State.ChatReply(text, e.TargetObjectID)
+}
+
+// SetChatMode is the chat window's mode choice (GroupChanged in the world).
+func (e *Engine) SetChatMode(mode byte) {
+	if e.State.Conn == nil {
+		e.State.ChatMode = mode
+		return
+	}
+	e.State.SetChatMode(mode)
+}
+
+// SendGuildCreate is 0x0578 {1, the name} (func_00BEEC08).
 func (e *Engine) SendGuildCreate(name string) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4+len(name))
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
-	copy(data[4:], name)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildCreate, data) {
-		log.Printf("WARNING: GuildCreate send window full")
-	}
+	e.State.GuildCreate(name)
 	log.Printf("Sent GuildCreate: %s", name)
 }
 
-// SendGuildLeave sends leave guild request (opcode 0x046B). No payload.
+// SendGuildLeave is 0x0578 {3} (func_00BEED98, the "Leave the guild?" answer).
 func (e *Engine) SendGuildLeave() {
 	if e.State.Conn == nil {
 		return
 	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildLeave, nil) {
-		log.Printf("WARNING: GuildLeave send window full")
-	}
+	e.State.GuildLeave()
 	log.Printf("Sent GuildLeave")
 }
 
-// SendGuildSetMOTD sends guild MOTD update (opcode 0x046F).
-// PS2 wire: int32(motdLen) + UTF-16(motd)
+// SendGuildDisband is 0x0578 {2} (func_00BEECD8, "Disband the guild?").
+func (e *Engine) SendGuildDisband() {
+	if e.State.Conn == nil {
+		return
+	}
+	e.State.GuildDisband()
+	log.Printf("Sent GuildDisband")
+}
+
+// SendGuildSetMOTD sets the guild's charter, 0x0578 {11, the text}
+// (func_00BEF0E0): the text 0x0468/1 sends back after the guild's name.
 func (e *Engine) SendGuildSetMOTD(motd string) {
 	if e.State.Conn == nil {
 		return
 	}
-	runes := []rune(motd)
-	data := make([]byte, 4+len(runes)*2)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(runes)))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(data[4+i*2:], uint16(r))
-	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildSetMOTD, data) {
-		log.Printf("WARNING: GuildSetMOTD send window full")
-	}
+	e.State.GuildCharter(motd)
 	log.Printf("Sent GuildSetMOTD: %s", motd)
 }
 
-// SendGuildInvite sends guild invite (opcode 0x046A).
-// PS2 wire: int32(nameLen) + ASCII(name)
+// SendGuildInvite is 0x0578 {8, the name, the guild's name} (func_00BEF478);
+// inviting oneself shows word 679 instead.
 func (e *Engine) SendGuildInvite(name string) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4+len(name))
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
-	copy(data[4:], name)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildInvite, data) {
-		log.Printf("WARNING: GuildInvite send window full")
-	}
+	e.State.InviteToGuild(name)
 	log.Printf("Sent GuildInvite: %s", name)
 }
 
-// SendGuildKick sends guild kick (opcode 0x046C).
+// SendGuildKick removes a member, 0x0578 {6, the member's id} (func_00BEF008).
+// The PS2 picks the member out of the member list; a name not in it sends
+// nothing.
 func (e *Engine) SendGuildKick(name string) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4+len(name))
-	binary.LittleEndian.PutUint32(data[0:4], uint32(len(name)))
-	copy(data[4:], name)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGuildKick, data) {
-		log.Printf("WARNING: GuildKick send window full")
+	if e.State.GuildRemove(name) {
+		log.Printf("Sent GuildKick: %s", name)
 	}
-	log.Printf("Sent GuildKick: %s", name)
 }
 
-// SendGroupInvite sends a group invite to a target player (opcode 0x0625).
-// Wire format: uint32(targetObjectID) + uint32(nameLen) + ASCII(name)
+// SendGroupInvite is VIClient::InviteToGroup: its checks and texts, then
+// 0x0625 {id, name}, and the invitations waiting here declined.
 func (e *Engine) SendGroupInvite(targetObjectID uint32, targetName string) {
 	if e.State.Conn == nil {
 		return
 	}
-	nameBytes := []byte(targetName)
-	data := make([]byte, 8+len(nameBytes))
-	binary.LittleEndian.PutUint32(data[0:4], targetObjectID)
-	binary.LittleEndian.PutUint32(data[4:8], uint32(len(nameBytes)))
-	copy(data[8:], nameBytes)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeGroupInvite, data) {
-		log.Printf("WARNING: GroupInvite send window full")
+	if e.State.InviteToGroup(targetObjectID, targetName) {
+		log.Printf("Sent group invite: target=0x%08X name=%s", targetObjectID, targetName)
 	}
-	log.Printf("Sent group invite: target=0x%08X name=%s", targetObjectID, targetName)
 }
 
-// SendAcceptGroupInvite accepts a pending group invite (opcode 0x0622).
-// Wire format: uint32(groupID)
+// SendAcceptGroupInvite is VIClient::AcceptInvite: the oldest invitation
+// taken, 0x0622 {its id}, the rest declined. groupID is the id the menu
+// shows, which is the oldest invitation's.
 func (e *Engine) SendAcceptGroupInvite(groupID uint32) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data[0:4], groupID)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeAcceptGroupInvite, data) {
-		log.Printf("WARNING: AcceptGroupInvite send window full")
-	}
+	e.State.AcceptGroupInvite()
 	log.Printf("Sent accept group invite: groupID=%d", groupID)
 }
 
-// SendDeclineGroupInvite declines a pending group invite (opcode 0x0624).
-// Wire format: uint32(groupID)
+// SendDeclineGroupInvite is VIClient::DeclineInvite: 0x0624 {id, 1}.
 func (e *Engine) SendDeclineGroupInvite(groupID uint32) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data[0:4], groupID)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeDeclineGroupInvite, data) {
-		log.Printf("WARNING: DeclineGroupInvite send window full")
-	}
+	e.State.DeclineGroupInvite()
 	log.Printf("Sent decline group invite: groupID=%d", groupID)
 }
 
-// SendLeaveGroup leaves the current group (opcode 0x0623).
-// Wire format: (no payload)
+// SendLeaveGroup is VIClient::LeaveGroup: 0x0623, out of the group.
 func (e *Engine) SendLeaveGroup() {
 	if e.State.Conn == nil {
 		return
 	}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeLeaveGroup, nil) {
-		log.Printf("WARNING: LeaveGroup send window full")
-	}
+	e.State.LeaveGroup()
 	log.Printf("Sent leave group")
 }
 
@@ -1104,20 +1061,15 @@ func (e *Engine) SendMerchantDiag(objectID uint32) {
 	log.Printf("Sent MerchantDiag: objectID=%d", objectID)
 }
 
-// SendMerchantBuy sends opcode 0x004A — buy item from merchant.
-// PS2 wire format (verified via pcap): zigzag(merchantSlot) + zigzag(quantity) + uint32(npcObjectID)
-// The NPC ObjectID prevents cross-merchant item key spoofing.
+// SendMerchantBuy is VIClient::MerchantRequest (0x00BCCA38, byte-exact):
+// SendOpSigned2Int(0x004A, slot, quantity, the merchant), the merchant being
+// the id 0x00B7 opened the window with (VIClient+0x1B300), not the target.
 func (e *Engine) SendMerchantBuy(merchantSlot int, quantity int) {
 	if e.State.Conn == nil {
 		return
 	}
-	npcObjID := e.State.Player.Target // merchant we're interacting with
-	buf := make([]byte, 16)
-	w := buffer.NewWriter(buf)
-	w.Write7BitEncodedInt64(int64(merchantSlot))
-	w.Write7BitEncodedInt64(int64(quantity))
-	w.WriteUint32(npcObjID)
-	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantBuy, w.Bytes()) {
+	npcObjID := e.State.MerchantID
+	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantBuy, merchantBuyPayload(merchantSlot, quantity, npcObjID)) {
 		log.Printf("WARNING: MerchantBuy send window full")
 	}
 	log.Printf("Sent MerchantBuy: slot=%d qty=%d npc=0x%08X", merchantSlot, quantity, npcObjID)
@@ -1134,34 +1086,28 @@ func (e *Engine) SendMerchantBuyRaw(data []byte) {
 	log.Printf("Sent MerchantBuyRaw: %d bytes hex=%X", len(data), data)
 }
 
-// SendMerchantSell sends opcode 0x004B — sell item to merchant.
-// PS2 wire format (verified via pcap): uint32(invSlot) + zigzag(quantity)
-func (e *Engine) SendMerchantSell(invSlot int, quantity int) {
+// SendMerchantSell is VIClient::SellItem (0x00BCCA80, byte-exact):
+// SendOpIntSignedInt(0x004B, the item's KEY, quantity, the merchant). key is
+// the record's key (GetSlotId), not its place in the list.
+func (e *Engine) SendMerchantSell(key int, quantity int) {
 	if e.State.Conn == nil {
 		return
 	}
-	buf := make([]byte, 16)
-	w := buffer.NewWriter(buf)
-	w.WriteInt32(int32(invSlot))
-	w.Write7BitEncodedInt64(int64(quantity))
-	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantSell, w.Bytes()) {
+	if !e.State.Conn.QueueReliable(protocol.OpcodeMerchantSell, merchantSellPayload(key, quantity, e.State.MerchantID)) {
 		log.Printf("WARNING: MerchantSell send window full")
 	}
-	log.Printf("Sent MerchantSell: invSlot=%d qty=%d", invSlot, quantity)
+	log.Printf("Sent MerchantSell: key=%d qty=%d npc=0x%08X", key, quantity, e.State.MerchantID)
 }
 
-// SendInteractItem sends opcode 0x003E — interact with an inventory item.
-// PS2 wire format: invSlot(uint32 LE) + target(uint32 LE, 0xFFFFFFFF) + action(byte, 0x00)
-// The server determines equip/unequip/use based on item state.
+// SendInteractItem is VIClient::UseItem (0x00BCABA0, byte-exact):
+// SendOpIntIntByte(0x003E, the item's key, the target, 0). The target is
+// m_target, -1 with none: a PS2 using an item on a merchant sends the
+// merchant (ps2_main_capture). The server decides equip, unequip or use.
 func (e *Engine) SendInteractItem(invSlot int) {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 9)
-	binary.LittleEndian.PutUint32(data[0:4], uint32(invSlot))
-	binary.LittleEndian.PutUint32(data[4:8], 0xFFFFFFFF)
-	data[8] = 0x00
-	if !e.State.Conn.QueueReliable(protocol.OpcodeInteractItem, data) {
+	if !e.State.Conn.QueueReliable(protocol.OpcodeInteractItem, useItemPayload(uint32(invSlot), noTarget(e.TargetObjectID), 0)) {
 		log.Printf("WARNING: InteractItem send window full")
 	}
 	log.Printf("Sent InteractItem: invSlot=%d opcode=0x003E", invSlot)
@@ -1206,19 +1152,19 @@ func (e *Engine) SendBlacksmithOpen(npcData uint32) {
 	log.Printf("Sent BlackSmithMenu: data=0x%08X", npcData)
 }
 
-// SendRepairItem sends opcode 0x0062 — repair a specific item.
-// PS2 wire: invSlot(uint32 LE) + repairCost(uint32 LE).
-func (e *Engine) SendRepairItem(invSlot int, repairCost uint32) {
+// SendRepairItem is VIClient::Send0062 (0x00BCCC70, byte-exact):
+// SendOpIntInt(0x0062, the item's key, the blacksmith 0x0061 named).
+func (e *Engine) SendRepairItem(invSlot int, blacksmith uint32) {
 	if e.State.Conn == nil {
 		return
 	}
 	data := make([]byte, 8)
 	binary.LittleEndian.PutUint32(data[0:4], uint32(invSlot))
-	binary.LittleEndian.PutUint32(data[4:8], repairCost)
+	binary.LittleEndian.PutUint32(data[4:8], blacksmith)
 	if !e.State.Conn.QueueReliable(protocol.OpcodeRequestRepair, data) {
 		log.Printf("WARNING: RequestRepair send window full")
 	}
-	log.Printf("Sent RequestRepair: invSlot=%d cost=%d", invSlot, repairCost)
+	log.Printf("Sent RequestRepair: invSlot=%d blacksmith=0x%08X", invSlot, blacksmith)
 }
 
 // SendCloseBlacksmith sends opcode 0x0063 — close blacksmith window.
@@ -1233,14 +1179,23 @@ func (e *Engine) SendCloseBlacksmith() {
 	e.State.BlacksmithOpen = false
 }
 
-// SendPetCommand sends a PetCommands opcode (0x0041) with a 1-byte command.
-// PS2 sends byte 0x05 once before all other combat commands. Likely "engage combat"
-// or "pet attack" — the PS2 always sends it even without a pet.
+// SendPetCommand is VIClient::PetCommand (0x00BD7430): with no pet (0x007E's
+// id, HasPet), "You do not have a pet." (1021) and nothing sent; else 0x0041
+// and the command byte. The pet menu sends 0-4 and 7, and 8 with the target
+// after it (SendOpByteRaw, pet attack); 5 is only ever the "Dismiss pet?"
+// prompt's yes (Send0041), and no CLIENT path sends 6.
 func (e *Engine) SendPetCommand(cmd byte) {
 	if e.State.Conn == nil {
 		return
 	}
+	if e.State.PetID == 0xFFFFFFFF {
+		e.State.socialShowWord(1021)
+		return
+	}
 	data := []byte{cmd}
+	if cmd == 8 {
+		data = binary.LittleEndian.AppendUint32(data, noTarget(e.TargetObjectID))
+	}
 	if !e.State.Conn.QueueReliable(protocol.OpcodePetCommands, data) {
 		log.Printf("WARNING: PetCommand send window full")
 	}
@@ -1383,15 +1338,15 @@ func (e *Engine) SendClearSpellBar() {
 	log.Printf("Sent ClearSpellBar")
 }
 
-// SendWhoList sends a who list request (opcode 0x0E01).
-// Format: byte(1) + byte(token). Token is incremented per request.
+// SendWhoList is VIClientPart38334::Open (0x00C03038): Close (the token one
+// more), then 0x0E01 {1, the token, zigzag}. A raw byte stood in for the
+// zigzag and went bad at the 64th request, a one-byte varint that is not one.
 func (e *Engine) SendWhoList() {
 	if e.State.Conn == nil {
 		return
 	}
-	e.whoToken += 2
-	data := []byte{1, e.whoToken}
-	if !e.State.Conn.QueueReliable(protocol.OpcodeWhoList, data) {
+	e.whoToken++
+	if !e.State.Conn.QueueReliable(protocol.OpcodeWhoList, whoPayload(e.whoToken)) {
 		log.Printf("WARNING: WhoList send window full")
 	}
 	log.Printf("Sent WhoList request token=%d", e.whoToken)

@@ -556,6 +556,7 @@ type GameState struct {
 	// Faction standings (from opcode 0x07E2 FactionPage)
 	Factions       []FactionEntry // all received faction entries
 	FactionPageID  int            // session-specific counter for requests
+	factionWaiting bool           // a RequestFactions' pages still arriving
 	FactionLoaded  bool           // true after all pages received
 
 	// Combat Mastery tree (from opcode 0x1402 ClassMasteryServer)
@@ -1512,16 +1513,22 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 		return
 	}
 
-	// Send the same world-entry opcode batch the PS2 client sends (all in ONE packet):
-	// CharacterInWorld + ChangeChatMode + FactionMessages + LootMessages + first 0x40.
-	// PS2 pcap shows all five in the same packet at world entry (~10.48s).
-	// These likely trigger enteredGame() / EntityInRange initialization
-	// on Sandstorm. Without them, entity channels 1-28 never arrive.
-	gs.Conn.QueueReliable(protocol.OpcodeCharacterInWorld, nil)
-	gs.Conn.QueueReliable(protocol.OpcodeChangeChatMode, []byte{0x00})        // chat mode = 0 (Normal)
-	gs.Conn.QueueReliable(protocol.OpcodeFactionMessages, []byte{0x00, 0x00}) // uint16 count = 0
-	gs.Conn.QueueReliable(protocol.OpcodeLootMessages, []byte{0x00, 0x00})    // uint16 count = 0
-	log.Printf("Sent world entry batch: CharacterInWorld + ChangeChatMode + FactionMessages + LootMessages")
+	// Msg000D's world entry (0x00BD0AB0..0x00BD0B98, read off the
+	// disassembly), after every dump, a respawn's too (breath_capture):
+	// 0x0014 (a constant two bytes, connection_send), GroupChanged with the
+	// kept chat mode (0x000E, "Chat Mode: Say."), then SendOpByteByte 0x00C9
+	// and 0x00CA, each {an option on, 0}: game options +0x93 and +0x94, both
+	// off here as in every capture. Sent before the first 0x40, in one packet.
+	gs.sendWorldEntry()
+	log.Printf("Sent world entry batch: 0x0014, 0x000E %d, 0x00C9, 0x00CA", gs.ChatMode)
+}
+
+// sendWorldEntry is Msg000D's four messages, in its order.
+func (gs *GameState) sendWorldEntry() {
+	gs.socialSend(protocol.OpcodeCharacterInWorld, nil)
+	gs.GroupChanged(gs.ChatMode)
+	gs.socialSend(protocol.OpcodeFactionMessages, []byte{0x00, 0x00})
+	gs.socialSend(protocol.OpcodeLootMessages, []byte{0x00, 0x00})
 }
 
 // parseMemoryDumpRemainder parses everything after position in the MemoryDump.
@@ -2872,17 +2879,7 @@ func (gs *GameState) SelectCharacter(index int) {
 	ch := gs.Characters[index]
 	gs.SelectedChar = index
 
-	// PS2 SelectedChar format (20 bytes, verified from pcap + round-trip tests):
-	// serverID(int32) + faceOption(int32) + hairStyle(int32) + hairLength(int32) + hairColor(int32)
-	// Confirmed: color and style swap between fields 2 and 4.
-	data := make([]byte, 20)
-	binary.LittleEndian.PutUint32(data[0:4], ch.ServerID)
-	binary.LittleEndian.PutUint32(data[4:8], uint32(ch.FaceOption))
-	binary.LittleEndian.PutUint32(data[8:12], uint32(ch.HairStyle))
-	binary.LittleEndian.PutUint32(data[12:16], uint32(ch.HairLength))
-	binary.LittleEndian.PutUint32(data[16:20], uint32(ch.HairColor))
-
-	gs.Conn.QueueReliable(protocol.OpcodeSelectedChar, data)
+	gs.Conn.QueueReliable(protocol.OpcodeSelectedChar, selectCharPayload(ch))
 	gs.Conn.Flush()
 
 	gs.Phase = PhaseEnteringWorld
@@ -2890,6 +2887,19 @@ func (gs *GameState) SelectCharacter(index int) {
 	gs.Session.CharSelectMessage = ""
 	log.Printf("Selected character: %s (serverID=%d) hair(%d/%d/%d) face=%d",
 		ch.Name, ch.ServerID, ch.HairColor, ch.HairLength, ch.HairStyle, ch.FaceOption)
+}
+
+// selectCharPayload is VIClient::SelectCharacter's 0x002A (0x00BD8428,
+// byte-exact): five raw words, the server id, then face, hair style, hair
+// length and hair colour, in that order (ps2_sandstorm.pcap).
+func selectCharPayload(ch CharInfo) []byte {
+	data := make([]byte, 20)
+	binary.LittleEndian.PutUint32(data[0:4], ch.ServerID)
+	binary.LittleEndian.PutUint32(data[4:8], uint32(ch.FaceOption))
+	binary.LittleEndian.PutUint32(data[8:12], uint32(ch.HairStyle))
+	binary.LittleEndian.PutUint32(data[12:16], uint32(ch.HairLength))
+	binary.LittleEndian.PutUint32(data[16:20], uint32(ch.HairColor))
+	return data
 }
 
 // DeleteCharacter sends the character deletion message (opcode 0x002D).
@@ -2914,12 +2924,26 @@ func (gs *GameState) CreateCharacter(name string, race, class, gender, hairColor
 	// nameLen(int32 LE) + name(UTF-8) + level(zigzag=1) + race(zigzag) + class(zigzag) +
 	// gender(zigzag) + hairColor(zigzag) + hairLength(zigzag) + hairStyle(zigzag) +
 	// faceOption(zigzag) + humType(zigzag) + 7×stats(int32 LE, all 0)
+	data := newCharPayload(name, race, class, gender, hairColor, hairLength, hairStyle, faceOption, humType, stats)
+	gs.Conn.QueueReliable(protocol.OpcodeCreateCharacter, data)
+	gs.Conn.Flush()
+
+	log.Printf("CreateCharacter: sent name='%s' race=%d class=%d gender=%d humType=%d hair(%d/%d/%d) face=%d",
+		name, race, class, gender, humType, hairColor, hairLength, hairStyle, faceOption)
+}
+
+// newCharPayload is VIClient::SendNewChar's 0x002B (0x00BE6268,
+// byte-exact): the name (u32 length + bytes), nine zigzag fields -- +0x18
+// (1 in every capture), race, class, sex, hair colour, length and style,
+// face, +0x38 (the human region: 0 other, 1 east, 2 west) -- then the seven
+// stat words raw (local-warp.pcap's eight creations).
+func newCharPayload(name string, race, class, gender, hairColor, hairLength, hairStyle, faceOption, humType int, stats [7]int) []byte {
 	buf := make([]byte, 256)
 	w := buffer.NewWriter(buf)
 
 	w.WriteInt32(int32(len(name)))
 	w.WriteBytes([]byte(name))
-	w.Write7BitEncodedInt64(1)                // level = 1 (zigzag — matches char list 0x002C)
+	w.Write7BitEncodedInt64(1)                // +0x18 (1 in every capture)
 	w.Write7BitEncodedInt64(int64(race))       // race (zigzag)
 	w.Write7BitEncodedInt64(int64(class))      // class (zigzag)
 	w.Write7BitEncodedInt64(int64(gender))     // gender (zigzag)
@@ -2931,13 +2955,7 @@ func (gs *GameState) CreateCharacter(name string, race, class, gender, hairColor
 	for i := 0; i < 7; i++ {
 		w.WriteInt32(int32(stats[i])) // stats: STR, STA, AGI, DEX, WIS, INT, CHA
 	}
-
-	data := w.Bytes()
-	gs.Conn.QueueReliable(protocol.OpcodeCreateCharacter, data)
-	gs.Conn.Flush()
-
-	log.Printf("CreateCharacter: sent name='%s' race=%d class=%d gender=%d humType=%d hair(%d/%d/%d) face=%d",
-		name, race, class, gender, humType, hairColor, hairLength, hairStyle, faceOption)
+	return append([]byte(nil), w.Bytes()...)
 }
 
 // SendCharacterInWorld sends the "character in world" confirmation.
@@ -3300,9 +3318,9 @@ func (gs *GameState) resolveObjectName(objectID uint32) string {
 
 // handleCharacterDied is 0x005E (Msg005E, 0x00BDAEB8). It has no payload:
 // my character takes its death pose, the spells it cast stop, and the cast
-// window clears. Not ported: the "death" cue at 0.4, UI mode 0, auto-attack
-// off (m_autoAttack = 0), every pending group invite declined (op 1572,
-// reason 3), the camera reset. The XP-loss, death-text and chat fields this
+// window clears, and every waiting group invitation is declined (0x0624
+// {id, 3}). Not ported: the "death" cue at 0.4, UI mode 0, auto-attack off
+// (m_autoAttack = 0), the camera reset. The XP-loss, death-text and chat fields this
 // handler used to read are not on the wire.
 func (gs *GameState) handleCharacterDied(msg *protocol.Message) {
 	if !gs.Player.Dead {
@@ -3315,6 +3333,7 @@ func (gs *GameState) handleCharacterDied(msg *protocol.Message) {
 	gs.Player.Speed = 0
 	gs.CastStartTime = time.Time{} // m_p2BB40 = m_p2BB48 = 0
 	gs.CastDurationMs = 0
+	gs.declineInvites(3) // every waiting group invitation: 0x0624 {id, 3}
 	gs.addChatMessage("You have died!", ChatError) // Go's own line; CLIENT prints none
 	log.Printf("CharacterDied")
 }
@@ -4227,26 +4246,28 @@ type FactionEntry struct {
 	Standing int
 }
 
-// RequestFactions sends 34 ClientFaction (0x0AC4) requests, one per page.
-// Server responds with FactionPage (0x07E2) for each.
+// RequestFactions opens the faction pages the way the faction window does
+// (func_00C568B0): a new token (func_00BEA7C0: +0x08 one more, the list
+// emptied), then page 0. Each page that arrives asks for the next with the
+// same token (handleFactionPage), as the window's next-page command does, so
+// one page is asked for at a time. While they arrive it does nothing more: the
+// menu calls it every frame until the first page is in.
 func (gs *GameState) RequestFactions() {
-	if gs.Conn == nil {
+	if (gs.Conn == nil && gs.sendHook == nil) || gs.factionWaiting {
 		return
 	}
+	gs.factionWaiting = true
 	gs.Factions = nil
 	gs.FactionLoaded = false
+	gs.FactionPageID++
+	gs.requestFactionPage(0)
+	log.Printf("RequestFactions: token %d, page 0", gs.FactionPageID)
+}
 
-	for pageIdx := 0; pageIdx <= 66; pageIdx += 2 {
-		gs.FactionPageID++
-		data := make([]byte, 16)
-		w := buffer.NewWriter(data)
-		w.WriteByte(0x66) // request marker
-		w.Write7BitEncodedInt64(int64(gs.FactionPageID))
-		w.WriteByte(byte(pageIdx))
-		gs.Conn.QueueReliable(protocol.OpcodeClientFaction, data[:w.Position()])
-	}
-	gs.Conn.Flush()
-	log.Printf("RequestFactions: sent 34 page requests (pageID starts at %d)", gs.FactionPageID-33)
+// requestFactionPage is func_00BEA6B8: 0x0AC4 {0x66, the token, the page},
+// the last two zigzag.
+func (gs *GameState) requestFactionPage(page int32) {
+	gs.socialSend(protocol.OpcodeClientFaction, appendSigned(appendSigned([]byte{0x66}, int32(gs.FactionPageID)), page))
 }
 
 // ParsedCMData holds the stats/skills/CM (Combat Mastery) section from the
