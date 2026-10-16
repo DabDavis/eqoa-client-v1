@@ -197,23 +197,23 @@ func (c *Client) executeHotkeyAction(label, msg string) {
 		case "6":
 			c.engine.SendLeaveGroup()
 		case "14":
-			c.chatDefaultMode = 0
+			c.setChatUIMode(0)
 			log.Printf("HOTKEY: Chat mode → Say")
 		case "15":
-			c.chatDefaultMode = 2
+			c.setChatUIMode(2)
 			log.Printf("HOTKEY: Chat mode → Group")
 		case "16":
-			c.chatDefaultMode = 1
+			c.setChatUIMode(1)
 			log.Printf("HOTKEY: Chat mode → Shout")
 		case "17":
-			c.chatDefaultMode = 3
+			c.setChatUIMode(3)
 			log.Printf("HOTKEY: Chat mode → Guild")
 		case "21":
-			c.engine.SendSay("/assist leader")
+			c.engine.SendChatCommand("/assist leader")
 		case "22":
-			c.engine.SendSay("/assist")
+			c.engine.SendChatCommand("/assist")
 		case "23":
-			c.engine.SendSay("/roll")
+			c.engine.SendChatCommand("/roll")
 		case "24":
 			c.engine.SendPetCommand(0)
 		case "25":
@@ -262,18 +262,10 @@ func (c *Client) getTargetName() string {
 	return ""
 }
 
-// sendChatInCurrentMode sends a message using the current chat channel.
+// sendChatInCurrentMode sends a hotkey's text in the kept chat mode, as typed
+// text goes.
 func (c *Client) sendChatInCurrentMode(text string) {
-	switch c.chatDefaultMode {
-	case 0:
-		c.engine.SendSay(text)
-	case 1:
-		c.engine.SendShout(text)
-	case 2:
-		c.engine.SendGroupChat(text)
-	default:
-		c.engine.SendSay(text) // guild not yet implemented
-	}
+	c.engine.SendChat(text)
 }
 
 // drawHotkeyMenu renders the hotkey overlay when active or fading out.

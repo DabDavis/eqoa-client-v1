@@ -2786,15 +2786,12 @@ func (c *Client) drawMenuGroup(startY, contentH int32) {
 		y += 20
 		c.uiLabel(px, y, fmt.Sprintf("From: %s", gs.GroupInviter), 13, colorWhite)
 		rightX := px + listW
+		// The answer takes the invitation off the queue and shows the next.
 		if c.uiButtonStyled(rightX-120, y, 54, 18, "Accept", 12) {
 			c.engine.SendAcceptGroupInvite(gs.GroupInviteID)
-			gs.GroupInviteID = 0
-			gs.GroupInviter = ""
 		}
 		if c.uiButtonStyled(rightX-60, y, 54, 18, "Decline", 12) {
 			c.engine.SendDeclineGroupInvite(gs.GroupInviteID)
-			gs.GroupInviteID = 0
-			gs.GroupInviter = ""
 		}
 		y += lineH + 10
 	}
@@ -2874,12 +2871,8 @@ func (c *Client) sendGroupInviteByName(name string) {
 	nameLower := strings.ToLower(name)
 	for _, ent := range gs.Entities {
 		if ent.IsPlayer && strings.ToLower(ent.Name) == nameLower {
+			// InviteToGroup says so itself (word 637), or why not.
 			c.engine.SendGroupInvite(ent.ObjectID, ent.Name)
-			gs.ChatLog = append(gs.ChatLog, game.ChatMessage{
-				Text:    fmt.Sprintf("Invited %s to group.", ent.Name),
-				Channel: game.ChatSystem,
-				ColorR:  255, ColorG: 255, ColorB: 100,
-			})
 			return
 		}
 	}

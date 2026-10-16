@@ -219,11 +219,9 @@ type Client struct {
 	// Chat input state
 	chatTyping      bool   // true when text input mode is active
 	chatBuffer      string // current text being typed
-	chatDefaultMode int    // default chat channel: 0=say, 1=shout, 2=group, 3=guild
 	chatModePopup    bool   // true when chat mode picker is visible
 	chatScrollOffset int    // lines scrolled up from bottom (0 = latest)
 	chatDragging     bool   // true while dragging chat scrollbar
-	lastTellSender  string // name of last player who sent a tell (for /r)
 	followTarget    bool   // true when auto-following current target
 	wrapCache       map[wrapCacheKey][]string // cached wrapText results
 
