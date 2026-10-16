@@ -441,3 +441,82 @@ func listDir(t *testing.T, dir string) []string {
 	}
 	return names
 }
+
+// A real patch server, when EQOA_LIVE_PATCH names one (5.161.217.188 is
+// Sandstorm): into an empty folder, then again with nothing to do. Read-only
+// GETs, the ones any console makes.
+func TestLiveServer(t *testing.T) {
+	host := os.Getenv("EQOA_LIVE_PATCH")
+	if host == "" {
+		t.Skip("set EQOA_LIVE_PATCH to a patch server's address")
+	}
+	dir := t.TempDir()
+	for pass := 1; pass <= 2; pass++ {
+		st := NewStatus()
+		Run(Config{Host: host, Dir: dir}, st)
+		snap := st.Snapshot()
+		t.Logf("pass %d: state %d, changed %v, err %q, notes %d bytes", pass, snap.State, snap.Changed, snap.Err, len(snap.Notes))
+		if snap.State != StateDone {
+			t.Fatalf("pass %d failed: %s", pass, snap.Err)
+		}
+		if pass == 2 && snap.Changed {
+			t.Fatal("the second pass changed files")
+		}
+	}
+	for _, name := range listDir(t, dir) {
+		data, _ := os.ReadFile(filepath.Join(dir, name))
+		t.Logf("%-14s %6d bytes  CRC %d", name, len(data), crc32.ChecksumIEEE(data))
+	}
+}
+
+// Check judges the folder as a patch would and changes nothing: everything to
+// fetch into an empty folder, nothing once a patch has run, the one file that
+// changed after that, and a Delete only when it would find its file.
+func TestCheckIsThePatchersDecision(t *testing.T) {
+	s := serve(t, true, sandstormLike, "notes")
+	dir := t.TempDir()
+	cfg := Config{Host: s.host, Port: s.port, Dir: dir}
+	plan, err := Check(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Fetch) != 5 || len(plan.Delete) != 0 || plan.Empty() {
+		t.Fatalf("empty folder: %+v", plan)
+	}
+	if HasModule(dir) {
+		t.Fatal("a check wrote something")
+	}
+	os.WriteFile(filepath.Join(dir, "words.txt"), []byte("old"), 0o644)
+	if plan, _ = Check(cfg); len(plan.Delete) != 1 || plan.Delete[0] != "words.txt" {
+		t.Fatalf("a Delete with its file: %+v", plan)
+	}
+
+	cfg.Record = filepath.Join(filepath.Dir(dir), "patch.json")
+	if snap := run(t, s, dir); snap.State != StateDone {
+		t.Fatal(snap.Err)
+	}
+	st := NewStatus()
+	Run(cfg, st) // nothing to do, but it writes the record
+	if plan, err = Check(cfg); err != nil || !plan.Empty() {
+		t.Fatalf("after a patch: %+v %v", plan, err)
+	}
+	if !HasModule(dir) {
+		t.Fatal("no module after a patch")
+	}
+	rec := ReadRecord(cfg.Record)
+	if rec == nil || rec.Server != s.host || len(rec.Files) != 5 {
+		t.Fatalf("record %+v", rec)
+	}
+
+	os.WriteFile(filepath.Join(dir, "S2"), bytes.Repeat([]byte("x"), len(sandstormLike[2].data)), 0o644)
+	if plan, _ = Check(cfg); len(plan.Fetch) != 1 || plan.Fetch[0] != "S2" {
+		t.Fatalf("one changed file: %+v", plan)
+	}
+
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	cfg.Port = l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	if _, err := Check(cfg); err == nil {
+		t.Fatal("an unreachable server checked out")
+	}
+}

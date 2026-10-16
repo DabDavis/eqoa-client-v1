@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,6 +20,14 @@ import (
 // internal/patcher, ported from the decomp, run in the background while
 // this screen is VIWndPatcher (decomp/modules/setup/src/viwndpatcher.cpp)
 // over the title painting.
+//
+// Where the PS2 has one card folder, and so patches it over to play on
+// another server, this client keeps a patch module per server
+// (saves/<server>/) and loads it on demand: a check made in the background
+// at launch (patcher.Check, the patcher's own decision with nothing written)
+// lets a module that is already current load with no patch at all, and one
+// whose server cannot be reached load as it was saved. The patch window runs
+// only when there is something to fetch or delete, or no module yet.
 
 // patchOutcome is how the patch screen ends: RunPatcher's 3 (the game goes
 // on) or 4 (back to the title; a failed patch's "Restart" restarts the
@@ -45,42 +54,114 @@ type patchScreen struct {
 	done       bool
 }
 
-// runPatchScreen runs the patcher against the configured server's save
-// folder, shows its window until the player moves on, and returns how it
-// ended. A finished patch is applied (the rules, the art, the words) before
-// it returns.
-func (c *Client) runPatchScreen() patchOutcome {
-	dir := saveDir(c.serverIP)
-	ps := &patchScreen{status: patcher.NewStatus()}
-	cfg := patcher.Config{
+// patchCheck is the background check's answer.
+type patchCheck struct {
+	plan *patcher.Plan
+	err  error
+}
+
+// patchConfig is the patcher's view of the configured server's module.
+func (c *Client) patchConfig() patcher.Config {
+	return patcher.Config{
 		Host:      c.serverIP,
 		Port:      sandstormPatchPort,
 		Manifest:  c.psvrPath(),
-		Dir:       dir,
+		Dir:       saveDir(c.serverIP),
 		FrameTime: time.Second / 30, // a MainLoop: two vsyncs
+		Record:    moduleRecord(c.serverIP),
 	}
+}
+
+// startPatchCheck checks the configured server's module in the background,
+// once per Play: the title is up meanwhile.
+func (c *Client) startPatchCheck() {
+	if c.patchCheckCh != nil {
+		return
+	}
+	cfg := c.patchConfig()
+	ch := make(chan patchCheck, 1)
+	c.patchCheckCh = ch
+	go func() {
+		plan, err := patcher.Check(cfg)
+		ch <- patchCheck{plan, err}
+	}()
+}
+
+// runPatchScreen loads the configured server's patch module, patching it
+// first when it needs it, and returns how it ended. A loaded module is
+// applied (the rules, the art, the words) before it returns.
+func (c *Client) runPatchScreen() patchOutcome {
+	cfg := c.patchConfig()
+	ps := &patchScreen{status: patcher.NewStatus()}
+	c.startPatchCheck()
+	var res patchCheck
+	for waiting := true; waiting; {
+		select {
+		case res = <-c.patchCheckCh:
+			c.patchCheckCh = nil
+			waiting = false
+			continue
+		default:
+		}
+		if rl.WindowShouldClose() {
+			return patchQuit
+		}
+		c.patchFrame(ps, &patcher.Snapshot{State: patcher.StateConnecting})
+	}
+	c.patchNotice = ""
+	switch {
+	case res.err == nil && res.plan.Empty():
+		log.Printf("patch: %s's module is current: loaded, nothing to patch", cfg.Host)
+		c.applyPatch(cfg.Dir)
+		return patchPlay
+	case res.err != nil && patcher.HasModule(cfg.Dir):
+		log.Printf("patch: %s: %v; loading its saved module", cfg.Host, res.err)
+		c.patchNotice = "The patch server did not answer: playing with the saved patch."
+		c.applyPatch(cfg.Dir)
+		return patchPlay
+	case res.err == nil:
+		log.Printf("patch: %s: fetch %v, delete %v", cfg.Host, res.plan.Fetch, res.plan.Delete)
+	}
+
 	go patcher.Run(cfg, ps.status)
 	for !rl.WindowShouldClose() && !ps.done {
-		c.reportBeginFrame()
-		if !c.reportOpen() {
-			ps.input()
-		}
-		c.audioSys.UpdateBGM()
-		c.audioSys.UpdateAmbient()
-		rl.BeginDrawing()
-		rl.ClearBackground(rl.Black)
-		if c.titleScr != nil && c.titleScr.loaded {
-			c.titleScr.drawTitleScene(c, false)
-		}
-		ps.draw(c)
-		c.checkScreenshot()
-		c.reportFrame()
-		rl.EndDrawing()
+		c.patchFrame(ps, nil)
 	}
 	if ps.outcome == patchPlay {
-		c.applyPatch(dir)
+		c.applyPatch(cfg.Dir)
 	}
 	return ps.outcome
+}
+
+// patchFrame is one frame of the patch window: the player's keys, then the
+// title painting and the window over it. over replaces the patcher's state
+// while there is none yet.
+func (c *Client) patchFrame(ps *patchScreen, over *patcher.Snapshot) {
+	c.reportBeginFrame()
+	if over == nil && !c.reportOpen() {
+		ps.input()
+	}
+	c.audioSys.UpdateBGM()
+	c.audioSys.UpdateAmbient()
+	rl.BeginDrawing()
+	rl.ClearBackground(rl.Black)
+	if c.titleScr != nil && c.titleScr.loaded {
+		c.titleScr.drawTitleScene(c, false)
+	}
+	snap := ps.status.Snapshot()
+	if over != nil {
+		snap = *over
+	}
+	ps.draw(c, snap)
+	c.checkScreenshot()
+	c.reportFrame()
+	rl.EndDrawing()
+}
+
+// moduleRecord is where a server's module keeps its record: beside its card
+// folder, in saves/<server>/.
+func moduleRecord(server string) string {
+	return filepath.Join(filepath.Dir(saveDir(server)), "patch.json")
 }
 
 // psvrPath is data\psvrpath.dat off the disc, the path of the manifest on
@@ -186,7 +267,7 @@ func (ps *patchScreen) finish(o patchOutcome) {
 // here in pixels about the middle of the screen, as the login is.
 const (
 	patchWinW  = int32(430)
-	patchRowH  = int32(24)
+	patchRowH  = int32(22)
 	patchRows  = int32(9)
 	patchTextX = int32(40)
 	patchFont  = int32(16)
@@ -194,8 +275,7 @@ const (
 
 // draw is VIWndPatcher::OnDrawSelf (0x00578F98), and the two windows it
 // opens over itself.
-func (ps *patchScreen) draw(c *Client) {
-	snap := ps.status.Snapshot()
+func (ps *patchScreen) draw(c *Client, snap patcher.Snapshot) {
 	c.drawFakeSplashInterface()
 	if snap.State == patcher.StateCancelled {
 		return // phase -1 draws the title bar alone
@@ -213,7 +293,7 @@ func (ps *patchScreen) draw(c *Client) {
 
 	x := (screenWidth - patchWinW) / 2
 	h := patchRows*patchRowH + 16
-	y := (screenHeight-h)/2 - 20
+	y := patchWindowY(h)
 	c.patchWindow(x, y, patchWinW, h, c.word(811, "Update"))
 	row := func(r int32) int32 { return y + 8 + r*patchRowH }
 
@@ -284,7 +364,7 @@ func (ps *patchScreen) drawNotes(c *Client, notes string) {
 	maxTop := max(0, len(lines)-visible)
 	ps.notesTop = min(ps.notesTop, maxTop)
 	w, h := int32(440), int32(10)*patchRowH+16
-	x, y := (screenWidth-w)/2, (screenHeight-h)/2-20
+	x, y := (screenWidth-w)/2, patchWindowY(h)
 	c.patchWindow(x, y, w, h, c.word(789, "Update Messages"))
 	for i := 0; i < visible && ps.notesTop+i < len(lines); i++ {
 		c.drawText(lines[ps.notesTop+i], x+40, y+8+int32(1+i)*patchRowH, patchFont, rl.White)
@@ -338,10 +418,17 @@ func (c *Client) word(id int, fallback string) string {
 	return fallback
 }
 
-// patchWindow is a VIUIWindow with a title: the panel frame, the title on
-// its top edge.
+// patchWindowY puts a window of height h where the PS2 centres its patch
+// windows: (320, 246) on its 640×448, a little below the middle, clear of the
+// title's logo.
+func patchWindowY(h int32) int32 {
+	return screenHeight*246/448 - h/2
+}
+
+// patchWindow is a VIUIWindow with a title on its top edge, framed as the
+// client's own menus are.
 func (c *Client) patchWindow(x, y, w, h int32, title string) {
-	c.drawPanelTextured(x, y, w, h, ui.FramePanel, ui.FillPanel)
+	c.drawPanelTextured(x, y, w, h, ui.FrameLine, ui.FillBlack)
 	tw := c.measureText(title, patchFont)
 	rl.DrawRectangle(x+(w-tw)/2-8, y-10, tw+16, 22, rl.Color{R: 20, G: 20, B: 32, A: 230})
 	c.drawText(title, x+(w-tw)/2, y-7, patchFont, colorGoldWarm)
@@ -352,7 +439,7 @@ func (c *Client) patchWindow(x, y, w, h int32, title string) {
 func (c *Client) patchMessageBox(title, text string, choices []string, sel int, width int32) {
 	lines := c.wrapText(text, patchFont, width-80)
 	h := int32(len(lines)+3)*patchRowH + 16
-	x, y := (screenWidth-width)/2, (screenHeight-h)/2-20
+	x, y := (screenWidth-width)/2, patchWindowY(h)
 	c.patchWindow(x, y, width, h, title)
 	for i, line := range lines {
 		c.drawTextInRect(line, x+40, y+8+int32(1+i)*patchRowH, width-80, patchFont, rl.White)

@@ -394,6 +394,8 @@ func (c *Client) drawLoginScreen() {
 	// Status message (errors only -- hint removed since we have a button now)
 	if c.loginError != "" {
 		c.drawCenteredText(c.loginError, loginBtnY()+loginBtnH+10, 14, rl.Color{R: 220, G: 60, B: 60, A: 255})
+	} else if c.patchNotice != "" {
+		c.drawCenteredText(c.patchNotice, loginBtnY()+loginBtnH+10, 14, colorDim)
 	}
 
 	// Mute button (top-left)

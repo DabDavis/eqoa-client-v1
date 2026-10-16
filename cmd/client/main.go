@@ -304,7 +304,9 @@ type Client struct {
 	zoneParticlesSpawned bool // true after zone ParticleSprites have been spawned
 	saveArtFor           string // the save folder whose art the model manager holds
 	rulesSetting         string // client.json "rules": "retail", "sandstorm", or "" for the save folder's patch
-	patched              bool   // the patch screen has run this launch
+	patched              bool   // the server's patch module is loaded this launch
+	patchCheckCh         chan patchCheck // the module's background check (patchscreen.go)
+	patchNotice          string          // why the module loaded without a patch, for the login screen
 	words                game.Words   // the string table: the save folder's WORDS.TXT, else the disc's
 	playerSearch         playerSearch // Sandstorm's player search window (playersearch.go)
 
@@ -635,6 +637,10 @@ func runClient() {
 	}
 	if rl.WindowShouldClose() {
 		return
+	}
+	// The server's patch module, checked while the title is up (patchscreen.go).
+	if client.offline == nil {
+		client.startPatchCheck()
 	}
 
 	// Outer loop: login -> game -> back to login on disconnect/escape

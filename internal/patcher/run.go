@@ -43,6 +43,18 @@ type Config struct {
 	// between the steps (20, 10, 32, ...) so each status can be read. The
 	// PS2's frame is two vsyncs; 0 runs straight through.
 	FrameTime time.Duration
+	// Record, when set, is where a finished patch writes the module's record
+	// (check.go): beside the card folder, never in it.
+	Record string
+}
+
+func (c *Config) defaults() {
+	if c.Port == 0 {
+		c.Port = DefaultPort
+	}
+	if c.Manifest == "" {
+		c.Manifest = DefaultManifest
+	}
 }
 
 // Status is the patch window's state, written by Run and read by the screen
@@ -93,6 +105,7 @@ type setup struct {
 	st           *Status
 	cfg          Config
 	initializing bool    // m_x218B0: the manifest is being read; OnFile leaves the state alone
+	lastError    string  // the last OnError's text, for Check
 	readDone     float32 // m_progress: how much of the card was read
 	writeDone    float32 // m_x218AC: how much of it was written back
 }
@@ -131,6 +144,7 @@ func (s *setup) OnTick(n int) int {
 // OnError (0x00569660) only prints: "ERROR CODE %d / '%s'".
 func (s *setup) OnError(code int, text string) int {
 	log.Printf("patcher: ERROR CODE %d / %q", code, text)
+	s.lastError = text
 	return 1
 }
 
@@ -153,12 +167,7 @@ func (s *setup) OnStatusInfo(text string) int { return 1 }
 // It always ends in StateDone or StateFailed, with Status.Done set. On a
 // failure nothing is written: the save folder is as it was.
 func Run(cfg Config, st *Status) {
-	if cfg.Port == 0 {
-		cfg.Port = DefaultPort
-	}
-	if cfg.Manifest == "" {
-		cfg.Manifest = DefaultManifest
-	}
+	cfg.defaults()
 	s := &setup{st: st, cfg: cfg}
 	fail := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
@@ -218,7 +227,12 @@ func Run(cfg Config, st *Status) {
 		fail("writing the save folder: %v", err)
 		return
 	}
-	log.Printf("patcher: %s, version %d: done (%s)", p.ProductName(), p.Version(), changedWord(changed))
+	if cfg.Record != "" {
+		if err := writeRecord(cfg, p.ProductName(), images); err != nil {
+			log.Printf("patcher: the module's record: %v", err)
+		}
+	}
+	log.Printf("patcher: %s version %d: done (%s)", cfg.Host, p.Version(), changedWord(changed))
 	st.mu.Lock()
 	st.progress = 1
 	st.state = StateDone

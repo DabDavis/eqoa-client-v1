@@ -25,6 +25,7 @@ import (
 
 	"github.com/eqoa/client/internal/game"
 	"github.com/eqoa/client/internal/models"
+	"github.com/eqoa/client/internal/patcher"
 )
 
 // Report a Problem: the F3 key, the same thing Dab's Mod has.
@@ -877,6 +878,14 @@ func (c *Client) reportDump(now time.Time) string {
 	}
 	f("server: %s", c.serverIP)
 	f("rules: %s", models.ActiveRules)
+	if rec := patcher.ReadRecord(moduleRecord(c.serverIP)); rec != nil {
+		f("patch module: %d files, patched %s", len(rec.Files), rec.Patched.Format(time.RFC3339))
+	} else {
+		f("patch module: none recorded")
+	}
+	if c.patchNotice != "" {
+		f("patch: %s", c.patchNotice)
+	}
 	var gs *game.GameState
 	if c.engine != nil {
 		gs = c.engine.State
