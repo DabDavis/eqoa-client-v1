@@ -407,6 +407,16 @@ func (c *Client) drawCharacterSelect() {
 
 	// Delete button now drawn on model viewport (above)
 
+	// CharSelectMsg's word (0x07F0..0x07F4: an unavailable area, a missing
+	// Frontiers disc), which the PS2 shows in its login window. Selecting a
+	// character clears it.
+	if text := gs.Session.CharSelectMessage; text != "" {
+		bx, by := csModelPanelX+8, panelY+40
+		bw := screenWidth - csModelPanelX - 15 - 16
+		rl.DrawRectangle(bx, by, bw, 112, colorDarkPanel)
+		c.drawWrappedText(text, bx+8, by+8, bw-16, 12, rl.Color{R: 255, G: 220, B: 140, A: 255})
+	}
+
 	// Delete confirmation dialog
 	if c.deleteConfirmActive && c.charSelectIdx >= 0 && c.charSelectIdx < len(gs.Characters) {
 		c.drawDeleteConfirm(gs.Characters[c.charSelectIdx].Name)

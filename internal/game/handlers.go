@@ -5,14 +5,10 @@ package game
 // Covers entity lifecycle, quest system, world entry/zone transfer, NPC
 // interaction, item streaming, chat, guild, and social.
 //
-// PS2 Disconnect Error Codes (from debug printf strings in CLIENT data section):
-//   Disconnect-5:  Malformed entity/group data (opcodes 0x0012, 0x07A2)
-//   Disconnect-6:  Bad stats update (opcode 0x0790)
-//   Disconnect-7:  Invalid admin/world data (opcode 0x0700)
-//   Disconnect-8:  Buddy list corruption (opcode 0x0771)
-//   Disconnect-9:  Auction system error (opcode 0x07E2)
-//   Disconnect-12: Combat state corruption (opcode 0x0777)
-//   Disconnect-??: Unknown/catch-all
+// The "Disconnect-N" printfs in CLIENT are the server-ordered disconnects
+// (intake_session.go, disconnectReasons): -5 0x0729, -6 0x072B, -7 0x0728,
+// -8 0x072A, -9 0x00EC/0x07A4, -11 a DRDP 0xFD, -12 0x0777, -?? a 0x0000
+// version other than 18. None of them is a malformed-data report.
 
 import (
 	"encoding/binary"
@@ -24,24 +20,6 @@ import (
 	"github.com/eqoa/client/internal/protocol"
 	"github.com/DabDavis/eqoa-esf-tools/pkg/buffer"
 )
-
-// PS2 disconnect error codes from CLIENT debug strings.
-// Logged when opcode handlers receive malformed data.
-var ps2DisconnectCodes = map[uint16]int{
-	0x0012: 5,  // GroupInvite
-	0x0700: 7,  // AdminCode
-	0x0771: 8,  // BuddyListStuff
-	0x0777: 12, // CombatEnd
-	0x0790: 6,  // StatsUpdate
-	0x07A2: 5,  // EntityStringUpdate
-	0x07E2: 9,  // Auction
-}
-
-func logPS2DisconnectCode(opcode uint16) {
-	if code, ok := ps2DisconnectCodes[opcode]; ok {
-		log.Printf("WARNING: malformed data for opcode 0x%04X (PS2 Disconnect-%d)", opcode, code)
-	}
-}
 
 // =============================================================================
 // The ability messages (0x00B3/B5/B8/FD/FF) and 0x00FC
@@ -89,127 +67,40 @@ func (gs *GameState) handleFullEntityRefresh(msg *protocol.Message) {
 }
 
 // =============================================================================
-// Entity Update Cascade (0x07F4/F0/F1/A1/A2/C0)
+// Character-select messages and disconnects (0x07F0..0x07F4, 0x07A1/A2, 0x07C0)
 // =============================================================================
+//
+// The old "entity update cascade" reading of these was Ghidra's fall-through
+// misread (claude-notes/decomp-phase62-dispatcher-survey-20261015.md §2): none
+// carries an entity. 0x07F0..0x07F4 are VIClient::CharSelectMsg, and 0x07A1,
+// 0x07A2 and 0x07C0 are Disconnect(13), (14) and (17).
 
-// handleEntityUpdateFullUI handles opcode 0x07F4 — enables HUD+map panels, then entity update.
+// handleEntityUpdateFullUI is 0x07F4 (and 0x07F2): CharSelectMsg(1662), the
+// "you are not using a Frontiers disc" message.
 func (gs *GameState) handleEntityUpdateFullUI(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	log.Printf("EntityUpdateFullUI: enabling HUD+map panels, dataLen=%d", len(data))
-	reader := buffer.NewReader(data[2:])
-	gs.parseEntityUpdateCascade(reader, "EntityUpdateFullUI")
+	gs.handleCharSelectMsg(msg)
 }
 
-// handleEntityUpdateMapPanel handles opcode 0x07F0/0x07F1 — enables map panel, then entity update.
+// handleEntityUpdateMapPanel is 0x07F0 and 0x07F1 (and 0x07F3):
+// CharSelectMsg(676), the "character is in an area that is unavailable" one.
 func (gs *GameState) handleEntityUpdateMapPanel(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	log.Printf("EntityUpdateMapPanel: enabling map panel, dataLen=%d", len(data))
-	reader := buffer.NewReader(data[2:])
-	// PS2: reads 8-byte timestamp, stops audio, then shared body
-	gs.parseEntityUpdateCascade(reader, "EntityUpdateMapPanel")
+	gs.handleCharSelectMsg(msg)
 }
 
-// handleEntityUpdateAudio handles opcode 0x07A1 — stops audio, then entity update.
+// handleEntityUpdateAudio is 0x07A1, VIClient::Msg07A1: eight bytes read and
+// dropped, then Disconnect(13, 0).
 func (gs *GameState) handleEntityUpdateAudio(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	reader := buffer.NewReader(data[2:])
-	// PS2: reads 8-byte timestamp
-	if reader.Remaining() >= 8 {
-		ts, _ := reader.ReadBytes(8)
-		log.Printf("EntityUpdateAudio: timestamp=%X, stopping audio", ts)
-	}
-	gs.parseEntityUpdateCascade(reader, "EntityUpdateAudio")
+	gs.handleServerDisconnect(msg)
 }
 
-// handleEntityUpdateMinimal handles opcode 0x07A2 — minimal cleanup, then entity update.
+// handleEntityUpdateMinimal is 0x07A2, VIClient::Msg07A2: Disconnect(14, 0).
 func (gs *GameState) handleEntityUpdateMinimal(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	log.Printf("EntityUpdateMinimal: minimal cleanup, dataLen=%d", len(data))
-	reader := buffer.NewReader(data[2:])
-	gs.parseEntityUpdateCascade(reader, "EntityUpdateMinimal")
+	gs.handleServerDisconnect(msg)
 }
 
-// handleEntityUpdateDirect handles opcode 0x07C0 — no prefix, straight entity update.
+// handleEntityUpdateDirect is 0x07C0: Disconnect(17, 0).
 func (gs *GameState) handleEntityUpdateDirect(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	reader := buffer.NewReader(data[2:])
-	gs.parseEntityUpdateCascade(reader, "EntityUpdateDirect")
-}
-
-// parseEntityUpdateCascade is the shared body for entity update cascade opcodes.
-// PS2: reads zigzag entity ID, raw byte flag, zigzag zone delta, zigzag value,
-// name(24), final 4-byte → state 19.
-func (gs *GameState) parseEntityUpdateCascade(reader *buffer.Reader, source string) {
-	if reader.Remaining() < 2 {
-		return
-	}
-
-	// Read entity ID (zigzag)
-	entityID, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		log.Printf("%s: failed to read entity ID: %v", source, err)
-		return
-	}
-
-	// Read flag byte
-	flag := byte(0)
-	if reader.Remaining() >= 1 {
-		flag, _ = reader.ReadByte()
-	}
-
-	// Read zone delta (zigzag)
-	zoneDelta := int64(0)
-	if reader.Remaining() >= 1 {
-		zoneDelta, _ = reader.Read7BitEncodedInt64()
-	}
-
-	// Read value (zigzag)
-	value := int64(0)
-	if reader.Remaining() >= 1 {
-		value, _ = reader.Read7BitEncodedInt64()
-	}
-
-	// Read name (24-byte fixed)
-	name := ""
-	if reader.Remaining() >= 24 {
-		nameBytes, err := reader.ReadBytes(24)
-		if err == nil {
-			for i, b := range nameBytes {
-				if b == 0 {
-					name = string(nameBytes[:i])
-					break
-				}
-			}
-		}
-	}
-
-	log.Printf("%s: entityID=%d flag=%d zoneDelta=%d value=%d name=%q remaining=%d",
-		source, entityID, flag, zoneDelta, value, name, reader.Remaining())
-
-	// Update entity if it exists
-	objID := uint32(entityID)
-	if objID != 0 {
-		ent, exists := gs.Entities[objID]
-		if exists && name != "" {
-			ent.Name = name
-			ent.LastUpdate = time.Now()
-		}
-	}
+	gs.handleServerDisconnect(msg)
 }
 
 // =============================================================================
@@ -438,57 +329,30 @@ func (gs *GameState) parseQuestTail(reader *buffer.Reader, source string) {
 // World Entry / Zone Transfer / Session (0x0728/0758/002E/0579/0790/07B0/07B2)
 // =============================================================================
 
-// handleServerLoginResponse handles opcode 0x0728 — post-auth world entry.
-// PS2: debug prints, state reset 6/7, server list, char appearance bytes.
+// handleServerLoginResponse is 0x0728, which is printf "Disconnect-7" and
+// Disconnect(6, 0): "Server not ready, please try again later. (nodbs)".
 func (gs *GameState) handleServerLoginResponse(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("ServerLoginResponse: dataLen=%d", len(data))
-	// This opcode signals successful auth — transition toward character select
-	// The actual char list comes via 0x002C, which we already handle
+	gs.handleServerDisconnect(msg)
 }
 
-// handleReconnectWorldEntry handles opcode 0x0758 — reconnection world entry.
-// PS2: reads server name string(512) + version byte first, then falls into login body.
+// handleReconnectWorldEntry is 0x0758: ReadString(buf, 512) — an 8-bit
+// string — into the game window's text (VIWndGame::AddText(const char *)).
 func (gs *GameState) handleReconnectWorldEntry(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 4 {
+	if len(data) < 2 {
 		return
 	}
-	log.Printf("ReconnectWorldEntry: dataLen=%d", len(data))
-	// Read server name (up to 512 bytes)
-	reader := buffer.NewReader(data[2:])
-	if reader.Remaining() >= 4 {
-		nameLen, _ := reader.ReadInt32()
-		if nameLen > 0 && nameLen <= 512 && reader.Remaining() >= int(nameLen) {
-			nameBytes, _ := reader.ReadBytes(int(nameLen))
-			serverName := string(nameBytes)
-			log.Printf("ReconnectWorldEntry: serverName=%q", serverName)
-		}
-	}
-	// Read version byte
-	if reader.Remaining() >= 1 {
-		version, _ := reader.ReadByte()
-		log.Printf("ReconnectWorldEntry: version=%d", version)
-		if version == 18 {
-			log.Printf("ReconnectWorldEntry: early exit (version 18)")
-			return
-		}
+	text := psString(buffer.NewReader(data[2:]), 512)
+	log.Printf("Text (0x0758): %q", text)
+	if text != "" {
+		gs.addChatMessage(text, ChatSystem)
 	}
 }
 
-// handleWorldEntry handles opcode 0x002E — char select → in-world transition.
-// PS2: sets state=3, reads appearance/equipment, full entity init.
+// handleWorldEntry is 0x002E, which is not a world entry: the login window
+// shows word 269, "Character create failed", and m_charCount comes down.
 func (gs *GameState) handleWorldEntry(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("WorldEntry: dataLen=%d — transitioning to in-world", len(data))
-	gs.Phase = PhaseEnteringWorld
-
-	// Extract appearance/equipment if present (after opcode bytes)
-	if len(data) > 2 {
-		reader := buffer.NewReader(data[2:])
-		// Try to read equipment block similar to char select
-		gs.parseWorldEntryAppearance(reader)
-	}
+	gs.createFailed(269)
 }
 
 // handleGuildWorldEntry handles opcode 0x0579 — full world entry with guild init.
@@ -504,29 +368,34 @@ func (gs *GameState) handleGuildWorldEntry(msg *protocol.Message) {
 	}
 }
 
-// handleServerAssignment handles opcode 0x0790 — server/world assignment.
-// PS2: name + flags + zone → state 19.
-// handleStatsUpdate handles opcode 0x0790 — XP/stats update.
-// PS2: reads int64+int32+int64 into entity+0x4F0F0..+0x4F107, sets sentinel -1,
-// then calls UI refresh. Likely current XP, level/stat, max XP.
+// handleStatsUpdate is 0x0790, VIClient::Msg0790, which is not experience: a
+// u64 DRDP endpoint id (an address), a u32 token and a u64 value
+// (SessionIntake.Probe), then Msg0790Done. CLIENT sends 0x0992 {token,
+// value} to that address from then on (each net tick, at most once per
+// min(connection timeout, 1,000 ms)); the Go client cannot send to a second
+// address and does not.
 func (gs *GameState) handleStatsUpdate(msg *protocol.Message) {
 	data := msg.Data()
-	payload := data[2:] // skip opcode
-	if len(payload) < 20 {
-		logPS2DisconnectCode(0x0790)
-		log.Printf("StatsUpdate: too short (%d bytes)", len(payload))
+	if len(data) < 22 {
+		log.Printf("Probe (0x0790): short (%d bytes)", len(data))
 		return
 	}
-	val1 := binary.LittleEndian.Uint64(payload[0:8])
-	val2 := binary.LittleEndian.Uint32(payload[8:12])
-	val3 := binary.LittleEndian.Uint64(payload[12:20])
-	log.Printf("StatsUpdate: val1=%d val2=%d val3=%d", val1, val2, val3)
-	// Store for UI (XP bar, level display)
-	gs.Player.Experience = int64(val1)
-	gs.Player.ExperienceMax = int64(val3)
+	p := data[2:]
+	gs.Session.Probe = ProbeState{
+		Set:   true,
+		Addr:  binary.LittleEndian.Uint64(p[0:8]),
+		Token: binary.LittleEndian.Uint32(p[8:12]),
+		Value: binary.LittleEndian.Uint64(p[12:20]),
+	}
+	a := gs.Session.Probe.Addr
+	log.Printf("Probe (0x0790): %d.%d.%d.%d:%d drdp %d, token 0x%08X, value 0x%X",
+		byte(a>>56), byte(a>>48), byte(a>>40), byte(a>>32), uint16(a>>16), uint16(a),
+		gs.Session.Probe.Token, gs.Session.Probe.Value)
 }
 
-// handleZoneTransferInit handles opcode 0x07B0 — zone transfer init/loading.
+// handleZoneTransferInit handles opcode 0x07B0, VIClientPart33950::Recv07B0
+// (0x00BE71B0), whose sub-handlers are not decompiled: the labels below are
+// the old Ghidra reading, unverified, and nothing reads the state they set.
 // PS2 FUN_00BE71B0: reads 1-byte sub-type, dispatches to state machine:
 //   0=init (guard state==3), 1=ready (guard state==5),
 //   2=zone data (guard state==1), 3=zone resource (guard state==2),
@@ -548,8 +417,7 @@ func (gs *GameState) handleZoneTransferInit(msg *protocol.Message) {
 		if len(rest) >= 1 {
 			result := rest[0]
 			log.Printf("ZoneTransfer: init result=%d", result)
-			// PS2 stores pending zone index at entity+0x4F0E8 for the
-			// zone about to be loaded. The result byte indicates the target zone.
+			// The result byte (what it selects is not decompiled).
 			gs.PendingZoneIdx = int(result)
 		}
 
@@ -607,11 +475,16 @@ func (gs *GameState) handleZoneTransferInit(msg *protocol.Message) {
 	}
 }
 
-// handleZoneTransferConfirm handles opcode 0x07B2 — zone transfer complete.
-// PS2: same handler as 0x07B0 (FUN_00BE71B0) — shared sub-type dispatch.
+// handleZoneTransferConfirm is 0x07B2, which is not 0x07B0's: the dispatcher
+// reads one u32 into VIClient+0x7578 (the constructor's 100) and does nothing
+// else with it.
 func (gs *GameState) handleZoneTransferConfirm(msg *protocol.Message) {
-	// Route through the same sub-type dispatcher
-	gs.handleZoneTransferInit(msg)
+	data := msg.Data()
+	if len(data) < 6 {
+		return
+	}
+	gs.Session.P07578 = binary.LittleEndian.Uint32(data[2:6])
+	log.Printf("0x07B2: +0x7578 = %d", gs.Session.P07578)
 }
 
 // parseWorldEntryAppearance tries to parse appearance/equipment from world entry data.
@@ -663,19 +536,10 @@ func (gs *GameState) handleNPCInteraction(msg *protocol.Message) {
 	log.Printf("0x001C: player +0x44 = %d", gs.PlayerP44)
 }
 
-// handleItemListUpdate handles opcode 0x0065 — full item definition with stats.
-// PS2: reads appearance bytes, equipment slots, pricing.
+// handleItemListUpdate is 0x0065, which carries no items: the login window
+// shows word 828, "Failed: invalid name", and m_charCount comes down.
 func (gs *GameState) handleItemListUpdate(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	log.Printf("ItemListUpdate: dataLen=%d", len(data))
-
-	// Parse items using existing item parser
-	if len(data) > 2 {
-		gs.parseAndLogItems("ItemListUpdate", data)
-	}
+	gs.createFailed(828)
 }
 
 // handleNPCMessage handles opcode 0x00D3 — NPC/server say message.
@@ -776,87 +640,15 @@ func (gs *GameState) handleHPResourceUpdate(msg *protocol.Message) {
 // Chat (0x07A3)
 // =============================================================================
 
-// handleChatMessage handles opcode 0x07A3 — chat message.
-// PS2: sender name(24) UTF-16 + 4-byte metadata + zigzag msg ID.
+// handleChatMessage is 0x07A3, which carries no chat: ReadString(name, 24)
+// widened into VIClient+0x4F0B8, the name GetReplyName returns.
 func (gs *GameState) handleChatMessage(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 4 {
+	if len(data) < 2 {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-
-	// Read sender name (24-byte fixed buffer)
-	senderName := ""
-	if reader.Remaining() >= 24 {
-		nameBytes, err := reader.ReadBytes(24)
-		if err == nil {
-			for i, b := range nameBytes {
-				if b == 0 {
-					senderName = string(nameBytes[:i])
-					break
-				}
-			}
-		}
-	}
-
-	// Read 4-byte metadata — byte 0 is chat channel type
-	chatChannel := ChatSay
-	if reader.Remaining() >= 4 {
-		metaBytes, _ := reader.ReadBytes(4)
-		if len(metaBytes) >= 1 {
-			switch metaBytes[0] {
-			case 0:
-				chatChannel = ChatSay
-			case 1:
-				chatChannel = ChatShout
-			case 2:
-				chatChannel = ChatGroup
-			case 3:
-				chatChannel = ChatGuild
-			case 4:
-				chatChannel = ChatTell
-			}
-		}
-	}
-
-	// Read message ID (zigzag)
-	msgID := int64(0)
-	if reader.Remaining() >= 1 {
-		msgID, _ = reader.Read7BitEncodedInt64()
-	}
-
-	// Read message text
-	msgText := ""
-	if reader.Remaining() > 4 {
-		text, err := readStringFromReader(reader)
-		if err == nil {
-			msgText = text
-		}
-	}
-
-	channelNames := map[ChatChannel]string{
-		ChatSay: "say", ChatShout: "shout", ChatGroup: "group",
-		ChatGuild: "guild", ChatTell: "tell",
-	}
-	log.Printf("ChatMessage[%s]: sender=%q msgID=%d text=%q",
-		channelNames[chatChannel], senderName, msgID, msgText)
-
-	if senderName != "" && msgText != "" {
-		prefix := ""
-		switch chatChannel {
-		case ChatGuild:
-			prefix = "[Guild] "
-		case ChatGroup:
-			prefix = "[Group] "
-		case ChatShout:
-			prefix = "[Shout] "
-		case ChatTell:
-			prefix = "[Tell] "
-		}
-		gs.addChatMessage(fmt.Sprintf("%s%s: %s", prefix, senderName, msgText), chatChannel)
-	} else if msgText != "" {
-		gs.addChatMessage(msgText, chatChannel)
-	}
+	gs.Session.ReplyName = psString(buffer.NewReader(data[2:]), 24)
+	log.Printf("ReplyName (0x07A3): %q", gs.Session.ReplyName)
 }
 
 // =============================================================================
@@ -934,14 +726,11 @@ func (gs *GameState) handleIgnoreListResult(msg *protocol.Message) {
 // Simple / Stub Handlers
 // =============================================================================
 
-// handleForceDisconnect handles opcode 0x00EC — force disconnect.
-// PS2: debug printf + state transition 8 (disconnect). Shares handler with 0x07A4.
+// handleForceDisconnect is 0x00EC (and 0x07A4, the same case): printf
+// "Disconnect-9" and Disconnect(8, 0), "You have logged in from another
+// location.", DisconnectKind 3.
 func (gs *GameState) handleForceDisconnect(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("*** FORCE DISCONNECT: opcode=0x00EC dataLen=%d ***", len(data))
-	if len(data) > 2 {
-		log.Printf("*** DISCONNECT DATA: %X ***", data)
-	}
+	gs.handleServerDisconnect(msg)
 }
 
 // handleStubNOP handles opcode 0x006E — deprecated stub (NOP).
@@ -1248,15 +1037,16 @@ func (gs *GameState) handleBuffNotification(msg *protocol.Message) {
 	}
 }
 
-// handleCombatEnd handles opcode 0x0777 — combat end / target clear.
-// PS2: no data payload. Resets combat target to -1, clears connection state,
-// transitions entity to idle mode. Server sends this when target dies,
-// goes out of range, or combat is explicitly stopped.
+// handleCombatEnd is 0x0777, VIClient::Msg0777, which does not end combat:
+// it hides the login window, prints "Disconnect-12", sets +0x4F0EC to -1 and
+// makes a QUIET Disconnect(0, 1), then Msg0777Done(2) reloads the world and
+// shows the login window. The server's word for it is DisconnectNoError.
 func (gs *GameState) handleCombatEnd(msg *protocol.Message) {
-	log.Printf("CombatEnd: server cleared combat state")
-	gs.Player.AttackCount = 0
-	gs.PlayerInCombat = false
-	gs.CombatEnded = true // consumed by animation manager to clear combat state
+	if !guaranteed(msg) {
+		return
+	}
+	gs.Session.Disconnect.HasCode = false
+	gs.serverDisconnect(0, true)
 }
 
 // handleNPCInteractResult handles opcodes 0x0729 / 0x0773 — NPC interaction result.
@@ -1696,10 +1486,10 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 	log.Printf("Auction: +%d items (total %d)", len(items), len(gs.AuctionItems))
 }
 
-// handleAdminShutdown handles opcode 0x07C1 — server shutdown announcement.
+// handleAdminShutdown is 0x07C1: Disconnect(18, 0), "We are updating the
+// game, please try again later.", DisconnectKind 4.
 func (gs *GameState) handleAdminShutdown(msg *protocol.Message) {
-	log.Printf("*** SERVER SHUTDOWN ANNOUNCED ***")
-	gs.addChatMessage("Server is shutting down!", ChatSystem)
+	gs.handleServerDisconnect(msg)
 }
 
 // =============================================================================

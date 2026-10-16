@@ -326,7 +326,12 @@ type GameState struct {
 	// Character select
 	Characters   []CharInfo
 	SelectedChar int // index into Characters, -1 = none selected
-	CreateError  string // set when server sends OpcodeNameTaken
+	CreateError  string // a failed create's word: 0x002E, 0x0065, 0x002F
+
+	// Session is what the session, login and world-entry opcodes leave
+	// (intake_session.go): a server-ordered disconnect, the character-select
+	// message, the expansion flags and the rest.
+	Session SessionIntake
 
 	// In-world state
 	PlayerObjectID uint32
@@ -497,7 +502,7 @@ type GameState struct {
 	ZoneTransferZone       string // target zone path
 	ZoneTransferState      int    // PS2 state machine: 0=idle, 1-5=phases
 	ZoneTransferProxyCount int    // number of zone proxies received in sub-type 2
-	PendingZoneIdx         int    // PS2 entity+0x4F0E8: zone index about to be loaded
+	PendingZoneIdx         int    // 0x07B0 sub 0's result byte (VIClient+0x4F0E8 is the disconnect reason, not this)
 
 	// Guild state (PS2 opcode 0x0468 sub-types)
 	GuildName    string        // from sub-type 1 (0x80 blob UTF-16)
@@ -955,25 +960,28 @@ func (gs *GameState) HandleStateChannel(channel byte, msg *protocol.Message) {
 	}
 }
 
+// handleDiscVersion is 0x0000 (viclient.cpp, ProcessMessage): an int32, and
+// any version but 18 is printf "Disconnect-??" and Disconnect(16, 0) — "The
+// server has been shutdown by a server administrator.", DisconnectKind 4.
+// Every captured server sends 18 (00 00 12 00 00 00).
 func (gs *GameState) handleDiscVersion(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) == 0 {
 		log.Printf("DiscVersion: empty data")
 		return
 	}
-	// Sandstorm sends 1 byte (0x12 keepalive), SPIRE sends 6 bytes (2-byte opcode + uint32)
-	// Anything larger is a misidentified message (opcode 0x0000 collision) — ignore
-	if len(data) > 10 {
+	// A message too short for the opcode is not 0x0000 on the PS2 at all (its
+	// opcode read fails), and one too short for the version leaves it
+	// unread; neither is acted on here.
+	if len(data) < 6 {
+		log.Printf("DiscVersion: %d bytes, raw=%X", len(data), data)
 		return
 	}
-	if len(data) >= 6 {
-		reader := buffer.NewReader(data[2:])
-		version, _ := reader.ReadUint32()
-		log.Printf("DiscVersion: server version 0x%08X (%d bytes)", version, len(data))
-	} else if len(data) == 1 {
-		// Keepalive — suppress log to reduce noise
-	} else {
-		log.Printf("DiscVersion: %d bytes, raw=%X", len(data), data)
+	version := int32(binary.LittleEndian.Uint32(data[2:6]))
+	log.Printf("DiscVersion: server version %d", version)
+	// A best-effort message starting 00 00 is not a version (guaranteed).
+	if version != 18 && guaranteed(msg) {
+		gs.serverDisconnect(16, false)
 	}
 }
 
@@ -1064,25 +1072,26 @@ func (gs *GameState) handleGameServers(msg *protocol.Message) {
 	gs.StatusMsg = "Received server list"
 }
 
+// handleCamera1 is 0x07D1, which is not a camera message: CLIENT stores the
+// u32 at VIClient+0x50304, the account's expansion flags (see
+// SessionIntake.ExpansionFlags). Every server sends -1.
 func (gs *GameState) handleCamera1(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) >= 6 {
-		reader := buffer.NewReader(data[2:])
-		val, _ := reader.ReadInt32()
-		log.Printf("Camera1: value=%d", val)
-
-		// Camera1 with value -1 means "no camera target" (pre-character-select).
-		// Do NOT change Phase here — Sandstorm sends Camera1(-1) after CharacterSelect,
-		// which would overwrite PhaseCharSelect and prevent auto-select from triggering.
+		gs.Session.ExpansionFlags = binary.LittleEndian.Uint32(data[2:6])
+		log.Printf("ExpansionFlags (0x07D1): 0x%08X", gs.Session.ExpansionFlags)
 	}
-	// Always send ACK response. Flush locks the connection's mutex on its first
-	// line, so a nil Conn panics rather than no-opping — same crash the
-	// world-entry batch in handleMemoryDump had.
+	// The PS2 acks it on its next net tick (TickNet's drdp_flush); this sends
+	// the ack at once. Flush locks the connection's mutex on its first line,
+	// so a nil Conn panics rather than no-opping — same crash the world-entry
+	// batch in handleMemoryDump had.
 	if gs.Conn != nil {
 		gs.Conn.Flush()
 	}
 }
 
+// handleCamera2 is 0x07F5, which CLIENT's dispatcher has no case for; no
+// captured server sends it.
 func (gs *GameState) handleCamera2(msg *protocol.Message) {
 	log.Printf("Camera2 received")
 	if gs.Conn != nil {
@@ -1090,10 +1099,20 @@ func (gs *GameState) handleCamera2(msg *protocol.Message) {
 	}
 }
 
+// handleCharacterSelect is 0x002C, VIClient::CharacterList (0x00BD2E80). The
+// dispatcher takes it only in client state 2 or 3 (connected to a world
+// server, or at the character list) — not once a character is chosen (4) or
+// in the world (5); the Go phases for 2 and 3 are PhaseConnectingGame and
+// PhaseCharSelect. Then: a zigzag count clamped to 8, and per character
+// ReadString(name, 24), nine zigzag fields and 32 raw bytes.
 func (gs *GameState) handleCharacterSelect(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) < 3 {
 		log.Printf("CharacterSelect: short data (%d bytes)", len(data))
+		return
+	}
+	if gs.Phase != PhaseConnectingGame && gs.Phase != PhaseCharSelect {
+		log.Printf("CharacterSelect: ignored in phase %v (CLIENT state is not 2 or 3)", gs.Phase)
 		return
 	}
 
@@ -1110,14 +1129,18 @@ func (gs *GameState) handleCharacterSelect(msg *protocol.Message) {
 	// Character count is zigzag encoded, like the per-character fields below.
 	// Confirmed against pcaps/ps2_sandstorm.pcap: count byte 0x0E for 7
 	// characters. CLAUDE.md's "count is UNSIGNED" note is incorrect.
-	count, _ := reader.Read7BitEncodedInt64()
+	// CharacterList clamps it to 8 and reads no further.
+	count, _ := psSigned(reader)
+	if count > 8 {
+		count = 8
+	}
 	log.Printf("CharacterSelect: %d characters", count)
 
 	gs.Characters = nil
 	for i := 0; i < int(count); i++ {
-		// Name: int32 length + UTF-8 string
-		nameLen, _ := reader.ReadInt32()
-		name, _ := reader.ReadStringUTF8(int(nameLen))
+		// Name: ReadString(m_name, 24) — 23 bytes at most, a longer one
+		// is skipped and reads empty.
+		name := psString(reader, 24)
 
 		// Character fields (zigzag)
 		serverID, _ := reader.Read7BitEncodedInt64()
@@ -1190,8 +1213,11 @@ func (gs *GameState) handleCharacterSelect(msg *protocol.Message) {
 			ci.BootsTint = equipBytes[30]
 			ci.HelmTint = equipBytes[31]
 
-			// Robe: -1 (0xFFFFFFFF) = no robe, 0-3 = valid robe style index.
-			if robeRaw >= 0 && robeRaw <= 3 {
+			// Robe: CharacterList stores the int raw (m_robe); -1 is no
+			// robe. Which robes exist is a rule-set question (retail 0-3,
+			// Sandstorm 0-5) settled where it is drawn (Rules.RobeCount),
+			// so a robe byte is kept as it came.
+			if robeRaw >= 0 && robeRaw < 0xFF {
 				ci.Robe = byte(robeRaw)
 			} else {
 				ci.Robe = 0xFF // no robe
@@ -1297,18 +1323,21 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 	// Sandstorm: adds opcode prefix, unknown byte, zone path, char name
 	reader := buffer.NewReader(data[2:]) // skip opcode prefix (2 bytes)
 
-	reader.ReadByte() // Sandstorm-specific: unknown byte (always 0)
+	// VIClient::Msg000D (0x00BD0630) starts with a byte it keeps as a bool,
+	// +0x662C, the gate that loads the world from the path string that
+	// follows rather than from the world table by index. Every server sends
+	// 0; the Go client loads by index.
+	gate, _ := reader.ReadByte()
+	gs.Session.WorldPathGate = gate != 0
 
-	// Zone file path (Sandstorm-specific, not in PS2 format)
-	pathLen, _ := reader.ReadInt32()
-	zonePath, _ := reader.ReadStringUTF8(int(pathLen))
+	// The world file path: ReadString(+0xC1DC, 256).
+	zonePath := psString(reader, 256)
 	gs.ZonePath = zonePath
-	log.Printf("MemoryDump: zone='%s'", zonePath)
+	log.Printf("MemoryDump: zone='%s' gate=%v", zonePath, gs.Session.WorldPathGate)
 
 	// Character core fields (PS2: func_00CBA850 at +0xC2DC)
 	charServerID, _ := reader.Read7BitEncodedInt64() // PS2: +0x00
-	nameLen, _ := reader.ReadInt32()                  // Sandstorm: char name (PS2 uses serverName here)
-	charName, _ := reader.ReadStringUTF8(int(nameLen))
+	charName := psString(reader, 24)                  // PS2: +0x04, ReadString(24)
 	class, _ := reader.Read7BitEncodedInt64()         // PS2: +0x1C
 	race, _ := reader.Read7BitEncodedInt64()          // PS2: +0x20
 	level, _ := reader.Read7BitEncodedInt64()         // PS2: +0x24
@@ -1395,6 +1424,10 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 		Shield: prevEquip.Shield,
 		HairColor: prevEquip.HairColor, HairLength: prevEquip.HairLength,
 		HairStyle: prevEquip.HairStyle, FaceOption: prevEquip.FaceOption,
+		// The walk control's speed: Msg000D reads the dump's speed into
+		// m_speed (ParsedCM.Speed) but calls no SetSpeed, so the player
+		// keeps moving at the last 0x00F8's.
+		Speed: prevEquip.Speed,
 	}
 
 	// Continue parsing full MemoryDump: hotkeys, quests, inventory, spells, etc.
@@ -1459,31 +1492,34 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 		return
 	}
 	log.Printf("MemoryDump: pos=%d hotkeyCount=%d", reader.Position(), hotkeyCount)
-	if hotkeyCount > 0 && hotkeyCount < 200 {
+	if hotkeyCount > 0 {
 		gs.Hotkeys = parseHotkeys(reader, hotkeyCount)
 		log.Printf("MemoryDump: parsed %d hotkey entries", len(gs.Hotkeys))
 	}
 
-	// ─── Section 3: Quest Data ──────────────────────────────────────────
-	// PS2: 4 raw bytes (quest metadata) + zigzag(count) + complex quest rows
-	// Sandstorm: 2×int32(0) + uint32(count) + count × WriteStringUnicode(text)
-	reader.ReadInt32() // quest metadata (always 0 on Sandstorm)
-	reader.ReadInt32() // quest metadata (always 0 on Sandstorm)
+	// ─── Section 3: Quest Log ───────────────────────────────────────────
+	// Msg000D: raw u32 → +0x2BB60 (the ability messages' stamp), raw u32 →
+	// +0x2BB0C (0x007C/0x007D's), raw u32 → m_questCount (+0x2CEE0), then
+	// that many ReadString(m_questTitle[i], 256). CLIENT does not clamp the
+	// count (a ninth title would run over the count itself); here every
+	// title is read and the first eight kept.
+	reader.ReadInt32() // +0x2BB60
+	reader.ReadInt32() // +0x2BB0C
 	questCount, err := reader.ReadUint32()
 	if err != nil {
 		log.Printf("MemoryDump: quests: read count failed (remaining=%d)", reader.Remaining())
 		return
 	}
 	log.Printf("MemoryDump: pos=%d questCount=%d", reader.Position(), questCount)
+	gs.QuestTexts = [8]string{}
 	gs.QuestTextIndex = 0
-	for i := uint32(0); i < questCount && i < 8; i++ {
-		textLen, err := reader.ReadInt32()
-		if err != nil {
-			log.Printf("MemoryDump: quest %d read error: %v", i, err)
+	for i := uint32(0); i < questCount; i++ {
+		if reader.Remaining() < 4 {
+			log.Printf("MemoryDump: quest %d: stream ends", i)
 			return
 		}
-		if textLen > 0 && textLen < 5000 {
-			text, _ := reader.ReadStringUnicode(int(textLen))
+		text := psWString(reader, 256)
+		if i < 8 {
 			gs.QuestTexts[i] = text
 			gs.QuestTextIndex = int(i) + 1
 		}
@@ -1526,12 +1562,11 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 		}
 	}
 
-	// ─── Section 5: Weapon Hotbars ──────────────────────────────────────
-	// PS2: 6 × (4 × ReadBytes(4)) = 96 bytes fixed via func_00BFD178
-	// Sandstorm: SKIPPED (not present in wire format)
-
 	// ─── Section 6: Bank Items (CHARACTER_BANK_ITEMS) ───────────────────
-	// Same format as inventory: zigzag count + uint32 count + N × DumpItem
+	// func_00BB9C80 on the bank control (+0x47388): first its items, read
+	// like the inventory (VIItemList::Read: the zigzag count drives the
+	// loop, the u32 is the list's +4). The 6 × 4 raw u32 block
+	// (func_00BFD178) is not here: CLIENT reads it after the abilities.
 	bankCount, err := reader.Read7BitEncodedInt64()
 	if err != nil {
 		log.Printf("MemoryDump: bank: read count failed (remaining=%d)", reader.Remaining())
@@ -1558,37 +1593,49 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 	}
 	log.Printf("MemoryDump: parsed %d bank items (total items=%d)", bankCount, len(gs.ParsedItems))
 
-	// ─── Section 7-10: Effects / Flag / Ignore ──────────────────────────
-	// PS2 order: flag byte → abilities → effects → ignore list
-	// Sandstorm sends 4 bytes here for empty sections (all zero counts):
-	//   byte 0: unknown (0x00)
-	//   byte 1: unknown (0x00)
-	//   byte 2: flag byte (0x01)
-	//   byte 3: unknown (0x00)
-	// ─── Section D: Buffs + Flag + Spells ──────────────────────────────
-	// Sandstorm format (verified via Dolph [00 00 01 00] and McGregor [00 02 ...]):
-	//   byte(unk0) + zigzag(buffCount) + [buff rows] + byte(flag) + byte(unk1)
-	// Then spells follow.
-	unk0, _ := reader.ReadByte() // always 0x00
+	// ─── Section 7: the rest of the bank, the corpse ────────────────────
+	// The bank control (func_00BB9C80) reads, after its items, a list of
+	// listing rows (func_00BBCD10, +0x7770), then 32-byte rows (func_00BBD0A8,
+	// +0x7788: two zigzag of key, three zigzag and a byte each), then a flag
+	// byte (+0x78CC). Msg000D then reads HaveCorpse and the abilities.
+	// Captured dumps: [00 00 01 00] (Dolph), [00 02 …] (McGregor).
+	listings, err := skipBankListings(reader)
+	if err != nil {
+		log.Printf("MemoryDump: bank listings: %v (remaining=%d)", err, reader.Remaining())
+		return
+	}
 	buffCount, _ := reader.Read7BitEncodedInt64()
-	log.Printf("MemoryDump: pos=%d unk0=%02X buffCount=%d remaining=%d",
-		reader.Position(), unk0, buffCount, reader.Remaining())
-	if buffCount > 0 && buffCount < 200 {
-		for i := int64(0); i < buffCount; i++ {
-			// Each buff row: try reading zigzag fields until we figure out the format.
-			// PS2 func_00CA6848: 2 key zigzag + 3 data zigzag + 1 flag byte = 6 reads per buff.
-			reader.Read7BitEncodedInt64() // key1
-			reader.Read7BitEncodedInt64() // key2
-			reader.Read7BitEncodedInt64() // field1
-			reader.Read7BitEncodedInt64() // field2
-			reader.Read7BitEncodedInt64() // field3
-			reader.ReadByte()             // flag
-			log.Printf("MemoryDump: skipped buff[%d] pos=%d", i, reader.Position())
+	log.Printf("MemoryDump: pos=%d bankListings=%d buffCount=%d remaining=%d",
+		reader.Position(), listings, buffCount, reader.Remaining())
+	for i := int64(0); i < buffCount; i++ {
+		// func_00CA6848: func_00CA6708's two zigzag (the key), three
+		// zigzag and a byte.
+		for j := 0; j < 5; j++ {
+			reader.Read7BitEncodedInt64()
+		}
+		if _, err := reader.ReadByte(); err != nil {
+			log.Printf("MemoryDump: bank row %d: stream ends", i)
+			return
 		}
 	}
 	flagByte, _ := reader.ReadByte()
-	unk1, _ := reader.ReadByte()
-	log.Printf("MemoryDump: pos=%d flagByte=%02X unk1=%02X before spells", reader.Position(), flagByte, unk1)
+	// HaveCorpse (+0x13B94): set, the open corpse's item list follows
+	// (VIItemList::Read into +0x13B98) and CLIENT calls LootNoWindow.
+	corpse, _ := reader.ReadByte()
+	gs.HaveCorpse = corpse != 0
+	gs.Corpse, gs.corpseNext = nil, 0
+	if gs.HaveCorpse {
+		items, next, err := readItemList(reader)
+		gs.Corpse, gs.corpseNext = items, next
+		if err != nil {
+			log.Printf("MemoryDump: corpse items: %v (remaining=%d)", err, reader.Remaining())
+			return
+		}
+		// Msg000D then calls LootNoWindow (0x00BCB098): SendOpcode(0x0016).
+		gs.sendLootClosed()
+	}
+	log.Printf("MemoryDump: pos=%d bankFlag=%02X haveCorpse=%v (%d items) before abilities",
+		reader.Position(), flagByte, gs.HaveCorpse, len(gs.Corpse))
 
 	// ─── Section 8: Abilities/Spells (CHARACTER_ABILITIES) ──────────────
 	// PS2: ReadSpellTable (zigzag count + N × ReadSpellRow)
@@ -1634,9 +1681,15 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 			sp.SpellID, sp.Name, sp.AbilityLevel, sp.AddedOrder, sp.Range, sp.CastTime, sp.Power, sp.Icon, sp.Scope, sp.Recast))
 	}
 
-	// ─── Section 11-12: Skills / Stats / CM ─────────────────────────────
-	// PS2: func_00BF71A0 (skills) + func_00BDCDC0 (stats block)
-	// Sandstorm: speed(float) + 26×int32 skills + CM zigzag fields
+	// ─── Section 11-12: Speed, the 6×4 block, CM ────────────────────────
+	// Msg000D, after ReadAbilities (func_00BDCDC0): a raw float into m_speed
+	// (+0x2CEE4; no SetSpeed follows), a raw u32 into +0x3FC0C, the 6 × 4
+	// raw u32 of func_00BFD178 (+0x3834C), then func_00BF71A0 (+0x4EC58): a
+	// raw u32 (+0x41C), four zigzag (+0x0C, +0x10, +0x14, +0x08), a raw u32
+	// (+0xA8), 29 zigzag (func_00BF7060) and 7 zigzag (func_00BF6FF0).
+	// cm.Skills is the 26 raw u32 between the speed and the four zigzag.
+	// A non-zero func_00BF71A0 result, or a stream error anywhere, sends
+	// CLIENT back to the login screen (Msg0777).
 	if reader.Remaining() < 112 {
 		log.Printf("MemoryDump: COMPLETE — %d items, %d spells, no CM section (%d bytes remaining)",
 			len(gs.ParsedItems), len(gs.ParsedSpells), reader.Remaining())
@@ -1814,42 +1867,56 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 		world, x, y, z, facing, oldCount)
 }
 
+// handlePlayerSpeed is 0x00F8: a raw float into m_speed and SetSpeed — the
+// walk control's run speed is it, its walk speed 3.0, or 0 when the run is
+// 0. A speed of 0 stops the player; ps2_sandstorm.pcap sends one right after
+// the respawn MemoryDump and 0x00B2, then 8.833.
 func (gs *GameState) handlePlayerSpeed(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) >= 6 {
 		reader := buffer.NewReader(data[2:])
 		speed, _ := reader.ReadFloat32()
 		gs.Player.Speed = speed
+		gs.Session.SpeedSet = true
 		log.Printf("PlayerSpeed: %.1f", speed)
 	}
 }
 
-// handleAdminCode processes AdminCode (0x0700) from the server.
-// PS2 VIWndGame uses this to enable/disable GM menu items.
-// Wire format: uint16 opcode + byte type + varint code.
+// handleAdminCode is 0x0700, VIClientPart382E8::Recv0700 (0x00BB5DD0): a
+// sub-type byte, then
+//
+//	35  ReadSigned into +0x14 (SessionIntake.AdminLevel)
+//	50  ReadString(name, 64) (wide), and PromptWithName: word 1189 ("Give
+//	    item:"), a space and the name, in a game-window prompt
+//
+// and nothing for any other sub-type.
 func (gs *GameState) handleAdminCode(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 4 {
+	if len(data) < 3 {
 		log.Printf("AdminCode: short data (%d bytes)", len(data))
 		return
 	}
-	menuType := data[2]
-	// Code is 7-bit encoded starting at byte 3
-	code := int64(0)
-	shift := uint(0)
-	for i := 3; i < len(data); i++ {
-		b := data[i]
-		code |= int64(b&0x7F) << shift
-		shift += 7
-		if b&0x80 == 0 {
-			break
+	sub := data[2]
+	r := buffer.NewReader(data[3:])
+	switch sub {
+	case 35:
+		v, err := psSigned(r)
+		if err != nil {
+			return
 		}
+		gs.Session.AdminLevel = v
+		gs.AdminMenuType = sub
+		gs.AdminMenuCode = int64(v)
+		log.Printf("AdminCode: +0x14 = %d", v)
+	case 50:
+		// The prompt is a game-window dialog the Go client does not have;
+		// its text goes to the chat window.
+		text := gs.sessionWord(1189) + " " + psWString(r, 64)
+		log.Printf("AdminCode: prompt %q", text)
+		gs.addChatMessage(text, ChatSystem)
+	default:
+		log.Printf("AdminCode: sub-type %d ignored, as CLIENT does", sub)
 	}
-	log.Printf("AdminCode: type=%d code=%d", menuType, code)
-
-	// Store for GM menu use — the server signals which admin features are available
-	gs.AdminMenuType = menuType
-	gs.AdminMenuCode = code
 }
 
 // readUnicodeString reads an int32 charCount + UTF-16LE string from data at the given offset.
@@ -3003,6 +3070,7 @@ func (gs *GameState) SelectCharacter(index int) {
 
 	gs.Phase = PhaseEnteringWorld
 	gs.StatusMsg = "Selecting " + ch.Name + "..."
+	gs.Session.CharSelectMessage = ""
 	log.Printf("Selected character: %s (serverID=%d) hair(%d/%d/%d) face=%d",
 		ch.Name, ch.ServerID, ch.HairColor, ch.HairLength, ch.HairStyle, ch.FaceOption)
 }
@@ -3696,7 +3764,7 @@ func (gs *GameState) handleMerchantBox(msg *protocol.Message) {
 func (gs *GameState) handleWeatherControl(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) >= 3 {
-		wt := WeatherType(data[2])
+		wt := weatherFromWire(data[2])
 		log.Printf("WeatherControl: type=%d (fade)", wt)
 		if gs.Weather != nil {
 			gs.Weather.SetWeather(wt, false)
@@ -3709,7 +3777,7 @@ func (gs *GameState) handleWeatherControl(msg *protocol.Message) {
 func (gs *GameState) handleSkyboxWeather(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) >= 3 {
-		wt := WeatherType(data[2])
+		wt := weatherFromWire(data[2])
 		log.Printf("SkyboxWeather: type=%d (instant)", wt)
 		if gs.Weather != nil {
 			gs.Weather.SetWeather(wt, true)
@@ -4344,7 +4412,7 @@ func parseSingleSpell(reader *buffer.Reader) (ParsedSpell, error) {
 
 // HotkeySlot holds one directional slot (N/W/E/S) within a hotkey entry.
 type HotkeySlot struct {
-	SlotID byte   // 0=N, 2=W, 4=E, 6=S
+	SlotID byte   // zigzag on the wire: 0=N, 1=W, 2=E, 3=S (func_00BDB8F8 keeps < 4)
 	Label  string // display label ("|14"=command code, " "=submenu, text=chat)
 	Msg    string // message to send or submenu display name
 }
@@ -4356,9 +4424,11 @@ type HotkeyEntry struct {
 }
 
 // parseHotkeys reads the hotkey section of MemoryDump into HotkeyEntry structs.
-// Wire format: count(zigzag) entries, each: zigzag(direction) + 4 × (byte(slotID) + WriteStringUnicode(label) + WriteStringUnicode(msg)).
+// Wire format (Msg000D): count(zigzag) entries, each: zigzag(direction) +
+// 4 × (zigzag(slotID) + label (wide, 127 at most) + msg (wide, 63 at most)).
+// A longer string is skipped and reads empty, as VIMemStream::ReadString does.
 func parseHotkeys(reader *buffer.Reader, count int64) []HotkeyEntry {
-	entries := make([]HotkeyEntry, 0, count)
+	entries := make([]HotkeyEntry, 0, min(count, 64))
 	for i := int64(0); i < count; i++ {
 		dirCode, err := reader.Read7BitEncodedInt64()
 		if err != nil {
@@ -4366,29 +4436,21 @@ func parseHotkeys(reader *buffer.Reader, count int64) []HotkeyEntry {
 		}
 		entry := HotkeyEntry{DirCode: dirCode}
 		for slot := 0; slot < 4; slot++ {
-			slotID, err := reader.ReadByte()
+			// Msg000D: ReadSigned(+0), ReadString(+4, 256),
+			// ReadString(+260, 128) — a 388-byte record, four to a node.
+			slotID, err := reader.Read7BitEncodedInt64()
 			if err != nil {
 				return entries
 			}
-			entry.Slots[slot].SlotID = slotID
-
-			// label: int32 charCount + UTF-16LE
-			labelLen, err := reader.ReadInt32()
-			if err != nil {
+			entry.Slots[slot].SlotID = byte(slotID)
+			if reader.Remaining() < 4 {
 				return entries
 			}
-			if labelLen > 0 && labelLen < 500 {
-				entry.Slots[slot].Label, _ = reader.ReadStringUnicode(int(labelLen))
-			}
-
-			// msg: int32 charCount + UTF-16LE
-			msgLen, err := reader.ReadInt32()
-			if err != nil {
+			entry.Slots[slot].Label = psWString(reader, 256)
+			if reader.Remaining() < 4 {
 				return entries
 			}
-			if msgLen > 0 && msgLen < 500 {
-				entry.Slots[slot].Msg, _ = reader.ReadStringUnicode(int(msgLen))
-			}
+			entry.Slots[slot].Msg = psWString(reader, 128)
 		}
 		entries = append(entries, entry)
 	}

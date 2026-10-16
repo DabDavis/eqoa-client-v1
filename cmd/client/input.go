@@ -661,13 +661,18 @@ func (c *Client) handleInWorldInput() {
 
 	// PS2 speed from server PlayerSpeed opcode (0x00F8).
 	// Walk base = 3.0, run base = server value (default 8.833).
+	// Until a 0x00F8 the walk control runs at its InitParms speeds; after
+	// one, a run of 0 is a stop (ps2_sandstorm.pcap sends 0 after a respawn).
 	serverSpeed := c.engine.State.Player.Speed
-	if serverSpeed <= 0 {
-		serverSpeed = ps2DefaultRunBase // fallback before server sends speed
+	if !c.engine.State.Session.SpeedSet {
+		serverSpeed = ps2DefaultRunBase
 	}
 	// VIClient::SetSpeed (0x00F8): run is the server's value and walk a flat
 	// 3.0 (0 when the run is 0); walk used to scale with the run.
 	walkSpeedCap := ps2WalkBase
+	if serverSpeed == 0 {
+		walkSpeedCap = 0
+	}
 
 	// PS2 UpdatePhysics speed ramping: exponential damping + force accumulation.
 	// velocity = velocity * powf(dampingBase, dt) + targetSpeed * (1 - powf(dampingBase, dt))

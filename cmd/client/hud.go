@@ -375,6 +375,9 @@ func (c *Client) handleChatInput() {
 				log.Printf("Tell to %s: %s (server routing not yet implemented)", parts[0], parts[1])
 			}
 		case "r", "reply":
+			if name := c.engine.State.Session.ReplyName; name != "" {
+				c.lastTellSender = name // 0x07A3's, VIClient::GetReplyName
+			}
 			if c.lastTellSender == "" {
 				gs := c.engine.State
 				gs.ChatLog = append(gs.ChatLog, game.ChatMessage{

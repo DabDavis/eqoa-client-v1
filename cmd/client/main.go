@@ -1069,6 +1069,11 @@ func runClient() {
 				client.handleInWorldInput()
 			}
 
+			// A server-ordered disconnect (0x0729, 0x07A4, 0x0777, ...).
+			if client.engine != nil && engine.State.Session.Disconnect.Pending {
+				client.serverDisconnected()
+			}
+
 			// Skip draw if disconnected mid-frame (e.g. Escape on char select)
 			if client.engine == nil {
 				rl.BeginDrawing()
