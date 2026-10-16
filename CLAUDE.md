@@ -769,7 +769,8 @@ index 7 is the current HP), 0x43 effects (u32 count ≤ 8, 132-byte records: ico
   hits in 25 s), and once the NPC fights back the server keeps the fight going after the
   release, as in `ps2_main_capture`. That is the PS2's own behaviour under the retail option
   (`VIGameOptions::m_x95` off); with the option on, a press toggles auto-attack and byte 36
-  stays 1.
+  stays 1. **The Go client's keyboard Space is always the toggle** (`attackPressed(true)`);
+  the pad's X keeps retail's hold.
 - **Targets**: every change is 0x0010 {u32 0, u32 target} and turns auto-attack off
   (`SetTarget`, `SelectTarget`, `CycleTarget` — Tab the scene by screen-centre score, ` the
   party); `ClearTarget` (Escape) sends nothing. A target that leaves the scene stays targeted.

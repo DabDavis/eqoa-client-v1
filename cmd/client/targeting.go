@@ -120,7 +120,14 @@ func (c *Client) targetChanged() {
 // keys 32 and 134): ToggleAutoAttack. Its release is MaybeStopAutoAttack, at
 // the top of handleInWorldInput. When it engages, the animation layer starts
 // its own combat state for the server's swings.
-func (c *Client) attackPressed() {
+//
+// The keyboard's Space TOGGLES auto-attack — one press on, the next off —
+// as VIGameOptions::m_x95 set does; the pad's X keeps retail's default, which
+// attacks only while held. A tap starts no fight on Sandstorm (its swing
+// comes ~7 s after the 0x000F and finds 0x40 byte 36 back at 0), so a held
+// key is what a keyboard player would otherwise need.
+func (c *Client) attackPressed(keyboard bool) {
+	c.engine.AutoAttackToggle = keyboard
 	c.engine.ToggleAutoAttack()
 	if c.engine.CombatEngaged && !c.animMgr.CombatEngaged {
 		c.animMgr.CombatEngaged = true

@@ -335,12 +335,12 @@ func (c *Client) handleInWorldInput() {
 	}
 
 	// Space: the attack button's press — ToggleAutoAttack, which sends 0x000F
-	// when a swing is due, at any range. Holding it keeps auto-attack on (the
-	// retail default; AutoAttackToggle makes a press toggle). Manual
+	// when a swing is due, at any range. On the keyboard a press toggles
+	// auto-attack (attackPressed); the pad's X attacks while held. Manual
 	// edge-detect because IsKeyPressed fires across multiple frames.
 	spaceDown := rl.IsKeyDown(rl.KeySpace)
 	if spaceDown && !c.spaceWasDown {
-		c.attackPressed()
+		c.attackPressed(true)
 	}
 	c.spaceWasDown = spaceDown
 

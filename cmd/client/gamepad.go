@@ -169,7 +169,7 @@ func (c *Client) handleGamepadInWorld() (inputFwd, inputRight, camDH, camDV floa
 	} else if gpPressed(rl.GamepadButtonRightFaceDown) {
 		// The attack button (the PS2's code 134): ToggleAutoAttack on the press,
 		// MaybeStopAutoAttack on the release (top of handleInWorldInput).
-		c.attackPressed()
+		c.attackPressed(false)
 	}
 
 	// --- Circle (B): Cast spell (if spell bar cursor visible) / Cancel dialogue/menu ---
