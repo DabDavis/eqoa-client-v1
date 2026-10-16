@@ -564,11 +564,21 @@ func handleCommand(engine *game.Engine, line string) {
 			return
 		}
 		search := strings.ToLower(strings.Join(parts[1:], " "))
+		// The current target when its name matches, else the nearest match
+		// (gs.Entities is a map: "the first match" was a random one).
 		var found *game.Entity
-		for _, ent := range gs.Entities {
-			if strings.Contains(strings.ToLower(ent.Name), search) {
-				found = ent
-				break
+		if t := gs.Entities[engine.TargetObjectID]; t != nil && strings.Contains(strings.ToLower(t.Name), search) {
+			found = t
+		} else {
+			best := float32(math.MaxFloat32)
+			for _, ent := range gs.Entities {
+				if !strings.Contains(strings.ToLower(ent.Name), search) {
+					continue
+				}
+				ex, ez := ent.X-gs.Player.X, ent.Z-gs.Player.Z
+				if d := ex*ex + ez*ez; d < best {
+					best, found = d, ent
+				}
 			}
 		}
 		if found == nil {
