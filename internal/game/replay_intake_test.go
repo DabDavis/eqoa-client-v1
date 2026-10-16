@@ -43,7 +43,7 @@ func TestReplayCapturesThroughIntake(t *testing.T) {
 			if len(d) == 0 {
 				t.Skip("no game-server traffic")
 			}
-			summary, panics := replayIntake(t, d)
+			summary, panics := replaySessions(t, d)
 			if out != "" {
 				if err := os.WriteFile(filepath.Join(out, name+".txt"), []byte(summary), 0o644); err != nil {
 					t.Fatal(err)
@@ -113,27 +113,44 @@ func replayReadUDP(t *testing.T, path string, port uint16) (s2c [][]byte) {
 	return s2c
 }
 
-// replayIntake runs the promoted session (the endpoint with the most traffic)
-// through a fresh Connection and GameState and summarises what it left behind.
-func replayIntake(t *testing.T, datagrams [][]byte) (string, int) {
+// replaySessions replays every server endpoint that carries a session (20 or
+// more packets; the lobby's few are skipped) in the order each first appears,
+// each through its own Connection and GameState, and joins their summaries.
+// A capture can hold several game sessions (a new instance is a new
+// endpoint), so picking one by packet count is ambiguous on a tie.
+func replaySessions(t *testing.T, datagrams [][]byte) (string, int) {
 	t.Helper()
 	var pkts []*network.ReceivedPacket
 	count := map[uint16]int{}
+	var order []uint16
 	for _, d := range datagrams {
 		pkt, err := network.ParsePacket(d, nil)
 		if err != nil || pkt.Body == nil {
 			continue
 		}
+		if count[pkt.LocalEndpoint] == 0 {
+			order = append(order, pkt.LocalEndpoint)
+		}
 		pkts = append(pkts, pkt)
 		count[pkt.LocalEndpoint]++
 	}
-	var ep uint16
-	for e, n := range count {
-		if n > count[ep] {
-			ep = e
+	var b strings.Builder
+	panics := 0
+	for _, ep := range order {
+		if count[ep] < 20 {
+			continue
 		}
+		s, n := replayIntake(t, pkts, ep)
+		fmt.Fprintf(&b, "=== endpoint %04X, %d packets\n%s", ep, count[ep], s)
+		panics += n
 	}
+	return b.String(), panics
+}
 
+// replayIntake runs one endpoint's packets through a fresh Connection and
+// GameState and summarises what they left behind.
+func replayIntake(t *testing.T, pkts []*network.ReceivedPacket, ep uint16) (string, int) {
+	t.Helper()
 	c, err := network.NewConnection("127.0.0.1", 9, 0xFFFE)
 	if err != nil {
 		t.Fatal(err)
