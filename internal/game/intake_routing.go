@@ -9,7 +9,6 @@ package game
 
 import (
 	"encoding/binary"
-	"fmt"
 	"log"
 	"unicode/utf16"
 
@@ -109,13 +108,7 @@ func (gs *GameState) noteSelf(msg *protocol.Message) {
 // guild, the buddy list and two sub-objects (+0x382E8, +0x38300) there; those
 // belong to their own handlers here.
 func (gs *GameState) resetWorld() {
-	for ch := range gs.entitySlots {
-		gs.entitySlots[ch] = entitySlot{}
-	}
-	for id := range gs.Entities {
-		gs.removeEntity(id)
-	}
-	gs.ChannelEntity = [29]uint32{}
+	gs.dropEntities()
 	gs.ChannelRecs = [40]ChannelRec{}
 	gs.selfKnown = false
 	log.Printf("Connect: a session the server opened (0xFF), world reset")
@@ -150,28 +143,23 @@ func (gs *GameState) handleBestEffort(msg *protocol.Message) {
 // handleDRDPDisconnect is the pump's 0xFD: the connection has ended, and the
 // reason byte the DRDP library terminated it with is mapped to the client's
 // own reason (1 -> 1, 14 -> 16, 15 -> 15, anything else -> 10) for
-// Disconnect. Byte 1 is an ICMP unreachable, 14 a peer on another protocol
-// version, 15 an empty segment (the route closed), 2/3 the warn and fail
-// timeouts, 6 a reset from the far end.
+// Disconnect, which DisconnectFromDRDP runs. Byte 1 is an ICMP unreachable,
+// 14 a peer on another protocol version, 15 an empty segment (the route
+// closed), 2/3 the warn and fail timeouts, 6 a reset from the far end.
 func (gs *GameState) handleDRDPDisconnect(msg *protocol.Message) {
 	var b byte
 	if d := msg.Data(); len(d) > 0 {
 		b = d[0]
 	}
 	gs.DRDPReason = int(b)
-	reason := 10
-	switch b {
-	case 1:
-		reason = 1
-	case 14:
-		reason = 16
-	case 15:
-		reason = 15
-	}
-	log.Printf("Disconnect-11: connection terminated (DRDP reason %d), disconnect reason %d", b, reason)
-	gs.DisconnectReason = reason
-	// Disconnect (0x00BC1720): the entities go and the game window gives
-	// way to the disconnect window, which reads the reason.
+	log.Printf("Disconnect-11: connection terminated (DRDP reason %d)", b)
+	gs.DisconnectFromDRDP(b)
+	gs.DisconnectReason = gs.Session.Disconnect.Reason
+}
+
+// dropEntities is Disconnect's (0x00BC1720) teardown of the scene: every
+// entity and every slot goes.
+func (gs *GameState) dropEntities() {
 	for ch := range gs.entitySlots {
 		gs.entitySlots[ch] = entitySlot{}
 	}
@@ -179,8 +167,6 @@ func (gs *GameState) handleDRDPDisconnect(msg *protocol.Message) {
 		gs.removeEntity(id)
 	}
 	gs.ChannelEntity = [29]uint32{}
-	gs.Phase = PhaseDisconnected
-	gs.StatusMsg = fmt.Sprintf("Disconnected from the server (reason %d)", reason)
 }
 
 // channelEntity is ChannelEntity: state channels 0x00..0x17.

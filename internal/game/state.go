@@ -610,9 +610,8 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleCamera2(msg)
 	case protocol.OpcodeCharacterSelect:
 		gs.handleCharacterSelect(msg)
-	case protocol.OpcodeNameTaken:
-		gs.CreateError = "Name is already taken"
-		log.Printf("NameTaken: server rejected character name")
+	case protocol.OpcodeNameTaken: // 0x002F: create failed, word 829
+		gs.handleNameTaken(msg)
 	case protocol.OpcodeTime:
 		gs.handleTime(msg)
 	case protocol.OpcodeMemoryDump:
@@ -754,8 +753,6 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handlePlayEffect(msg)
 	case protocol.OpcodeSkillBarAck:
 		gs.handleSkillBarAck(msg)
-	case protocol.OpcodeNPCInteractResult:
-		gs.handleNPCInteractResult(msg)
 
 	// Item durability / blacksmith
 	case protocol.OpcodeAdjustItemHP:
@@ -863,9 +860,14 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 	case protocol.OpcodeCombatEnd:
 		gs.handleCombatEnd(msg)
 
-	// Disconnect opcodes — log prominently for debugging
-	case protocol.OpcodeCharacterModifiedDisconnect,
-		protocol.OpcodeDisconnectClient, protocol.OpcodeLoggedInFromAnotherLocationDC:
+	// The dispatcher's Disconnect(reason, 0) cases (disconnectReasons,
+	// intake_session.go): 0x0729 3, 0x072B 4, 0x072A 7, 0x07A4 8, 0x07D2 19.
+	case protocol.GameOpcode(0x0729), protocol.GameOpcode(0x072B), protocol.GameOpcode(0x072A),
+		protocol.OpcodeLoggedInFromAnotherLocationDC, protocol.OpcodeCharacterModifiedDisconnect:
+		gs.handleServerDisconnect(msg)
+
+	// 0x09B0 is the client's own disconnect; CLIENT's dispatcher has no case.
+	case protocol.OpcodeDisconnectClient:
 		log.Printf("*** SERVER DISCONNECT: opcode=0x%04X dataLen=%d ***", uint16(opcode), len(msg.Data()))
 		if len(msg.Data()) > 2 {
 			log.Printf("*** DISCONNECT DATA: %X ***", msg.Data())
@@ -876,10 +878,12 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		// Silent
 	case protocol.OpcodeServerReady:
 		// Silent — server keepalive/ready signal, no payload
-	case protocol.OpcodeIgnoreList:
-		// Silent
-	case protocol.OpcodeWorldUnavailable:
-		log.Printf("WorldUnavailable: server reports world unavailable")
+	case protocol.GameOpcode(0x1003), protocol.GameOpcode(0x1004), protocol.OpcodeIgnoreList:
+		// Msg1003/1004/1005: the no-collide list (0x1005 is not the ignore list)
+		gs.handleNoCollide(msg)
+	case protocol.GameOpcode(0x07F2), protocol.OpcodeWorldUnavailable:
+		// 0x07F2 and 0x07F3: char-select messages, words 1662 and 676
+		gs.handleCharSelectMsg(msg)
 
 	// Catch-all: everything else is already logged by logOpcode above
 	default:
@@ -1503,7 +1507,7 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 	// that many ReadString(m_questTitle[i], 256). CLIENT does not clamp the
 	// count (a ninth title would run over the count itself); here every
 	// title is read and the first eight kept.
-	reader.ReadInt32() // +0x2BB60
+	gs.AbilityStamp, _ = reader.ReadUint32() // +0x2BB60
 	reader.ReadInt32() // +0x2BB0C
 	questCount, err := reader.ReadUint32()
 	if err != nil {

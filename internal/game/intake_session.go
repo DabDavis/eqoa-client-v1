@@ -275,6 +275,7 @@ func (gs *GameState) serverDisconnect(reason int, quiet bool) {
 	if !quiet {
 		d.Text = gs.ConnectStatusString(reason, d.Code, d.HasCode)
 	}
+	gs.dropEntities()
 	gs.Phase = PhaseDisconnected
 	gs.StatusMsg = d.Text
 	log.Printf("*** SERVER DISCONNECT: reason=%d quiet=%v kind=%d %q ***",

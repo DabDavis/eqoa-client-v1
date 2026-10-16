@@ -481,6 +481,11 @@ func (gs *GameState) dispatchIncoming(msg *protocol.Message) {
 		}
 	}()
 
+	// Disconnect destroys the DRDP object, so the pump's loop condition
+	// (m_drdp) ends it: nothing after a disconnect is read.
+	if gs.Session.Disconnect.Pending {
+		return
+	}
 	// VIClient::PumpMessages (0x00BD4C10): one switch on the DRDP type.
 	switch t := msg.Type; {
 	case t == protocol.MessageTypeConnect:

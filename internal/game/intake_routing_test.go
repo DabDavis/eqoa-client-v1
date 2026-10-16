@@ -369,11 +369,21 @@ func TestPumpRoutesByType(t *testing.T) {
 	// The terminate byte becomes the client's own reason.
 	for _, c := range []struct{ b, reason int }{{1, 1}, {14, 16}, {15, 15}, {6, 10}, {3, 10}} {
 		gs.Phase = PhaseInWorld
+		gs.Session.Disconnect = DisconnectState{} // each case is a fresh session
 		fd := &protocol.Message{Type: protocol.MessageTypeDisconnect}
 		fd.SetData([]byte{byte(c.b)})
 		gs.dispatchIncoming(fd)
 		if gs.Phase != PhaseDisconnected || gs.DisconnectReason != c.reason || gs.DRDPReason != c.b {
 			t.Fatalf("0xFD %d: phase %v reason %d", c.b, gs.Phase, gs.DisconnectReason)
 		}
+	}
+
+	// After a disconnect the pump reads nothing more (m_drdp is gone).
+	gs.Phase = PhaseInWorld
+	again := &protocol.Message{Type: protocol.MessageTypeDisconnect}
+	again.SetData([]byte{1})
+	gs.dispatchIncoming(again)
+	if gs.Phase != PhaseInWorld {
+		t.Fatalf("a message after the disconnect was dispatched")
 	}
 }
