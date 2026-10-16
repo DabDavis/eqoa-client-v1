@@ -352,6 +352,9 @@ type Client struct {
 	// Current world ID — 0=Tunaria (default), changes via MemoryDump/Teleport
 	currentWorld byte
 
+	// arrival is a Respawn placement waiting for its zone (arrival.go).
+	arrival *game.Arrival
+
 	// --offline mode (offline.go); nil in a normal session.
 	offline *offlineConfig
 
@@ -1066,6 +1069,7 @@ func runClient() {
 					client.handleCharSelectInput()
 				}
 			case game.PhaseInWorld:
+				client.updateArrival()
 				client.handleInWorldInput()
 			}
 
@@ -1100,6 +1104,7 @@ func runClient() {
 			case game.PhaseInWorld:
 				// Always call drawWorld so terrain zone detection + loading runs
 				client.drawWorld()
+				client.drawFade()
 				if client.loadScrFade > 0 {
 					client.loadScrAngle += 60.0 * rl.GetFrameTime()
 					// Fade alpha: opaque for first 3s, fade out over last 1s

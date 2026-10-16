@@ -224,3 +224,22 @@ func (s *System) SetAmbient(track int32, tracks map[int32]*AmbientTrack, rain, o
 		}
 	}
 }
+
+// StopSoundTrack is VIScene::StopSoundTrack (viscene.cpp:718), which CLIENT
+// calls as the player arrives anywhere (Msg000D, Respawn, MoveTo): both
+// slots stop and are cleared, and the next SetAmbient takes its track at
+// once, as before the first one ever (m_p00 = 1), at full volume.
+func (s *System) StopSoundTrack() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ambVoices[0].stop()
+	s.ambVoices[1].stop()
+	if s.ambMix.inited {
+		s.ambMix.slot[0].clear()
+		s.ambMix.slot[1].clear()
+		s.ambMix.first = true
+	}
+}

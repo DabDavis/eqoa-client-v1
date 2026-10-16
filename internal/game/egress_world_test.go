@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/eqoa/client/internal/network"
+	"github.com/eqoa/client/internal/protocol"
 )
 
 // These pin the world lane of the egress pass to CLIENT: the entity motion
@@ -160,6 +161,60 @@ func TestCreatureStepsAndIsSetDown(t *testing.T) {
 	gs.UpdateEntityMotion()
 	if p := gs.Entities[0x44]; p == nil || !nearf(p.X, 7) || probes != before+1 {
 		t.Fatalf("plain entity: %+v, probes %d (one, the creature's)", p, probes-before)
+	}
+}
+
+// A 0x00B2 keeps the entities (Respawn → EnterWorld keeps m_entities) and
+// leaves an arrival for the visual client: a cast of reach 3, the follow
+// stopped. The MemoryDump's arrival has no cast, and fades in from black.
+func TestTeleportKeepsEntitiesAndArrives(t *testing.T) {
+	gs, _ := motionState(t)
+	feed(gs, 3, creatureAt(0x45, 1, 2, 3, 0, [3]int8{}))
+	b := []byte{0xB2, 0x00, 0}
+	for _, f := range []float32{100, 20, 300, 1.5, 0, 0} {
+		u := math.Float32bits(f)
+		b = append(b, byte(u), byte(u>>8), byte(u>>16), byte(u>>24))
+	}
+	b = append(b, 7, 0, 0, 0)
+	msg := &protocol.Message{Type: protocol.MessageTypeReliable}
+	msg.SetData(b)
+	gs.handleTeleport(msg)
+	if gs.Entities[0x45] == nil {
+		t.Fatal("0x00B2 dropped the entities")
+	}
+	a := gs.TakeArrival()
+	if a == nil || a.Reach != 3 || !a.StopFollow || a.X != 100 || a.Y != 20 || a.Z != 300 {
+		t.Fatalf("arrival %+v", a)
+	}
+	if gs.TakeArrival() != nil {
+		t.Fatal("the arrival was handed over twice")
+	}
+}
+
+// SetFade(1, 0) then SetFade(0, 1), as Msg000D does: black at once, clear a
+// second later, linearly; a frame over a tenth of a second counts as 1/30.
+func TestFadeInFromBlack(t *testing.T) {
+	gs, _ := motionState(t)
+	gs.SetFade(1, 0)
+	gs.SetFade(0, 1)
+	if a := gs.AdvanceFade(0); a != 1 {
+		t.Fatalf("alpha %v at once, want 1", a)
+	}
+	var a float32
+	for i := 0; i < 10; i++ {
+		a = gs.AdvanceFade(0.05)
+	}
+	if !nearf(a, 0.5) {
+		t.Fatalf("alpha %v after half a second, want 0.5", a)
+	}
+	if a := gs.AdvanceFade(5); !nearf(a, 0.5-1.0/30) {
+		t.Fatalf("alpha %v after a long frame, want %v (1/30 s)", a, 0.5-1.0/30)
+	}
+	for i := 0; i < 20; i++ {
+		a = gs.AdvanceFade(0.05)
+	}
+	if a != 0 {
+		t.Fatalf("alpha %v at the end, want 0 (no overshoot)", a)
 	}
 }
 

@@ -370,6 +370,11 @@ type GameState struct {
 	// down (the headless tool).
 	CreatureFloorFunc func(x, y, z float32) (float32, bool)
 
+	// PendingArrival is the arrival the visual client has yet to take
+	// (arrival.go); Fade is the screen fade.
+	PendingArrival *Arrival
+	Fade           ScreenFade
+
 	// NoCreatureSteps and NoEntityBlend are CLIENT's m_p2BD48 and m_p2BD4C
 	// cleared — the console's switches for UpdateCreatures' steps and
 	// Extrapolate's blend. Both are on (false here) from the constructor.
@@ -607,6 +612,7 @@ func NewGameState(host string, gamePort, authPort, patchPort int, username strin
 		SelectedChar:      -1,         // no character selected yet
 		itemLists:         newItemLists(),
 		stateChannelCount: make(map[byte]int),
+		Fade:              ScreenFade{Color: [4]float32{0, 0, 0, 1}},
 	}
 	return gs
 }
@@ -1479,6 +1485,15 @@ func (gs *GameState) handleMemoryDump(msg *protocol.Message) {
 	gs.parseMemoryDumpRemainder(reader)
 
 	gs.MemoryDumpCount++
+
+	// Msg000D puts the walker where the dump says (SetLocation, no cast),
+	// stops the battle music and the sound track, and fades in from black:
+	// SetFade(1, 0) then SetFade(0, 1), after a "respawn" cue (PlayCue,
+	// silent on the retail disc: no resident file holds a sound by that
+	// name).
+	gs.arrive(Arrival{World: newWorld, X: x, Y: y, Z: z, Heading: facing})
+	gs.SetFade(1, 0)
+	gs.SetFade(0, 1)
 	gs.Phase = PhaseInWorld
 	gs.StatusMsg = "In world"
 
@@ -1867,19 +1882,9 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 	gs.DialogueOptions = nil
 	gs.MerchantOpen = false // CLIENT closes the merchant (and the bank, trade, loot)
 
-	// Clear all entities from previous zone — PS2 VIEntity visibility is purely
-	// state-channel-driven, so old entities are invalid after zone transition.
-	oldCount := len(gs.Entities)
-	for id := range gs.Entities {
-		gs.SpellFXSys.NotifyActorWasDestroyed(id)
-	}
-	gs.Entities = make(map[uint32]*Entity)
-	gs.ChannelEntity = [29]uint32{}
-
-	// Reset state channel debug counters for entity channels
-	for ch := byte(1); ch <= 28; ch++ {
-		delete(gs.stateChannelCount, ch)
-	}
+	// The entities stay. Respawn → EnterWorld → LoadWorld keep m_entities,
+	// even across a world load (each is told OnWorldLoaded); the server
+	// removes the ones it no longer sends (flag 0 on their channels).
 
 	// Do NOT reset XOR delta bases on teleport. The server's XOR base
 	// (stc.seqnum2) still references our last ACK'd sequence. If we clear
@@ -1908,8 +1913,13 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 	}
 	gs.Player.World = world
 
-	log.Printf("Teleport: world=%d pos=(%.1f, %.1f, %.1f) facing=%.2f — cleared %d entities",
-		world, x, y, z, facing, oldCount)
+	// Respawn's placement: the walker is set down on the floor a sphere cast
+	// ±3 about the point finds, the follow is stopped, and the music and
+	// the camera go as at any arrival (arrival.go).
+	gs.arrive(Arrival{World: world, X: x, Y: y, Z: z, Heading: facing, Reach: 3, StopFollow: true})
+
+	log.Printf("Teleport: world=%d pos=(%.1f, %.1f, %.1f) facing=%.2f — %d entities kept",
+		world, x, y, z, facing, len(gs.Entities))
 }
 
 // handlePlayerSpeed is 0x00F8: a raw float into m_speed and SetSpeed — the

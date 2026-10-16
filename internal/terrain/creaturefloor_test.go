@@ -37,3 +37,18 @@ func TestCreatureFloorReach(t *testing.T) {
 		t.Error("a ceiling 1 above set the creature down on it")
 	}
 }
+
+// Respawn's cast (reach 3) puts the feet 0.1 under a floor it meets, and 0.2
+// under the sweep's end when it meets none.
+func TestArrivalFloor(t *testing.T) {
+	zt := stripZone(levelQuad(5, -5, 5, -5, 5, false))
+	if y := zt.ArrivalFloor(0, 7, 0, 3); !near(y, 4.9) {
+		t.Errorf("2 above the floor: feet at %.3f, want 4.9", y)
+	}
+	if y := zt.ArrivalFloor(0, 3, 0, 3); !near(y, 4.9) {
+		t.Errorf("2 under the floor: feet at %.3f, want 4.9 (the cast starts 3 above)", y)
+	}
+	if y := zt.ArrivalFloor(0, 20, 0, 3); !near(y, 16.8) {
+		t.Errorf("nothing in reach: feet at %.3f, want 16.8 (3.2 under the point)", y)
+	}
+}
