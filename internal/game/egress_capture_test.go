@@ -203,13 +203,20 @@ func egressFromCapture(t *testing.T, name string) (msgs []egressMsg, undecoded i
 func egressAll(t *testing.T) []egressMsg {
 	t.Helper()
 	var all []egressMsg
+	found := 0
 	for _, name := range egressCaptures {
 		path := filepath.Join("..", "..", "..", "pcaps", name)
 		if _, err := os.Stat(path); err != nil {
 			continue
 		}
+		found++
 		m, _ := egressFromCapture(t, name)
 		all = append(all, m...)
+	}
+	// The captures live in the project's pcaps/, beside the repo, not in it;
+	// CI (and a bare clone) has none, and a test pinned to them skips there.
+	if found == 0 {
+		t.Skip("no captures in ../pcaps")
 	}
 	return all
 }
