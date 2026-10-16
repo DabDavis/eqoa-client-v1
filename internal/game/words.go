@@ -78,6 +78,7 @@ var retailWords = map[int]string{
 	620:  "Server not ready, please try again later. (nodbs)",
 	621:  "Server not ready, please try again later. (loginto)",
 	625:  "You have received more training points!",
+	626:  "%s wants to trade with you, but you are busy.",
 	627:  "Recipient not found.",
 	628:  "%s is already in a group.",
 	630:  "The group leader has ejected you.",
@@ -92,8 +93,12 @@ var retailWords = map[int]string{
 	648:  "Messages from your guild are hidden.",
 	649:  "%s sends you a buddy list invitation, but you are busy.",
 	650:  "%s sends you a guild invitation, but you are busy.",
+	651:  "%s is busy and cannot accept trades.",
 	666:  "The server that you were connected to is currently unavailable.  Try back again later",
 	667:  "Connection problem or server currently unavailable",
+	673:  "That corpse is already being looted by another player",
+	674:  "That entity is not lootable",
+	675:  "That corpse belongs to another player or group",
 	676:  "That character is in an area of the world that is currently unavailable.  Please try again later.",
 	677:  "Your character is in an area of the world that is temporarily unavailable.",
 	716:  "You have been ejected by a server administrator.",
@@ -101,6 +106,9 @@ var retailWords = map[int]string{
 	718:  "We are updating the game, please try again later.",
 	719:  "Disconnected (server restarted).",
 	721:  "You have gained a new ability.",
+	733:  "Trade invalid: you don't have enough inventory space for that many items.",
+	734:  "Trade invalid: you can't stack enough of one of those items.",
+	735:  "Trade invalid: you already have an offered lore item.",
 	745:  "\"Member\" is the lowest rank and cannot be demoted.",
 	758:  "Connecting...",
 	819:  "Code",
@@ -144,4 +152,32 @@ func (gs *GameState) wordText(n int) string {
 		return s
 	}
 	return fmt.Sprintf("#%d", n)
+}
+
+// wordFormat is the part of VIString::snprintf16 the words use: %s and %S
+// take a string, %d and %u a number, %% is a percent sign.
+func wordFormat(format string, args ...interface{}) string {
+	var b strings.Builder
+	a := 0
+	for i := 0; i < len(format); i++ {
+		c := format[i]
+		if c != '%' || i+1 == len(format) {
+			b.WriteByte(c)
+			continue
+		}
+		i++
+		switch format[i] {
+		case 's', 'S', 'd', 'u':
+			if a < len(args) {
+				fmt.Fprint(&b, args[a])
+				a++
+			}
+		case '%':
+			b.WriteByte('%')
+		default:
+			b.WriteByte('%')
+			b.WriteByte(format[i])
+		}
+	}
+	return b.String()
 }

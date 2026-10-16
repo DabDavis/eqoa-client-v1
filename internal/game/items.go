@@ -628,19 +628,6 @@ func fitsQuickSlot3(w int64) bool {
 	return false
 }
 
-// itemWords are the WORDS.TXT strings these handlers show, from the retail
-// disc. GameState has no word table of its own; the client's is cmd/client's.
-var itemWords = map[int]string{
-	626: "%s wants to trade with you, but you are busy.",
-	651: "%s is busy and cannot accept trades.",
-	673: "That corpse is already being looted by another player",
-	674: "That entity is not lootable",
-	675: "That corpse belongs to another player or group",
-	733: "Trade invalid: you don't have enough inventory space for that many items.",
-	734: "Trade invalid: you can't stack enough of one of those items.",
-	735: "Trade invalid: you already have an offered lore item.",
-}
-
 // tradeName is VIClient::TradeName (0x00BCCCB8)'s lookup, with the fallback
 // the caller passes: the entity's name, or that.
 func (gs *GameState) tradeName(id uint32, fallback string) string {

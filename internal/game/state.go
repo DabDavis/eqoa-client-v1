@@ -2048,7 +2048,7 @@ func (gs *GameState) handleGroupInvite(msg *protocol.Message) {
 	gs.GroupInviter = gs.GroupInvites[0].Name
 	log.Printf("GroupInvite: %s (id=0x%08X x=0x%08X), %d pending", name, id, x, len(gs.GroupInvites))
 	if !gs.socialBusy() {
-		gs.socialLine(socialFormat(gs.wordText(636), name), ChatSystem, socialWhite)
+		gs.socialLine(wordFormat(gs.wordText(636), name), ChatSystem, socialWhite)
 	}
 }
 
@@ -3858,7 +3858,7 @@ func (gs *GameState) handleGuildInfo(msg *protocol.Message) {
 	case 15:
 		who := s.str8(24)
 		added := s.str8(24)
-		gs.socialLine(socialFormat(gs.wordText(717), who, added), ChatGuild, socialWhite)
+		gs.socialLine(wordFormat(gs.wordText(717), who, added), ChatGuild, socialWhite)
 	default:
 		log.Printf("GuildInfo: sub-type %d ignored (%d bytes)", sub, len(msg.Data()))
 	}

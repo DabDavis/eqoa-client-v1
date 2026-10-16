@@ -10,10 +10,8 @@ package game
 
 import (
 	"encoding/binary"
-	"fmt"
 	"log"
 	"sort"
-	"strings"
 	"unicode/utf16"
 
 	"github.com/eqoa/client/internal/protocol"
@@ -287,34 +285,6 @@ type SocialState struct {
 // string 567 (data_00CD7A50).
 const guildCreateCost = 5000
 
-// socialFormat is the part of VIString::snprintf16 the words use: %s and %S
-// take a string, %d and %u a number, %% is a percent sign.
-func socialFormat(format string, args ...interface{}) string {
-	var b strings.Builder
-	a := 0
-	for i := 0; i < len(format); i++ {
-		c := format[i]
-		if c != '%' || i+1 == len(format) {
-			b.WriteByte(c)
-			continue
-		}
-		i++
-		switch format[i] {
-		case 's', 'S', 'd', 'u':
-			if a < len(args) {
-				fmt.Fprint(&b, args[a])
-				a++
-			}
-		case '%':
-			b.WriteByte('%')
-		default:
-			b.WriteByte('%')
-			b.WriteByte(format[i])
-		}
-	}
-	return b.String()
-}
-
 // The chat colours CLIENT passes as VIColor32F, as bytes.
 var (
 	socialWhite = [3]uint8{255, 255, 255} // AddText's default (data_00CF5458, set to 1,1,1,1)
@@ -458,7 +428,7 @@ func (gs *GameState) handleGroupStuff(msg *protocol.Message) {
 		gs.socialShowWord(627)
 	case 1, 2, 4, 5:
 		name := s.str8(24)
-		gs.socialShowText(socialFormat(gs.wordText(word[sub]), name))
+		gs.socialShowText(wordFormat(gs.wordText(word[sub]), name))
 	default:
 		log.Printf("GroupStuff: sub %d ignored", sub)
 	}
@@ -488,7 +458,7 @@ func (gs *GameState) handleGroupInviteCancel(msg *protocol.Message) {
 func (gs *GameState) handleGroupInviteAccepted(msg *protocol.Message) {
 	s := newSocialStream(msg)
 	name := s.str8(24)
-	gs.socialShowText(socialFormat(gs.wordText(557), name))
+	gs.socialShowText(wordFormat(gs.wordText(557), name))
 }
 
 // --- buddies -----------------------------------------------------------------

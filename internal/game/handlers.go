@@ -17,8 +17,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/eqoa/client/internal/protocol"
 	"github.com/DabDavis/eqoa-esf-tools/pkg/buffer"
+	"github.com/eqoa/client/internal/protocol"
 )
 
 // =============================================================================
@@ -250,7 +250,7 @@ func (gs *GameState) handleGuildWorldEntry(msg *protocol.Message) {
 		case 2:
 			gs.socialShowWord(566)
 		case 6:
-			gs.socialShowText(socialFormat(gs.wordText(567), guildCreateCost))
+			gs.socialShowText(wordFormat(gs.wordText(567), guildCreateCost))
 		case 7:
 			gs.socialShowWord(568)
 		}
@@ -298,9 +298,10 @@ func (gs *GameState) handleStatsUpdate(msg *protocol.Message) {
 // (0x00BE71B0), whose sub-handlers are not decompiled: the labels below are
 // the old Ghidra reading, unverified, and nothing reads the state they set.
 // PS2 FUN_00BE71B0: reads 1-byte sub-type, dispatches to state machine:
-//   0=init (guard state==3), 1=ready (guard state==5),
-//   2=zone data (guard state==1), 3=zone resource (guard state==2),
-//   4=complete (guard state==4), 5=abort, 6=extra handler
+//
+//	0=init (guard state==3), 1=ready (guard state==5),
+//	2=zone data (guard state==1), 3=zone resource (guard state==2),
+//	4=complete (guard state==4), 5=abort, 6=extra handler
 func (gs *GameState) handleZoneTransferInit(msg *protocol.Message) {
 	data := msg.Data()
 	payload := data[2:] // skip opcode
@@ -715,7 +716,7 @@ func (gs *GameState) handleLootOptions(msg *protocol.Message) {
 		return
 	}
 	if id := map[byte]int{1: 673, 2: 674, 3: 675}[d[2]]; id != 0 {
-		gs.addChatMessage(itemWords[id], ChatSystem)
+		gs.addChatMessage(gs.wordText(id), ChatSystem)
 	}
 }
 
@@ -837,15 +838,15 @@ func (gs *GameState) handleTradeUI(msg *protocol.Message) {
 		gs.tradeReset()
 	case 20: // Trade20
 		if gs.tradeAsked && gs.tradeEntity != 0xFFFFFFFF {
-			gs.addChatMessage(fmt.Sprintf(itemWords[651], gs.tradeName(gs.tradeEntity, "Unknown")), ChatSystem)
+			gs.addChatMessage(wordFormat(gs.wordText(651), gs.tradeName(gs.tradeEntity, "Unknown")), ChatSystem)
 		}
 		gs.tradeReset()
 	case 17:
-		gs.addChatMessage(itemWords[733], ChatError)
+		gs.addChatMessage(gs.wordText(733), ChatError)
 	case 21:
-		gs.addChatMessage(itemWords[734], ChatError)
+		gs.addChatMessage(gs.wordText(734), ChatError)
 	case 22:
-		gs.addChatMessage(itemWords[735], ChatError)
+		gs.addChatMessage(gs.wordText(735), ChatError)
 	case 2: // Trade02
 		gs.TradePartner = id
 		log.Printf("TradeUI: a trade with 0x%08X opened, and there is no trade window", id)
@@ -867,7 +868,7 @@ func (gs *GameState) handleTradeRequest(msg *protocol.Message) {
 	}
 	partner := binary.LittleEndian.Uint32(d[2:6])
 	gs.TradePartner, gs.tradeEntity = partner, binary.LittleEndian.Uint32(d[6:10])
-	gs.addChatMessage(fmt.Sprintf(itemWords[626], gs.tradeName(gs.tradeEntity, "Someone")), ChatSystem)
+	gs.addChatMessage(wordFormat(gs.wordText(626), gs.tradeName(gs.tradeEntity, "Someone")), ChatSystem)
 	if gs.Conn != nil {
 		decline := make([]byte, 5) // SendOpByteInt(86, 20, partner)
 		decline[0] = 20
@@ -917,7 +918,7 @@ func (gs *GameState) handleGuildInviteStuff(msg *protocol.Message) {
 		}
 		switch {
 		case gs.socialBusy():
-			gs.socialShowText(socialFormat(gs.wordText(650), name))
+			gs.socialShowText(wordFormat(gs.wordText(650), name))
 			reply(2)
 		case gs.InGuild:
 			reply(4)
@@ -929,7 +930,7 @@ func (gs *GameState) handleGuildInviteStuff(msg *protocol.Message) {
 	case 2:
 		s.zigzag()
 		name := s.str8(24)
-		gs.socialShowText(socialFormat(gs.wordText(557), name))
+		gs.socialShowText(wordFormat(gs.wordText(557), name))
 	case 3:
 		code := s.u8()
 		name := s.str8(24)
@@ -937,7 +938,7 @@ func (gs *GameState) handleGuildInviteStuff(msg *protocol.Message) {
 		if !ok {
 			word = 558
 		}
-		gs.socialShowText(socialFormat(gs.wordText(word), name))
+		gs.socialShowText(wordFormat(gs.wordText(word), name))
 	default:
 		log.Printf("GuildInvite: sub-type %d ignored", sub)
 	}
@@ -960,7 +961,7 @@ func (gs *GameState) handleBuffNotification(msg *protocol.Message) {
 	gs.BuddyRequestName = name
 	switch {
 	case gs.socialBusy():
-		gs.socialShowText(socialFormat(gs.wordText(649), name))
+		gs.socialShowText(wordFormat(gs.wordText(649), name))
 		gs.socialSendMsg(protocol.GameOpcode(0x0368), id, 1)
 		gs.BuddyRequestID = 0xFFFFFFFF
 	case len(gs.Buddies) >= 32:
@@ -1022,7 +1023,7 @@ func (gs *GameState) handleBuddyListStuff(msg *protocol.Message) {
 		log.Printf("InviteResult: code %d from %q not shown", code, name)
 		return
 	}
-	gs.socialShowText(socialFormat(gs.wordText(word), name))
+	gs.socialShowText(wordFormat(gs.wordText(word), name))
 }
 
 // handleFactionPage is 0x07E2, VIClientPart4F078::Recv07E2 (0x00BEA820): a
@@ -1115,7 +1116,7 @@ func (gs *GameState) handleClassMasteryServer(msg *protocol.Message) {
 		}
 		if old := gs.CMPoints; points > old {
 			if n := points - old; n >= 2 {
-				gs.socialShowText(socialFormat(gs.wordText(1627), n))
+				gs.socialShowText(wordFormat(gs.wordText(1627), n))
 			} else {
 				gs.socialShowWord(1628)
 			}
@@ -1329,9 +1330,10 @@ func (gs *GameState) handleConfirmBankTunar(msg *protocol.Message) {
 // handleAuctionStuff handles opcode 0x1206 — auction data.
 // Small (7 bytes): sub(0x81) + page + 5 zeros = status/ack.
 // Large (5000+ bytes, reassembled from fragments): item listings.
-//   Header: sub(0x81) + page(byte) + unk(byte) + itemCount(byte)
-//   Per item: sellerNameLen(uint32) + sellerName(ASCII) + item fields (parseSingleItem)
-//             + currentBid(zigzag) + buyoutPrice(zigzag)
+//
+//	Header: sub(0x81) + page(byte) + unk(byte) + itemCount(byte)
+//	Per item: sellerNameLen(uint32) + sellerName(ASCII) + item fields (parseSingleItem)
+//	          + currentBid(zigzag) + buyoutPrice(zigzag)
 func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 	data := msg.Data()
 	if len(data) < 3 {
