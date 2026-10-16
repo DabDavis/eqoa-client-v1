@@ -756,9 +756,22 @@ index 7 is the current HP), 0x43 effects (u32 count ≤ 8, 132-byte records: ico
 
 ## Combat System (verified on Sandstorm)
 
-- **Attack (0x000F)**: Auto-attack at 4s intervals
-- **UseSkill (0x0032)**: the ability stamp (u32, 0 on Sandstorm), then byte 4 = WhereOnHotBar (0-9), then the target
-- **ForcePositionFlush**: Must call after SendTarget before combat opcodes (server reads target from 0x40 bytes 37-40)
+- **The client's own combat is CLIENT's** (`internal/game/combat.go`, pinned to the captures
+  and to CLIENT's code in `egress_combat_test.go`): the attack button is `ToggleAutoAttack`
+  on the press and `MaybeStopAutoAttack` on the release — retail's option attacks only while
+  it is held, so **0x40 byte 36 (m_autoAttack) pulses**. **0x000F (u32 target) goes out only
+  when the swing is due**, at any range, with no walking to the target; the server runs the
+  fight from there. `AutoAttackTick` plays the swing's own effect in reach (GetSwing:
+  Attack1-4 / Range1-4, 3-6 s) and sends nothing; out of reach the character swings, **0x00D8**
+  (bare) goes out and the next try waits 2 s.
+- **Targets**: every change is 0x0010 {u32 0, u32 target} and turns auto-attack off
+  (`SetTarget`, `SelectTarget`, `CycleTarget` — Tab the scene by screen-centre score, ` the
+  party); `ClearTarget` (Escape) sends nothing. A target that leaves the scene stays targeted.
+- **Interact** (X): 0x004C merchant, 0x124D banker, 0x0061 blacksmith, 0x0004 anything else,
+  nothing for a player. **Emotes** are opcodes (0x001E wave, 0x0042 bow, 0x0043 point, 0x0044
+  cheer). `/follow` follows group members only.
+- **UseSkill (0x0032)**: the ability stamp (u32, 0 on Sandstorm), then byte 4 = WhereOnHotBar (0-9), then the target (always m_target)
+- **ForcePositionFlush** is not needed by any combat message: 0x0010, 0x000F and 0x0032 each carry the target
 - **DamageIndication (0x00DB)**: u32 attacker, zigzag amount, u32 defender (+ S2's optional RGB). CLIENT draws |amount|: over the defender when I attacked (white), else over ME (yellow); green when positive
 - **CastingCombat (0x00B1)**: caster(4) + target(4) + n(1) + n × secondary id(4) + time ms(4) + effect(4) — 17 bytes with no secondaries
 - **The ability messages** (`abilities.go`): 0x00B3 add (insert-only), 0x00B4 the echo of 0x0033 (memorize ⇄ forget, by DISPLAY index), 0x00B5/B6 slot/display moves, 0x00B8 erase, 0x00CD lockout, 0x00FD +0x14, 0x00FF clear the bar. Not entity messages
