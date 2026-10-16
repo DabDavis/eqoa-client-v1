@@ -769,7 +769,7 @@ func handleCommand(engine *game.Engine, line string) {
 		}
 		item := gs.ParsedItems[slot]
 		fmt.Printf("InteractItem: slot=%d name=%q equipLoc=%d\n", slot, item.Name, item.EquipLocation)
-		engine.SendInteractItem(slot)
+		engine.SendInteractItem(int(item.Key)) // VIClient::UseItem sends the record's key
 
 	case "weaponbar", "wb":
 		// Equipment hotbar swap: PS2 sends PrepareItem (0x000A) with slot + action byte

@@ -3235,8 +3235,7 @@ func (c *Client) handleMerchantInput() {
 	// Cross/A or Enter: buy selected item
 	if rl.IsKeyPressed(rl.KeyEnter) || (gpAvailable() && gpPressed(rl.GamepadButtonRightFaceDown)) {
 		if gs.MerchantSelected >= 0 && gs.MerchantSelected < len(gs.MerchantItems) {
-			item := &gs.MerchantItems[gs.MerchantSelected]
-			if item.ItemCost <= gs.Tunar {
+			if gs.MerchantPrice(gs.MerchantSelected) <= gs.Tunar {
 				c.engine.SendMerchantBuy(gs.MerchantSelected, 1)
 			}
 		}
@@ -3604,9 +3603,10 @@ func (c *Client) drawMerchantWindow() {
 		}
 
 		// Cost
-		costStr := fmt.Sprintf("%d", item.ItemCost)
+		price := gs.MerchantPrice(i) // VIClient::GetMerchantPrice
+		costStr := fmt.Sprintf("%d", price)
 		costColor := colorGold
-		if item.ItemCost > gs.Tunar {
+		if price > gs.Tunar {
 			costColor = rl.Color{R: 200, G: 80, B: 80, A: 255} // red if can't afford
 		}
 		c.drawText(costStr, px+merchW-merchPad-70, ry+4, 13, costColor)
@@ -3627,7 +3627,7 @@ func (c *Client) drawMerchantWindow() {
 	var selectedItem *game.ParsedItem
 	if canBuy {
 		selectedItem = &gs.MerchantItems[gs.MerchantSelected]
-		canBuy = selectedItem.ItemCost <= gs.Tunar
+		canBuy = gs.MerchantPrice(gs.MerchantSelected) <= gs.Tunar
 	}
 
 	// Selected item description (bottom-left)
@@ -3699,8 +3699,8 @@ func (c *Client) itemContextOptions() []string {
 	if c.itemContextTab == 0 {
 		return []string{"Unequip", "Cancel"}
 	}
-	// Only show Equip for items with a valid equipment slot
-	if c.itemContextSlot > 0 {
+	// Only show Equip for a carried item with a valid equipment slot
+	if c.itemContextTab == 1 && c.itemContextSlot > 0 {
 		return []string{"Equip", "Cancel"}
 	}
 	return []string{"Cancel"}
@@ -3794,9 +3794,9 @@ func (c *Client) executeItemContext(optIdx int) {
 
 	switch action {
 	case "Equip":
-		c.engine.SendEquipItem(c.itemContextInvSlot)
+		c.engine.SendEquipItem(int(c.itemContextKey))
 	case "Unequip":
-		c.engine.SendUnequipItem(c.itemContextInvSlot)
+		c.engine.SendUnequipItem(int(c.itemContextKey))
 	case "Cancel":
 		// already closed
 	}
@@ -3860,16 +3860,11 @@ func (c *Client) drawItemDetailColumn(item game.ParsedItem, x, y, w, h int32) {
 		cy += lineH
 	}
 
-	// Stats (sorted by index to prevent flickering)
+	// Stats, in the record's order
 	if len(item.Stats) > 0 {
 		cy += 2
-		statKeys := make([]int, 0, len(item.Stats))
-		for k := range item.Stats {
-			statKeys = append(statKeys, k)
-		}
-		sort.Ints(statKeys)
-		for _, idx := range statKeys {
-			val := item.Stats[idx]
+		for _, st := range item.Stats {
+			idx, val := int(st.ID), st.Value
 			if val == 0 {
 				continue
 			}
@@ -4032,7 +4027,7 @@ func (c *Client) handleBlacksmithInput() {
 	if rl.IsKeyPressed(rl.KeyEnter) || (gpAvailable() && gpPressed(rl.GamepadButtonRightFaceDown)) {
 		if c.blacksmithSel >= 0 && c.blacksmithSel < len(items) {
 			item := items[c.blacksmithSel]
-			c.engine.SendRepairItem(item.InvSlot, uint32(gs.BlacksmithRepairCost))
+			c.engine.SendRepairItem(int(item.Key), gs.BlacksmithID)
 		}
 	}
 
@@ -4055,7 +4050,7 @@ func (c *Client) repairableItems() []game.ParsedItem {
 		return nil
 	}
 	var items []game.ParsedItem
-	for _, item := range gs.ParsedItems {
+	for _, item := range gs.Inventory() {
 		if item.MaxHP > 0 && item.RemainingHP < item.MaxHP {
 			items = append(items, item)
 		}
@@ -4164,8 +4159,8 @@ func (c *Client) drawBlacksmithWindow() {
 		hpStr := fmt.Sprintf("%d/%d", item.RemainingHP, item.MaxHP)
 		c.drawText(hpStr, px+panelW-pad-100, ry+4, 13, colorDim)
 
-		// Cost
-		costStr := fmt.Sprintf("%d", gs.BlacksmithRepairCost)
+		// Cost (VIClient::GetInvItemRepairCost)
+		costStr := fmt.Sprintf("%d", game.ItemRepairCost(item))
 		c.drawText(costStr, px+panelW-pad-45, ry+4, 13, colorGold)
 	}
 
@@ -4194,7 +4189,7 @@ func (c *Client) drawBlacksmithWindow() {
 
 	if canRepair && isBtnHover && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 		item := items[c.blacksmithSel]
-		c.engine.SendRepairItem(item.InvSlot, uint32(gs.BlacksmithRepairCost))
+		c.engine.SendRepairItem(int(item.Key), gs.BlacksmithID)
 	}
 
 	// Hint
@@ -4315,14 +4310,8 @@ func (c *Client) drawInspectWindow() {
 	if len(item.Stats) > 0 {
 		lines = append(lines, inspLine{gap: 6})
 		lines = append(lines, inspLine{text: "Stats:", color: colorGold, size: 13})
-		// Sort stat keys for deterministic order.
-		statKeys := make([]int, 0, len(item.Stats))
-		for k := range item.Stats {
-			statKeys = append(statKeys, k)
-		}
-		sort.Ints(statKeys)
-		for _, k := range statKeys {
-			v := item.Stats[k]
+		for _, st := range item.Stats {
+			k, v := int(st.ID), st.Value
 			sign := "+"
 			if v < 0 {
 				sign = ""

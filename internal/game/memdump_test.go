@@ -255,11 +255,8 @@ func TestRoundTripServerFormat(t *testing.T) {
 	if item0.ItemID != 1001 {
 		t.Errorf("Item[0] ID: expected 1001, got %d", item0.ItemID)
 	}
-	if item0.Stats[0] != 5 {
-		t.Errorf("Item[0] str stat: expected 5, got %d", item0.Stats[0])
-	}
-	if item0.Stats[3] != 3 {
-		t.Errorf("Item[0] dex stat: expected 3, got %d", item0.Stats[3])
+	if len(item0.Stats) != 2 || item0.Stats[0] != (ItemStat{0, 5}) || item0.Stats[1] != (ItemStat{3, 3}) {
+		t.Errorf("Item[0] stats: expected [{0 5} {3 3}], got %v", item0.Stats)
 	}
 	if item0.WeaponDamage != 200 {
 		t.Errorf("Item[0] damage: expected 200, got %d", item0.WeaponDamage)
@@ -282,8 +279,11 @@ func TestRoundTripServerFormat(t *testing.T) {
 	if item2.Name != "Crafting Material" {
 		t.Errorf("Item[2] name: expected 'Crafting Material', got %q", item2.Name)
 	}
-	if item2.Location != 1 {
-		t.Errorf("Item[2] location: expected 1 (bank), got %d", item2.Location)
+	if item2.QuickSlot != 1 {
+		t.Errorf("Item[2] quick slot (+0x2F4): expected 1, got %d", item2.QuickSlot)
+	}
+	if len(gs.Bank()) != 1 || gs.Bank()[0].Name != "Crafting Material" {
+		t.Errorf("Bank: expected the one record, got %d", len(gs.Bank()))
 	}
 
 	// Verify spells

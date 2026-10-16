@@ -458,7 +458,7 @@ func isDualWieldFromItems(items []game.ParsedItem) bool {
 	var hasPrimary, hasSecondary bool
 	for _, item := range items {
 		// Only check equipped items
-		if item.EquipLocation < 0 || item.Location != -1 {
+		if item.EquipLocation < 0 {
 			continue
 		}
 		if item.Slot == 12 && item.AttackType > 0 && item.AttackType != 10 {
@@ -858,7 +858,7 @@ func (am *AnimationManager) ResolvePlayerAnim(gs *game.GameState, p *game.Entity
 		level:              gs.Player.Level,
 		isPC:               true,
 		weaponAttackType:   am.GetWeaponAttackType(gs),
-		parsedItems:        gs.ParsedItems,
+		parsedItems:        gs.Inventory(),
 		serverDrivenCombat: true,
 		castBarEnd:         castBarEnd,
 		castingSelf:        gs.CastSelfTarget,
@@ -1064,7 +1064,7 @@ func inferAttackType(primary, secondary, shield uint32) int {
 func getWeaponAttackTypeFromItems(items []game.ParsedItem) int {
 	for _, item := range items {
 		// Only check equipped items
-		if item.EquipLocation < 0 || item.Location != -1 {
+		if item.EquipLocation < 0 {
 			continue
 		}
 		if (item.Slot == 12 || item.Slot == 14 || item.Slot == 15) && item.AttackType > 0 {
@@ -1088,8 +1088,8 @@ func attackTypes(gs *game.GameState, actorObjID uint32) [2]int {
 	if actorObjID == gs.PlayerObjectID {
 		ent = &gs.Player
 		found := [2]bool{}
-		for _, item := range gs.ParsedItems {
-			if item.EquipLocation < 0 || item.Location != -1 {
+		for _, item := range gs.Inventory() {
+			if item.EquipLocation < 0 {
 				continue
 			}
 			switch item.EquipLocation {
@@ -1173,9 +1173,9 @@ func (am *AnimationManager) GetWeaponAttackType(gs *game.GameState) int {
 	if gs == nil {
 		return 11
 	}
-	for _, item := range gs.ParsedItems {
-		// Only check equipped weapon items (EquipLocation >= 0 and Location == -1)
-		if item.EquipLocation < 0 || item.Location != -1 {
+	for _, item := range gs.Inventory() {
+		// Only check equipped weapon items
+		if item.EquipLocation < 0 {
 			continue
 		}
 		if (item.Slot == 12 || item.Slot == 14 || item.Slot == 15) && item.AttackType > 0 {

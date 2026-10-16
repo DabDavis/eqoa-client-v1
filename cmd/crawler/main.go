@@ -601,18 +601,18 @@ func (c *Crawler) saveMerchantItems(npcObjID uint32, npcName string, items []gam
 			continue
 		}
 		statsStr := ""
-		for k, v := range item.Stats {
+		for _, st := range item.Stats {
 			if statsStr != "" {
 				statsStr += ","
 			}
-			statsStr += fmt.Sprintf("%d=%d", k, v)
+			statsStr += fmt.Sprintf("%d=%d", st.ID, st.Value)
 		}
 		stmtItem.Exec(
 			item.ItemID, item.Name, item.Desc, item.Slot, item.EquipLocation,
 			item.ItemCost, item.ItemIcon, item.LevelReq, item.AttackType,
 			item.WeaponDamage, item.MaxStack, item.MaxHP,
-			item.NoTrade, item.NoRent, item.IsLore, item.IsCraft,
-			item.ClassUse, item.RaceUse, item.ProcAnim, item.Duration, statsStr,
+			item.NoTrade, item.Rent, item.IsLore, item.IsCraft,
+			item.ClassUse, item.RaceUse, item.P4C, item.Durability, statsStr,
 		)
 		stmtLink.Exec(npcObjID, item.ItemID, item.ItemCost)
 	}
@@ -696,18 +696,18 @@ func (c *Crawler) dumpItems() {
 			continue
 		}
 		statsStr := ""
-		for k, v := range item.Stats {
+		for _, st := range item.Stats {
 			if statsStr != "" {
 				statsStr += ","
 			}
-			statsStr += fmt.Sprintf("%d=%d", k, v)
+			statsStr += fmt.Sprintf("%d=%d", st.ID, st.Value)
 		}
 		stmt.Exec(
 			item.ItemID, item.Name, item.Desc, item.Slot, item.EquipLocation,
 			item.ItemCost, item.ItemIcon, item.LevelReq, item.AttackType,
 			item.WeaponDamage, item.MaxStack, item.MaxHP,
-			item.NoTrade, item.NoRent, item.IsLore, item.IsCraft,
-			item.ClassUse, item.RaceUse, item.ProcAnim, item.Duration, statsStr,
+			item.NoTrade, item.Rent, item.IsLore, item.IsCraft,
+			item.ClassUse, item.RaceUse, item.P4C, item.Durability, statsStr,
 		)
 		count++
 	}

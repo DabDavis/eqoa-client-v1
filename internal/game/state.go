@@ -366,6 +366,7 @@ type GameState struct {
 	ParsedSpells         []ParsedSpell
 	ParsedCM             *ParsedCMData
 	InventoryItemCount   int // items 0..N-1 are inventory, N..end are bank
+	itemLists                // the lists' own state: keys, the corpse, the trade (items.go)
 
 	// Hotbar: slots 0-9 mapped to spells. Populated from ParsedSpells (OnHotBar=1).
 	// Keys 1-9,0 map to slots 0-8,9 respectively.
@@ -442,9 +443,8 @@ type GameState struct {
 	CombatAttackFXHash  uint32    // PS2 func_00CBE0A8: resolved spell FX DictID for current weapon/class
 	FloatingTexts   []FloatingText // rising/fading damage/heal numbers
 
-	// Blacksmith/repair state
-	BlacksmithOpen       bool
-	BlacksmithRepairCost int
+	// Blacksmith/repair window (0x0061 opens it, 0x0063 closes it; BlacksmithID is in itemLists)
+	BlacksmithOpen bool
 	CastStartTime   time.Time      // when current spell cast began
 	CastDurationMs  uint16         // cast duration in ms (0 = not casting)
 	CastTargetName  string         // name of target being cast on
@@ -505,10 +505,6 @@ type GameState struct {
 	GuildMembers []GuildMember // from sub-type 3 (member list)
 	GuildLeader  bool          // from sub-type 13/14 (leader status)
 
-	// NPC interaction (from opcode 0x001C)
-	NPCInteractionType int // 18=info, 16=trainer, 3=merchant, 4=blacksmith, 6=quest, 7=banker
-	NPCInteractionName string
-
 	// Player currency
 	Tunar int64
 
@@ -529,13 +525,13 @@ type GameState struct {
 	CMDetail      *CMSkillDetail // currently viewed skill detail
 	CMTreeLoaded  bool
 
-	// Merchant window (from opcode 0x001C type=3 or 0x00B7)
+	// Merchant window (from opcode 0x00B7)
 	MerchantOpen     bool
-	MerchantName     string
+	MerchantName     string // the merchant entity's name (its greeting is MerchantText)
 	MerchantItems    []ParsedItem
 	MerchantSelected int // selected item index (-1 = none)
-	MerchantBuyRate  int // server buy rate multiplier (e.g. 200 = 2x)
-	MerchantSellRate int // server sell rate multiplier
+	MerchantBuyRate  int // +0x1B308: the percent the merchant pays of an item's value (SellPrice)
+	MerchantSellRate int // +0x1B30C: the percent of its value a merchant item costs (MerchantPrice)
 
 	// Chat message (from opcode 0x07A3)
 	// Uses existing ChatLog
@@ -548,10 +544,6 @@ type GameState struct {
 
 	// Entity creation via reliable opcodes (from 0x00B3/0x00B5 etc.)
 	// Uses existing Entities map — reliable opcodes populate same entities as state channels
-
-	// Loot result (from opcode 0x001A)
-	LootResultStatus byte // 1=ok, 2=partial, 3=fail
-	LootResultMsg    string
 
 	// Debug: state channel receive counts
 	stateChannelCount map[byte]int
@@ -583,6 +575,7 @@ func NewGameState(host string, gamePort, authPort, patchPort int, username strin
 		Entities:          make(map[uint32]*Entity),
 		QuestTrackerID:    0xFFFFFFFF, // no active quest
 		SelectedChar:      -1,         // no character selected yet
+		itemLists:         newItemLists(),
 		stateChannelCount: make(map[byte]int),
 	}
 	return gs
@@ -1495,6 +1488,7 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 		return
 	}
 	invCountDup, _ := reader.ReadUint32() // PS2: 4 raw bytes = duplicate count
+	gs.SetInventoryNextKey(invCountDup)   // VIItemList::m_p04: the key the next new record gets
 	if int64(invCountDup) != invCount {
 		log.Printf("MemoryDump: inventory count mismatch zigzag=%d dup=%d", invCount, invCountDup)
 	}
@@ -1514,11 +1508,11 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 	log.Printf("MemoryDump: parsed %d inventory items", gs.InventoryItemCount)
 
 	// Log equipped items with all fields (investigating proc spell FX DictIDs)
-	for _, item := range gs.ParsedItems {
-		if item.EquipLocation >= 0 && item.Location == -1 {
-			log.Printf("  EQUIPPED: %q id=%d equipLoc=%d atk=%d dmg=%d proc=%d unk1=%d unk2=%d unk3=%d unk4=%d unk5=%d unk6=%d",
+	for _, item := range gs.Inventory() {
+		if item.EquipLocation >= 0 {
+			log.Printf("  EQUIPPED: %q id=%d equipLoc=%d atk=%d dmg=%d p4c=%d p08=%d icon2=%d p18=%d p24=%d range=%d p58=%d",
 				item.Name, item.ItemID, item.EquipLocation, item.AttackType, item.WeaponDamage,
-				item.ProcAnim, item.Unk1, item.Unk2, item.Unk3, item.Unk4, item.Unk5, item.Unk6)
+				item.P4C, item.P08, item.Icon2, item.P18, item.P24, item.Range, item.P58)
 		}
 	}
 
@@ -1534,7 +1528,7 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 		return
 	}
 	bankCountDup, _ := reader.ReadUint32()
-	_ = bankCountDup
+	gs.SetBankNextKey(bankCountDup)
 	log.Printf("MemoryDump: pos=%d bankCount=%d", reader.Position(), bankCount)
 
 	for i := int64(0); i < bankCount; i++ {
@@ -1616,14 +1610,14 @@ func (gs *GameState) parseMemoryDumpRemainder(reader *buffer.Reader) {
 	// Log items and spells to /tmp for debugging
 	for _, item := range gs.ParsedItems {
 		statStr := ""
-		for idx, val := range item.Stats {
+		for _, st := range item.Stats {
 			if statStr != "" {
 				statStr += ","
 			}
-			statStr += fmt.Sprintf("%d=%d", idx, val)
+			statStr += fmt.Sprintf("%d=%d", st.ID, st.Value)
 		}
-		writeItemLog("MemDump", fmt.Sprintf("ITEM id=%d name=%q slot=%d equipLoc=%d loc=%d cost=%d icon=%d lvl=%d atk=%d dmg=%d stack=%d proc=0x%X stats={%s}",
-			item.ItemID, item.Name, item.Slot, item.EquipLocation, item.Location, item.ItemCost, item.ItemIcon, item.LevelReq, item.AttackType, item.WeaponDamage, item.MaxStack, item.ProcAnim, statStr))
+		writeItemLog("MemDump", fmt.Sprintf("ITEM id=%d name=%q slot=%d equipLoc=%d quick=%d cost=%d icon=%d lvl=%d atk=%d dmg=%d stack=%d p4c=0x%X stats={%s}",
+			item.ItemID, item.Name, item.Slot, item.EquipLocation, item.QuickSlot, item.ItemCost, item.ItemIcon, item.LevelReq, item.AttackType, item.WeaponDamage, item.MaxStack, item.P4C, statStr))
 	}
 	for _, sp := range gs.ParsedSpells {
 		writeSpellLog(fmt.Sprintf("SPELL id=%d name=%q ability=%d addedOrder=%d range=%d cast=%d power=%d icon=%d scope=%d recast=%d",
@@ -3088,48 +3082,38 @@ func (gs *GameState) handleGrantXPOrItems(msg *protocol.Message) {
 	writeItemLog("XP", fmt.Sprintf("level=%d xp=%d xpPct=%d", level, xp, gs.Player.XPPct))
 }
 
-// FindItemIndex returns the index of a ParsedItem by key, or -1 if not found.
+// FindItemIndex is VIItemList::Find on the inventory: the index of the record
+// with this key, or -1.
 func (gs *GameState) FindItemIndex(key uint32) int {
-	for i, item := range gs.ParsedItems {
-		if item.Key == key {
-			return i
-		}
-	}
-	return -1
+	return listFind(gs.Inventory(), key)
 }
 
+// handleInventoryItem handles opcode 0x003B, AddInvItem (CLIENT 0x00BCB0D8):
+// one item record, filed as VIItemList::AddItem files it — onto the first
+// stack of the same item, else a new record under the list's next key.
+// HandleMessage routes 0x0018 here too, which is the corpse's list, not an
+// inventory message (handleLoot).
 func (gs *GameState) handleInventoryItem(msg *protocol.Message, source string) {
-	data := msg.Data()
-	if len(data) < 4 {
+	d := msg.Data()
+	if len(d) < 3 {
 		return
 	}
-	// Parse and add item to inventory.
-	if len(data) > 2 {
-		items := parseItemData(data[2:])
-		for _, item := range items {
-			log.Printf("%s: name=%q slot=%d equipLoc=%d cost=%d lvl=%d atk=%d",
-				source, item.Name, item.Slot, item.EquipLocation, item.ItemCost, item.LevelReq, item.AttackType)
-			// Update or add to parsed items list.
-			updated := false
-			for i, existing := range gs.ParsedItems {
-				if existing.Key == item.Key && item.Key != 0 {
-					item.InvSlot = existing.InvSlot // preserve original slot
-					gs.ParsedItems[i] = item
-					updated = true
-					break
-				}
-			}
-			if !updated {
-				item.InvSlot = len(gs.ParsedItems)
-				gs.ParsedItems = append(gs.ParsedItems, item)
-			}
-			gs.InventoryItemCount = len(gs.ParsedItems)
-		}
+	if protocol.GameOpcode(d[0])|protocol.GameOpcode(d[1])<<8 == protocol.OpcodeLoot {
+		gs.handleLoot(msg)
+		return
 	}
-	gs.parseAndLogItems(source, data)
+	item, err := readNetItem(buffer.NewReader(d[2:]))
+	if err != nil {
+		log.Printf("%s: %v", source, err)
+		return
+	}
+	took := gs.addInventory(&item)
+	log.Printf("%s: %q x%d, key %d (%d in the inventory)", source, item.Name, took, item.Key, gs.InventoryItemCount)
+	logItemRecord(source, item)
 }
 
 // parseAndLogItems tries to extract item data and log it for DB population.
+// It scans (parseItemData): the handlers it serves do not read an item record.
 func (gs *GameState) parseAndLogItems(source string, data []byte) {
 	// Try extracting UTF-16 strings as a starting point
 	strs := extractUTF16Strings(data)
@@ -3141,17 +3125,8 @@ func (gs *GameState) parseAndLogItems(source string, data []byte) {
 
 	// Try DumpItem parse on data after opcode
 	if len(data) > 2 {
-		items := parseItemData(data[2:])
-		for _, item := range items {
-			statStr := ""
-			for idx, val := range item.Stats {
-				if statStr != "" {
-					statStr += ","
-				}
-				statStr += fmt.Sprintf("%d=%d", idx, val)
-			}
-			writeItemLog(source, fmt.Sprintf("ITEM: name=%q desc=%q id=%d cost=%d icon=%d lvl=%d slot=%d maxStack=%d stats={%s}",
-				item.Name, item.Desc, item.ItemID, item.ItemCost, item.ItemIcon, item.LevelReq, item.Slot, item.MaxStack, statStr))
+		for _, item := range parseItemData(data[2:]) {
+			logItemRecord(source, item)
 		}
 	}
 }
@@ -3374,19 +3349,16 @@ func (gs *GameState) handlePlayerSearchEntry(msg *protocol.Message) {
 	gs.PlayerSearch = append(gs.PlayerSearch, e)
 }
 
-// getEquippedProcAnim returns the ProcAnim DictID from the first equipped item
-// that has a non-zero proc effect. PS2 func_00BC76A0 iterates items at entity+0xC428
-// checking item+0x2F0 for proc type codes (14-20) and item+0x28 for the spell FX DictID.
-// EquipLocation values for weapon/armor slots: 0=helm, 1=gloves, 5=chest, 8=bracer,
-// 12=legs, 13=boots, 14=primary, 15=secondary, 21=robe. Procs can be on any slot.
+// getEquippedProcAnim returns the P4C of the first worn inventory item that
+// has one. (Nothing calls it. Its namesake, CLIENT func_00BC76A0, is the
+// auto-attack tick, which reads the worn weapons' attack type at +0x28.)
 func (gs *GameState) getEquippedProcAnim() uint32 {
-	for _, item := range gs.ParsedItems {
-		// Only equipped items (EquipLocation != -1 means equipped in a slot)
-		if item.EquipLocation < 0 || item.Location != -1 {
+	for _, item := range gs.Inventory() {
+		if item.EquipLocation < 0 {
 			continue
 		}
-		if item.ProcAnim != 0 {
-			return uint32(item.ProcAnim)
+		if item.P4C != 0 {
+			return uint32(item.P4C)
 		}
 	}
 	return 0
@@ -3671,50 +3643,41 @@ func (gs *GameState) handlePlayerTunar(msg *protocol.Message) {
 	log.Printf("PlayerTunar: tunar=%d", tunarVal)
 }
 
+// handleMerchantBox handles opcode 0x00B7 (CLIENT's dispatcher, 0x00BD21EC):
+// the merchant (u32), the two rates in percent (zigzag: what it pays for an
+// item, what it charges for its own), its item list (VIItemList::Read), then
+// its greeting (ReadString16 into 128 characters), and the window opens
+// (MerchantOpen; the PS2 opens it only when no other panel is up).
 func (gs *GameState) handleMerchantBox(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("MerchantBox: dataLen=%d hex=%X", len(data), data[:min(64, len(data))])
-	// Wire format (from PS2 pcap): opcode(2) + objectID(uint32) + buyRate(zigzag) + sellRate(zigzag)
-	//   + itemCount(zigzag) + itemCount(uint32, duplicate) + items[itemCount] + dialogueString(unicode)
-	if len(data) < 10 {
+	r := buffer.NewReader(msg.Data()[2:])
+	id, err := r.ReadUint32()
+	if err != nil {
 		return
 	}
-	reader := buffer.NewReader(data[2:]) // skip opcode prefix
-	objID, _ := reader.ReadUint32()
-	buyRate, _ := reader.Read7BitEncodedInt64()
-	sellRate, _ := reader.Read7BitEncodedInt64()
-	itemCount, _ := reader.Read7BitEncodedInt64()
-	itemCountDup, _ := reader.ReadUint32() // duplicate count as raw uint32
-	log.Printf("MerchantBox: objID=0x%08X buyRate=%d sellRate=%d itemCount=%d (dup=%d)",
-		objID, buyRate, sellRate, itemCount, itemCountDup)
-
-	gs.MerchantBuyRate = int(buyRate)
-	gs.MerchantSellRate = int(sellRate)
-
-	// Parse items
-	var items []ParsedItem
-	for i := int64(0); i < itemCount && reader.Remaining() > 10; i++ {
-		item, err := parseSingleItem(reader)
-		if err != nil {
-			log.Printf("MerchantBox: item %d parse error at offset %d: %v", i, reader.Position(), err)
-			break
-		}
-		items = append(items, item)
-		log.Printf("MerchantBox: item %d: %q cost=%d icon=%d slot=%d lvl=%d stats=%v",
-			i, item.Name, item.ItemCost, item.ItemIcon, item.Slot, item.LevelReq, item.Stats)
+	buyRate, err1 := readSigned(r)
+	sellRate, err2 := readSigned(r)
+	items, _, err3 := readItemList(r)
+	if err1 != nil || err2 != nil || err3 != nil {
+		log.Printf("MerchantBox: 0x%08X: %v %v %v", id, err1, err2, err3)
+		return
 	}
-
-	if len(items) > 0 {
-		gs.MerchantItems = items
-		if gs.MerchantName == "" {
-			gs.MerchantName = gs.NPCInteractionName
-		}
-		gs.MerchantOpen = true
-		gs.MerchantSelected = -1
-		log.Printf("MerchantBox: opened with %d/%d items", len(items), itemCount)
-	} else {
-		log.Printf("MerchantBox: no items parsed from %d remaining bytes", reader.Remaining())
+	text, err := readWideString(r, 256)
+	if err != nil {
+		log.Printf("MerchantBox: 0x%08X text: %v", id, err)
 	}
+	gs.MerchantID = id
+	gs.MerchantBuyRate, gs.MerchantSellRate = int(buyRate), int(sellRate)
+	gs.MerchantItems = items
+	gs.MerchantText = text
+	if name := gs.tradeName(id, ""); name != "" {
+		gs.MerchantName = name
+	}
+	gs.MerchantOpen = true
+	gs.MerchantSelected = -1
+	for _, it := range items {
+		logItemRecord("MerchantBox", it)
+	}
+	log.Printf("MerchantBox: 0x%08X %q, %d items, rates %d%%/%d%%", id, text, len(items), buyRate, sellRate)
 }
 
 // handleWeatherControl handles opcode 0x00C5: CLIENT 0x00BD2CC0 reads one byte
@@ -4271,8 +4234,9 @@ func PrintOpcodeStats() {
 	}
 }
 
-// parseItemData attempts to parse Sandstorm item data and returns extracted items.
-// Items follow the C# DumpItem format: zigzag fields + WriteStringUnicode(name) + WriteStringUnicode(desc) + stats.
+// parseItemData scans a payload for consecutive item records, for the item
+// log only: it skips forward a byte at a time until one parses. Every handler
+// that has a record in its message reads it with readNetItem (items.go).
 func parseItemData(data []byte) []ParsedItem {
 	if len(data) < 10 {
 		return nil
@@ -4298,119 +4262,54 @@ func parseItemData(data []byte) []ParsedItem {
 	return items
 }
 
-// ParsedItem holds a decoded item from the server (all 29 DumpItem fields + stats).
+// ParsedItem is one item record as CLIENT holds it (game.h VINetItem): the
+// six slot words that make an item a list entry, then the item proper
+// (VIItem, 0x2E4 bytes). The fields are in wire order; the comment on each is
+// its offset in the PS2's record. Names are FrontiersForge's (item.lua) and
+// VIClient's getters' where the field has one, the offset where it has none.
 type ParsedItem struct {
-	InvSlot       int // index in ParsedItems — the server's inventory slot number
-	StackLeft     int64
-	RemainingHP   int64
-	Charges       int64
-	EquipLocation int64
-	Location      int64
-	Key           uint32 // raw int32
-	ItemID        int64
-	ItemCost      int64
-	Unk1          int64
-	ItemIcon      int64
-	Unk2          int64
-	Slot          int64
-	Unk3          int64
-	NoTrade       int64
-	NoRent        int64
-	Unk4          int64
-	AttackType    int64
-	WeaponDamage  int64
-	Unk5          int64
-	LevelReq      int64
-	MaxStack      int64
-	MaxHP         int64
-	Duration      int64
-	ClassUse      int64
-	RaceUse       int64
-	ProcAnim      int64
-	IsLore        int64
-	Unk6          int64
-	IsCraft       int64
-	Name          string
-	Desc          string
-	Stats         map[int]int64
+	InvSlot int // the record's index in ParsedItems: an inventory record's is its list index
+
+	// The slot words (ReadNetItem, CLIENT 0x00CBB040).
+	StackLeft     int64  // +0x2E4 quantity
+	RemainingHP   int64  // +0x2E8 current HP; 0x0060 sets it
+	Charges       int64  // +0x2EC; 0x003E counts it down
+	EquipLocation int64  // +0x2F0 the equip slot worn in, -1 none (0x003F, 0x0040)
+	QuickSlot     int64  // +0x2F4 the quick slot 0-3, -1 none (0x000A)
+	Key           uint32 // +0x2F8 the list's own id for the record (GetSlotId): what 0x0060 and every request name it by
+
+	// The item (func_00CBACE8).
+	ItemID       int64      // +0x00
+	ItemCost     int64      // +0x04 its value in tunar, before a merchant's rate
+	P08          int64      // +0x08
+	ItemIcon     int64      // +0x0C
+	Icon2        int64      // +0x10 the Frontiers icon, used instead under expansion flag 2 (VIClient::ItemIcon)
+	Slot         int64      // +0x14 the wear slot (1 head .. 27, -1 none)
+	P18          int64      // +0x18
+	NoTrade      int64      // +0x1C
+	Rent         int64      // +0x20 0 = NO RENT
+	P24          int64      // +0x24
+	AttackType   int64      // +0x28 the weapon skill, 0 for none
+	WeaponDamage int64      // +0x2C
+	Range        int64      // +0x30
+	LevelReq     int64      // +0x34
+	MaxStack     int64      // +0x38
+	MaxHP        int64      // +0x3C
+	Durability   int64      // +0x40
+	ClassUse     int64      // +0x44 class mask
+	RaceUse      int64      // +0x48 race mask
+	P4C          int64      // +0x4C quick-slot class: 2 may go in quick slots 0-1, 7 in quick slot 2 (Msg000A)
+	IsLore       int64      // +0x50
+	P58          int64      // +0x58, read before +0x54
+	IsCraft      int64      // +0x54
+	Name         string     // +0x5C, 63 characters at most
+	Desc         string     // +0xDC, 255 characters at most
+	Stats        []ItemStat // +0x2DC, in the record's order
 }
 
+// parseSingleItem reads one item record off the stream (readNetItem).
 func parseSingleItem(reader *buffer.Reader) (ParsedItem, error) {
-	var item ParsedItem
-	var err error
-
-	// C# DumpItem order: stack, hp, charges, equipLoc, location, key(uint32),
-	// itemID, cost, unk1, icon, unk2, slot, unk3, noTrade, noRent, unk4,
-	// attackType, weaponDmg, unk5, levelReq, maxStack, maxHP, duration,
-	// classUse, raceUse, procAnim, isLore, unk6, isCraft,
-	// itemName(string), itemDesc(string), statSize, [stats...]
-	item.StackLeft, _ = reader.Read7BitEncodedInt64()
-	item.RemainingHP, _ = reader.Read7BitEncodedInt64()
-	item.Charges, _ = reader.Read7BitEncodedInt64()
-	item.EquipLocation, _ = reader.Read7BitEncodedInt64()
-	item.Location, _ = reader.Read7BitEncodedInt64()
-	item.Key, _ = reader.ReadUint32()
-	item.ItemID, _ = reader.Read7BitEncodedInt64()
-	item.ItemCost, _ = reader.Read7BitEncodedInt64()
-	item.Unk1, _ = reader.Read7BitEncodedInt64()
-	item.ItemIcon, _ = reader.Read7BitEncodedInt64()
-	item.Unk2, _ = reader.Read7BitEncodedInt64()
-	item.Slot, _ = reader.Read7BitEncodedInt64()
-	item.Unk3, _ = reader.Read7BitEncodedInt64()
-	item.NoTrade, _ = reader.Read7BitEncodedInt64()
-	item.NoRent, _ = reader.Read7BitEncodedInt64()
-	item.Unk4, _ = reader.Read7BitEncodedInt64()
-	item.AttackType, _ = reader.Read7BitEncodedInt64()
-	item.WeaponDamage, _ = reader.Read7BitEncodedInt64()
-	item.Unk5, _ = reader.Read7BitEncodedInt64()
-	item.LevelReq, _ = reader.Read7BitEncodedInt64()
-	item.MaxStack, _ = reader.Read7BitEncodedInt64()
-	item.MaxHP, _ = reader.Read7BitEncodedInt64()
-	item.Duration, _ = reader.Read7BitEncodedInt64()
-	item.ClassUse, _ = reader.Read7BitEncodedInt64()
-	item.RaceUse, _ = reader.Read7BitEncodedInt64()
-	item.ProcAnim, _ = reader.Read7BitEncodedInt64()
-	item.IsLore, _ = reader.Read7BitEncodedInt64()
-	item.Unk6, _ = reader.Read7BitEncodedInt64()
-	item.IsCraft, _ = reader.Read7BitEncodedInt64()
-
-	// Item name (WriteStringUnicode = int32 charCount + UTF-16LE)
-	nameLen, err := reader.ReadInt32()
-	if err != nil || nameLen < 0 || nameLen > 200 {
-		return item, fmt.Errorf("bad name len: %d", nameLen)
-	}
-	if nameLen > 0 {
-		item.Name, err = reader.ReadStringUnicode(int(nameLen))
-		if err != nil {
-			return item, err
-		}
-	}
-
-	// Item description
-	descLen, err := reader.ReadInt32()
-	if err != nil || descLen < 0 || descLen > 500 {
-		return item, fmt.Errorf("bad desc len: %d", descLen)
-	}
-	if descLen > 0 {
-		item.Desc, err = reader.ReadStringUnicode(int(descLen))
-		if err != nil {
-			return item, err
-		}
-	}
-
-	// Stats
-	statSize, _ := reader.Read7BitEncodedInt64()
-	item.Stats = make(map[int]int64)
-	for i := int64(0); i < statSize; i++ {
-		idx, _ := reader.Read7BitEncodedInt64()
-		val, err := reader.Read7BitEncodedInt64()
-		if err != nil {
-			break
-		}
-		item.Stats[int(idx)] = val
-	}
-
-	return item, nil
+	return readNetItem(reader)
 }
 
 // AuctionItem holds a single auction house listing parsed from opcode 0x1206.

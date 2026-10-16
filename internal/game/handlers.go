@@ -628,97 +628,39 @@ func (gs *GameState) parseWorldEntryAppearance(reader *buffer.Reader) {
 // Item / Loot / NPC (0x001A/001C/0065/00D3/00D9)
 // =============================================================================
 
-// handleLootResult handles opcode 0x001A — loot outcome.
-// PS2: status(1=ok/2=partial/3=fail → strings 673-675), item ID array, entity update.
+// handleLootResult handles opcode 0x001A, Msg001A (CLIENT 0x00BD98B0): no
+// payload. Everything on the corpse goes into the inventory, record by
+// record; a record whose stack did not all fit stays, and the walk moves on.
 func (gs *GameState) handleLootResult(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
+	moved := 0
+	for i := 0; i < len(gs.Corpse); {
+		item := listGet(gs.Corpse, i)
+		if item.StackLeft <= 0 {
+			// A record holding none: Took(i, 0) takes it off.
+			gs.Corpse = append(gs.Corpse[:i], gs.Corpse[i+1:]...)
+			continue
+		}
+		item.EquipLocation = -1
+		took := gs.addInventory(&item)
+		gs.Corpse, _ = listTook(gs.Corpse, i, took)
+		if took != item.StackLeft {
+			i++
+		}
+		moved++
 	}
-	reader := buffer.NewReader(data[2:])
-	status, err := reader.ReadByte()
-	if err != nil {
-		return
-	}
-	gs.LootResultStatus = status
-
-	statusNames := map[byte]string{1: "success", 2: "partial", 3: "fail"}
-	statusName := statusNames[status]
-	if statusName == "" {
-		statusName = fmt.Sprintf("unknown(%d)", status)
-	}
-
-	log.Printf("LootResult: status=%s remaining=%d", statusName, reader.Remaining())
-
-	switch status {
-	case 1:
-		gs.LootResultMsg = "Loot acquired"
-	case 2:
-		gs.LootResultMsg = "Partial loot — inventory full"
-		gs.addChatMessage("Your inventory is partially full.", ChatError)
-	case 3:
-		gs.LootResultMsg = "Loot failed"
-		gs.addChatMessage("Loot failed.", ChatError)
-	}
+	log.Printf("LootAll: %d records, %d left on the corpse", moved, len(gs.Corpse))
 }
 
-// handleNPCInteraction handles opcode 0x001C — NPC interaction response.
-// PS2: skill/ability defs, UI window text, type-code dispatch
-// (18=info, 16/3/4/6/7=training/merchant/blacksmith), then item list.
+// handleNPCInteraction handles opcode 0x001C. CLIENT reads one raw u32 into
+// the player record's +0x44 (VIPlayer, +0xC320), which the stat-training
+// window adds the CM count to (GetP44Total). That is all it does.
 func (gs *GameState) handleNPCInteraction(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 6 {
+	d := msg.Data()
+	if len(d) < 6 {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-
-	// Read NPC interaction type
-	npcType, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		return
-	}
-	gs.NPCInteractionType = int(npcType)
-
-	typeNames := map[int]string{
-		3: "merchant", 4: "blacksmith", 6: "quest", 7: "banker",
-		16: "trainer", 18: "info",
-	}
-	typeName := typeNames[int(npcType)]
-	if typeName == "" {
-		typeName = fmt.Sprintf("type_%d", npcType)
-	}
-
-	log.Printf("NPCInteraction: type=%s(%d) remaining=%d", typeName, npcType, reader.Remaining())
-
-	// Try to extract NPC name and text
-	if reader.Remaining() > 4 {
-		text, err := readStringFromReader(reader)
-		if err == nil && text != "" {
-			gs.NPCInteractionName = text
-			log.Printf("NPCInteraction: text=%q", text)
-		}
-	}
-
-	// For merchant/blacksmith, parse remaining data as items
-	if reader.Remaining() > 10 {
-		remaining := data[2+reader.Position()-reader.Remaining():]
-		items := parseItemData(remaining)
-		if len(items) > 0 && (npcType == 3 || npcType == 4) {
-			gs.MerchantItems = items
-			gs.MerchantName = gs.NPCInteractionName
-			gs.MerchantOpen = true
-			gs.MerchantSelected = -1
-			log.Printf("NPCInteraction: opened merchant %q with %d items", gs.MerchantName, len(items))
-		}
-	}
-
-	// Log string data for debugging
-	if reader.Remaining() > 0 {
-		strs := extractUTF16Strings(data)
-		for _, s := range strs {
-			writeItemLog("NPCInteraction", s)
-		}
-	}
+	gs.PlayerP44 = binary.LittleEndian.Uint32(d[2:6])
+	log.Printf("0x001C: player +0x44 = %d", gs.PlayerP44)
 }
 
 // handleItemListUpdate handles opcode 0x0065 — full item definition with stats.
@@ -1014,173 +956,235 @@ func (gs *GameState) handleStubNOP(msg *protocol.Message) {
 	gs.parseQuestTail(reader, "StubNOP")
 }
 
-// handleEquipItemConfirm handles opcode 0x003F — equip confirmation.
-// PS2 wire format: 2 bytes = [invSlot, equipLoc].
-// invSlot = array index in ParsedItems. equipLoc = body position assigned.
-// For visible equipment, state channel bytes are the source of truth.
-// For accessories (no state channel), we update EquipLocation here.
+// handleEquipItemConfirm handles opcode 0x003F, Msg003F (CLIENT 0x00BCB2F0):
+// an inventory slot byte and an equip slot byte. If the item's wear slot fits
+// the equip slot (func_00CC61A8), whatever is worn there comes off, then what
+// the item displaces (a two-hander both hands, a shield the off hand, ...),
+// and the item goes on. The state channel draws the body; this is the list.
 func (gs *GameState) handleEquipItemConfirm(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) >= 4 {
-		invSlot := data[2]
-		equipLoc := data[3]
-		log.Printf("EquipItem: invSlot=%d equipLoc=%d", invSlot, equipLoc)
-		// Only update accessories (slots without state channel tracking).
-		// Visible equipment (armor, weapons, robe) is handled by state channel.
-		if isAccessoryEquipLoc(int(equipLoc)) {
-			if int(invSlot) < len(gs.ParsedItems) {
-				gs.ParsedItems[invSlot].EquipLocation = int64(equipLoc)
-				log.Printf("EquipItem: idx %d %q EquipLocation → %d", invSlot, gs.ParsedItems[invSlot].Name, equipLoc)
-			}
-		}
-	} else {
-		log.Printf("EquipItem: dataLen=%d", len(data))
+	d := msg.Data()
+	if len(d) < 4 {
+		log.Printf("EquipItem: dataLen=%d", len(d))
+		return
 	}
+	slot, equip := int(d[2]), int64(d[3])
+	inv := gs.Inventory()
+	if slot >= len(inv) {
+		log.Printf("EquipItem: slot %d of %d", slot, len(inv))
+		return
+	}
+	wear := inv[slot].Slot
+	if !fitsEquip(wear, equip) {
+		log.Printf("EquipItem: %q (wear slot %d) does not fit equip slot %d", inv[slot].Name, wear, equip)
+		return
+	}
+	listUnequip(inv, equip)
+	for _, e := range equipDisplaces(wear, equip) {
+		listUnequip(inv, e)
+	}
+	inv[slot].EquipLocation = equip
+	log.Printf("EquipItem: %q -> equip slot %d", inv[slot].Name, equip)
 }
 
-// handleUnequipItem handles opcode 0x0040 — unequip confirmation.
-// PS2 wire format: 1 byte = equipLoc (body position that was unequipped).
+// handleUnequipItem handles opcode 0x0040, Msg0040 (CLIENT 0x00BCB8A0): an
+// equip slot byte; whatever is worn there comes off (VIItemList::Unequip).
 func (gs *GameState) handleUnequipItem(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) >= 3 {
-		equipLoc := data[2]
-		log.Printf("UnequipItem: equipLoc=%d", equipLoc)
-		// Find item with matching EquipLocation and clear it.
-		// Only update accessories. Visible equipment uses state channel.
-		if isAccessoryEquipLoc(int(equipLoc)) {
-			for i := range gs.ParsedItems {
-				if gs.ParsedItems[i].EquipLocation == int64(equipLoc) {
-					log.Printf("UnequipItem: idx %d %q EquipLocation %d → -1", i, gs.ParsedItems[i].Name, equipLoc)
-					gs.ParsedItems[i].EquipLocation = -1
-					break
-				}
-			}
-		}
-	} else {
-		log.Printf("UnequipItem: dataLen=%d", len(data))
+	d := msg.Data()
+	if len(d) < 3 {
+		log.Printf("UnequipItem: dataLen=%d", len(d))
+		return
+	}
+	if !listUnequip(gs.Inventory(), int64(d[2])) {
+		log.Printf("UnequipItem: nothing worn in equip slot %d", d[2])
 	}
 }
 
-// isAccessoryEquipLoc returns true for equip locations NOT tracked by state channel.
-func isAccessoryEquipLoc(loc int) bool {
-	switch loc {
-	case 2, 3: // Earrings
-		return true
-	case 4: // Neck
-		return true
-	case 6, 7: // Bracelet
-		return true
-	case 9, 10: // Rings
-		return true
-	case 11: // Belt
-		return true
-	}
-	return false
-}
-
-// handleArrangeItem handles opcode 0x003D — move/rearrange inventory item.
+// handleArrangeItem handles opcode 0x003D, Msg003D (CLIENT 0x00BCB208): two
+// inventory slot bytes. The record at the first moves to the second, the ones
+// between shifting towards where it was (VIItemList::Op003D).
 func (gs *GameState) handleArrangeItem(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("ArrangeItem: dataLen=%d", len(data))
+	d := msg.Data()
+	if len(d) < 4 {
+		log.Printf("ArrangeItem: dataLen=%d", len(d))
+		return
+	}
+	inv := gs.invCopy()
+	if !listMove(inv, int(d[2]), int(d[3])) {
+		log.Printf("ArrangeItem: %d -> %d of %d", d[2], d[3], len(inv))
+		return
+	}
+	gs.setLists(inv, gs.Bank())
 }
 
-// handleLootOptions handles opcode 0x0085 — loot option settings.
+// handleLootOptions handles opcode 0x0085 (CLIENT's dispatcher, 0x00BD1E88):
+// one byte, why the corpse cannot be looted, shown in the text window as word
+// 673, 674 or 675. Any other value shows nothing.
 func (gs *GameState) handleLootOptions(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("LootOptions: dataLen=%d", len(data))
+	d := msg.Data()
+	if len(d) < 3 {
+		return
+	}
+	if id := map[byte]int{1: 673, 2: 674, 3: 675}[d[2]]; id != 0 {
+		gs.addChatMessage(itemWords[id], ChatSystem)
+	}
 }
 
-// handleClientCloseLoot handles opcode 0x0016 — close loot window.
+// handleClientCloseLoot handles opcode 0x0016 (CLIENT's dispatcher,
+// 0x00BD1E50): the loot window closes and the corpse list empties.
 func (gs *GameState) handleClientCloseLoot(msg *protocol.Message) {
-	log.Printf("ClientCloseLoot: loot window closed")
+	gs.HaveCorpse = false
+	gs.Corpse = nil
+	gs.corpseNext = 0
 }
 
-// handlePrepareItem handles opcode 0x000A — equipment hotbar swap confirmation.
-// Server response format (from PS2 pcap): slot(uint8) + action(uint8) = 2 bytes
-// Action: 0=unequip to hotbar, 2=equip from hotbar, 3=swap hotbar slot.
-// Client sends 5 bytes (uint32 slot + action), server confirms with 2 bytes.
+// handlePrepareItem handles opcode 0x000A, Msg000A (CLIENT 0x00BD9C18): an
+// inventory slot byte and a quick slot byte. A quick slot under 4 takes the
+// item if it fits there — P4C 2 in slots 0-1, P4C 7 in slot 2, a weapon's wear
+// slot in slot 3 (FitsSlot3) — and the item that held it lets go. Anything
+// else changes nothing: the PS2's test for 255 sits inside its test for < 4.
 func (gs *GameState) handlePrepareItem(msg *protocol.Message) {
-	data := msg.Data()
-	payload := data[2:] // skip opcode
-	if len(payload) < 2 {
-		log.Printf("PrepareItem: dataLen=%d (too short)", len(payload))
+	d := msg.Data()
+	if len(d) < 4 {
+		log.Printf("PrepareItem: dataLen=%d (too short)", len(d))
 		return
 	}
-	slot := payload[0]
-	action := payload[1]
-	actionName := "unknown"
-	switch action {
-	case 0:
-		actionName = "unequip→hotbar"
-	case 2:
-		actionName = "equip←hotbar"
-	case 3:
-		actionName = "swap"
-	}
-	log.Printf("PrepareItem: slot=%d action=%d(%s)", slot, action, actionName)
-}
-
-// handleAdjustItemHP handles opcode 0x0060 — item durability change.
-// PS2 pcap confirmed: invSlot(uint32 LE) + remainingHP(uint16 LE) = 6 bytes after opcode.
-func (gs *GameState) handleAdjustItemHP(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 8 { // 2 opcode + 4 slot + 2 hp
-		log.Printf("AdjustItemHP: dataLen=%d (too short)", len(data))
+	slot, pos := int(d[2]), int64(d[3])
+	inv := gs.Inventory()
+	if pos >= 4 || slot >= len(inv) {
+		log.Printf("PrepareItem: slot %d of %d, quick slot %d", slot, len(inv), pos)
 		return
 	}
-	invSlot := binary.LittleEndian.Uint32(data[2:6])
-	remainingHP := binary.LittleEndian.Uint16(data[6:8])
-	log.Printf("AdjustItemHP: invSlot=%d remainingHP=%d", invSlot, remainingHP)
-	if int(invSlot) < len(gs.ParsedItems) {
-		gs.ParsedItems[invSlot].RemainingHP = int64(remainingHP)
-	}
-}
-
-// handleBlackSmithMenu handles opcode 0x0061 — blacksmith/repair menu.
-// Server sends item list (fragmented) or 4-byte repair cost summary.
-func (gs *GameState) handleBlackSmithMenu(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) <= 6 {
-		// Short form: 4 bytes — total repair cost or blacksmith NPC info.
-		if len(data) >= 6 {
-			cost := binary.LittleEndian.Uint32(data[2:6])
-			gs.BlacksmithRepairCost = int(cost)
-			log.Printf("BlackSmithMenu: repairCost=%d", cost)
+	prev := -1
+	for i := range inv {
+		if inv[i].QuickSlot == pos {
+			prev = i
+			break
 		}
-		gs.BlacksmithOpen = true
-		return
 	}
-	// Long form: item list (same DSP format as MemoryDump).
-	log.Printf("BlackSmithMenu: dataLen=%d (item list)", len(data))
-	gs.BlacksmithOpen = true
+	it := &inv[slot]
+	if (it.P4C == 2 && pos < 2) || (it.P4C == 7 && pos == 2) || (fitsQuickSlot3(it.Slot) && pos == 3) {
+		if prev != -1 {
+			inv[prev].QuickSlot = -1
+		}
+		it.QuickSlot = pos
+	}
+	log.Printf("PrepareItem: %q quick slot %d -> %d", it.Name, pos, it.QuickSlot)
 }
 
-// handleCloseBlacksmith handles opcode 0x0063 — close blacksmith window.
+// handleAdjustItemHP handles opcode 0x0060, Msg0060 (CLIENT 0x00BD2A14,
+// VIItemList::Op0060): an item KEY (u32) and a zigzag HP, the current HP of
+// the inventory record with that key, floored at 0. (The PS2 writes it 12
+// bytes before the list when no record has the key.)
+func (gs *GameState) handleAdjustItemHP(msg *protocol.Message) {
+	r := buffer.NewReader(msg.Data()[2:])
+	key, err1 := r.ReadUint32()
+	hp, err2 := readSigned(r)
+	if err1 != nil || err2 != nil {
+		log.Printf("AdjustItemHP: dataLen=%d (too short)", len(msg.Data()))
+		return
+	}
+	inv := gs.Inventory()
+	i := listFind(inv, key)
+	if i < 0 {
+		log.Printf("AdjustItemHP: no inventory record has key %d", key)
+		return
+	}
+	if hp < 0 {
+		hp = 0
+	}
+	inv[i].RemainingHP = int64(hp)
+}
+
+// handleBlackSmithMenu handles opcode 0x0061, Msg0061 (CLIENT): one u32, the
+// blacksmith, kept to send back with every repair (Send0062), and the repair
+// window opens. (The PS2 opens it only when no other panel is up.)
+func (gs *GameState) handleBlackSmithMenu(msg *protocol.Message) {
+	d := msg.Data()
+	if len(d) < 6 {
+		log.Printf("BlackSmithMenu: dataLen=%d (too short)", len(d))
+		return
+	}
+	gs.BlacksmithID = binary.LittleEndian.Uint32(d[2:6])
+	gs.BlacksmithOpen = true
+	log.Printf("BlackSmithMenu: blacksmith 0x%08X", gs.BlacksmithID)
+}
+
+// handleCloseBlacksmith handles opcode 0x0063, Msg0063 (CLIENT): the
+// blacksmith is forgotten and the window closes.
 func (gs *GameState) handleCloseBlacksmith(msg *protocol.Message) {
-	log.Printf("CloseBlacksmith: window closed")
+	gs.BlacksmithID = 0xFFFFFFFF
 	gs.BlacksmithOpen = false
 }
 
-// handleInventoryFull handles opcode 0x00D7 — inventory full notification.
+// handleInventoryFull handles opcode 0x00D7, Msg00D7 (CLIENT): no payload. It
+// clears the PS2's three request-pending flags (a merchant request at
+// +0x1B304, the bank's at VIBankControl+0x78C8, an item use at +0x13B90) and
+// shows nothing. The Go client keeps none of the three.
 func (gs *GameState) handleInventoryFull(msg *protocol.Message) {
-	log.Printf("InventoryFull: inventory is full")
-	gs.addChatMessage("Your inventory is full.", ChatError)
+	log.Printf("0x00D7: request flags cleared")
 }
 
-// handleTradeUI handles opcode 0x0056 — trade window.
+// handleTradeUI handles opcode 0x0056 (CLIENT's dispatcher, 0x00BD28A8): a
+// sub-type byte and the partner (u32). Only 1, 2 and 20 are taken from anyone
+// but the partner. 1 and 16 end the trade; 20 ends it after "<name> is busy
+// and cannot accept trades." (word 651) when this side asked for it; 17, 21
+// and 22 are trade errors (words 733-735, in red). 2 opens the trade window,
+// 6 and 7 are the window's, and the rest are its offers (TradeA/TradeB). The
+// Go client has no trade window, and answers every offer as busy (0x0057).
 func (gs *GameState) handleTradeUI(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("TradeUI: dataLen=%d", len(data))
+	r := buffer.NewReader(msg.Data()[2:])
+	sub, err1 := r.ReadByte()
+	id, err2 := r.ReadUint32()
+	if err1 != nil || err2 != nil {
+		log.Printf("TradeUI: dataLen=%d", len(msg.Data()))
+		return
+	}
+	if id != gs.TradePartner && sub != 1 && sub != 2 && sub != 20 {
+		return
+	}
+	switch sub {
+	case 1, 16: // Trade01 is Trade16
+		gs.tradeReset()
+	case 20: // Trade20
+		if gs.tradeAsked && gs.tradeEntity != 0xFFFFFFFF {
+			gs.addChatMessage(fmt.Sprintf(itemWords[651], gs.tradeName(gs.tradeEntity, "Unknown")), ChatSystem)
+		}
+		gs.tradeReset()
+	case 17:
+		gs.addChatMessage(itemWords[733], ChatError)
+	case 21:
+		gs.addChatMessage(itemWords[734], ChatError)
+	case 22:
+		gs.addChatMessage(itemWords[735], ChatError)
+	case 2: // Trade02
+		gs.TradePartner = id
+		log.Printf("TradeUI: a trade with 0x%08X opened, and there is no trade window", id)
+	default:
+		log.Printf("TradeUI: sub-type %d from 0x%08X (%d bytes)", sub, id, r.Remaining())
+	}
 }
 
-// handleTradeRequest handles opcode 0x0057 — incoming trade request.
+// handleTradeRequest handles opcode 0x0057, Msg0057 (CLIENT 0x00BDA1A8): the
+// partner and the partner's entity (two u32s). The PS2 puts up the offer when
+// no panel is open; otherwise it says "<name> wants to trade with you, but you
+// are busy." (word 626), declines (0x0056 sub-type 20, the partner) and
+// resets. The Go client has no trade window, so it is always the second.
 func (gs *GameState) handleTradeRequest(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("TradeRequest: dataLen=%d", len(data))
-	strs := extractUTF16Strings(data)
-	if len(strs) > 0 {
-		gs.addChatMessage(fmt.Sprintf("%s wants to trade.", strs[0]), ChatSystem)
+	d := msg.Data()
+	if len(d) < 10 {
+		log.Printf("TradeRequest: dataLen=%d", len(d))
+		return
 	}
+	partner := binary.LittleEndian.Uint32(d[2:6])
+	gs.TradePartner, gs.tradeEntity = partner, binary.LittleEndian.Uint32(d[6:10])
+	gs.addChatMessage(fmt.Sprintf(itemWords[626], gs.tradeName(gs.tradeEntity, "Someone")), ChatSystem)
+	if gs.Conn != nil {
+		decline := make([]byte, 5) // SendOpByteInt(86, 20, partner)
+		decline[0] = 20
+		binary.LittleEndian.PutUint32(decline[1:], partner)
+		gs.Conn.QueueReliable(protocol.OpcodeTradeUI, decline)
+	}
+	gs.tradeReset()
 }
 
 // handleOutMatched is 0x077A (the dispatcher's case), with no payload: word
@@ -1552,25 +1556,23 @@ func extractUTF16Strings16(data []byte) []string {
 	return result
 }
 
-// handleBankUI handles opcode 0x124D — open bank window.
+// handleBankUI handles opcode 0x124D (CLIENT's dispatcher, 0x00BD2654): no
+// payload. The bank window closes and its pending request clears
+// (VIBankControl::Close). The bank's records come with the MemoryDump and
+// change with 0x1250 and 0x1251.
 func (gs *GameState) handleBankUI(msg *protocol.Message) {
-	data := msg.Data()
-	log.Printf("BankUI: dataLen=%d", len(data))
-	if len(data) > 2 {
-		gs.parseAndLogItems("BankUI", data)
-	}
+	log.Printf("BankUI: closed")
 }
 
-// handleConfirmBankTunar handles opcode 0x1253 — bank tunar update.
+// handleConfirmBankTunar handles opcode 0x1253 (VIBankControl::Recv, CLIENT
+// 0x00BB9CF0): one zigzag, the tunar in the bank (VIPlayer+0x38).
 func (gs *GameState) handleConfirmBankTunar(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 6 {
+	v, err := readSigned(buffer.NewReader(msg.Data()[2:]))
+	if err != nil {
 		return
 	}
-	tunar := int64(0)
-	reader := buffer.NewReader(data[2:])
-	tunar, _ = reader.Read7BitEncodedInt64()
-	log.Printf("ConfirmBankTunar: tunar=%d", tunar)
+	gs.BankTunar = int64(v)
+	log.Printf("ConfirmBankTunar: bank tunar=%d", v)
 }
 
 // handleAuctionStuff handles opcode 0x1206 — auction data.
@@ -1642,71 +1644,11 @@ func (gs *GameState) handleAuctionStuff(msg *protocol.Message) {
 			ai.Seller = string(nameBytes)
 		}
 
-		// 23 zigzag item fields (func_00CBACE8)
-		ai.Item.ItemID, _ = reader.Read7BitEncodedInt64()
-		ai.Item.ItemCost, _ = reader.Read7BitEncodedInt64()
-		ai.Item.Unk1, _ = reader.Read7BitEncodedInt64()
-		ai.Item.ItemIcon, _ = reader.Read7BitEncodedInt64()
-		ai.Item.Unk2, _ = reader.Read7BitEncodedInt64()
-		ai.Item.Slot, _ = reader.Read7BitEncodedInt64()
-		ai.Item.Unk3, _ = reader.Read7BitEncodedInt64()
-		ai.Item.NoTrade, _ = reader.Read7BitEncodedInt64()
-		ai.Item.NoRent, _ = reader.Read7BitEncodedInt64()
-		ai.Item.Unk4, _ = reader.Read7BitEncodedInt64()
-		ai.Item.AttackType, _ = reader.Read7BitEncodedInt64()
-		ai.Item.WeaponDamage, _ = reader.Read7BitEncodedInt64()
-		ai.Item.Unk5, _ = reader.Read7BitEncodedInt64()
-		ai.Item.LevelReq, _ = reader.Read7BitEncodedInt64()
-		ai.Item.MaxStack, _ = reader.Read7BitEncodedInt64()
-		ai.Item.MaxHP, _ = reader.Read7BitEncodedInt64()
-		ai.Item.Duration, _ = reader.Read7BitEncodedInt64()
-		ai.Item.ClassUse, _ = reader.Read7BitEncodedInt64()
-		ai.Item.RaceUse, _ = reader.Read7BitEncodedInt64()
-		ai.Item.ProcAnim, _ = reader.Read7BitEncodedInt64()
-		ai.Item.IsLore, _ = reader.Read7BitEncodedInt64()
-		ai.Item.Unk6, _ = reader.Read7BitEncodedInt64()
-		ai.Item.IsCraft, _ = reader.Read7BitEncodedInt64()
-
-		// Name (uint32 charCount + UTF-16) — blob_read format
-		nameLen, err := reader.ReadInt32()
-		if err != nil {
-			log.Printf("AuctionStuff[%d]: name read error at pos %d: %v", i, reader.Position(), err)
+		// The item proper (func_00CBACE8), as every item record carries it.
+		if err := readItemBody(reader, &ai.Item); err != nil {
+			log.Printf("AuctionStuff[%d]: item at pos %d seller=%q itemID=%d: %v",
+				i, reader.Position(), ai.Seller, auctionItemID, err)
 			break
-		}
-		if nameLen > 0 && nameLen < 200 {
-			ai.Item.Name, _ = reader.ReadStringUnicode(int(nameLen))
-		} else if nameLen != 0 {
-			log.Printf("AuctionStuff[%d]: bad name len %d at pos %d seller=%q itemID=%d",
-				i, nameLen, reader.Position(), ai.Seller, auctionItemID)
-			break
-		}
-
-		// Description
-		descLen, err := reader.ReadInt32()
-		if err != nil {
-			log.Printf("AuctionStuff[%d]: desc read error at pos %d", i, reader.Position())
-			break
-		}
-		if descLen > 0 && descLen < 500 {
-			ai.Item.Desc, _ = reader.ReadStringUnicode(int(descLen))
-		} else if descLen != 0 {
-			log.Printf("AuctionStuff[%d]: bad desc len %d at pos %d name=%q",
-				i, descLen, reader.Position(), ai.Item.Name)
-			break
-		}
-
-		// Stats (zigzag count + pairs)
-		statSize, _ := reader.Read7BitEncodedInt64()
-		if statSize > 0 && statSize < 50 {
-			ai.Item.Stats = make(map[int]int64)
-			for j := int64(0); j < statSize; j++ {
-				idx, _ := reader.Read7BitEncodedInt64()
-				val, e := reader.Read7BitEncodedInt64()
-				if e != nil {
-					break
-				}
-				ai.Item.Stats[int(idx)] = val
-			}
 		}
 
 		bytesConsumed := reader.Position() - startPos
