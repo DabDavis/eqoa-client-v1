@@ -126,3 +126,15 @@ func TestRulesClamps(t *testing.T) {
 		t.Errorf("sandstorm world 6: %q", name)
 	}
 }
+
+// A patch's table shorter than retail's, with the clamp kept, is read as far
+// as it goes.
+func TestShortTintTable(t *testing.T) {
+	r := RulesFromPatch(&sspatch.Features{Tints: []sspatch.RGBA{{1, 2, 3, 4}, {5, 6, 7, 8}}})
+	if r.TintCount() != 2 || r.Tint(1) != (TintColor{5, 6, 7, 8}) || r.Tint(14) != (TintColor{1, 2, 3, 4}) {
+		t.Fatalf("count %d, %v %v", r.TintCount(), r.Tint(1), r.Tint(14))
+	}
+	if r := RulesFromPatch(&sspatch.Features{Tints: []sspatch.RGBA{}}); r.TintCount() != 15 || r.Tint(3) != Tints[3] {
+		t.Fatal("an empty table is retail's")
+	}
+}

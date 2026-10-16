@@ -86,7 +86,7 @@ var sandstormWorldNameIDs = [8]int{0x413, 0x414, 0x5A0, 0x5B6, 0x5B7, 0x6F8, 0x6
 func RulesFromPatch(f *sspatch.Features) Rules {
 	r := RetailRules()
 	r.Source = "S2"
-	if f.Tints != nil {
+	if len(f.Tints) > 0 {
 		r.tints = make([]TintColor, len(f.Tints))
 		for i, t := range f.Tints {
 			r.tints[i] = TintColor{t[0], t[1], t[2], t[3]}
@@ -155,10 +155,13 @@ func (r Rules) String() string {
 // 15 or more into 0; a patch that removes that clamp (S2 nops
 // SetArmorSlot+0x58) lets an index reach the end of its own table.
 func (r Rules) TintCount() int {
-	if r.tints != nil && r.tintClampRemoved {
+	switch {
+	case r.tints == nil:
+		return 15
+	case r.tintClampRemoved:
 		return len(r.tints)
 	}
-	return 15
+	return min(15, len(r.tints))
 }
 
 // Tint is the colour of a tint index; past TintCount, white (index 0).
@@ -166,7 +169,7 @@ func (r Rules) Tint(i byte) TintColor {
 	if int(i) >= r.TintCount() {
 		i = 0
 	}
-	if r.tints != nil {
+	if int(i) < len(r.tints) {
 		return r.tints[i]
 	}
 	return Tints[i]
