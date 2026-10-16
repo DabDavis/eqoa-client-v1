@@ -120,3 +120,10 @@ Full implementation of EQOA's custom UDP protocol:
 
 - [eqoa-esf-tools](https://github.com/DabDavis/eqoa-esf-tools) — ESF/CSF asset inspection, export, and patching tools
 - [eqoa-pipeline](https://github.com/DabDavis/eqoa-pipeline) — PCSX2 debug tools and zone serve pipeline
+
+## License
+
+MIT (`LICENSE`), for this repository's own work: the client, its tools and its notes. It
+grants no rights in *EverQuest Online Adventures* itself; the game, its binaries and its
+data belong to their owners, and none of them are distributed here. The client reads every
+asset from your own disc image at runtime.
