@@ -656,6 +656,8 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleEntityDataUpdate(msg)
 	case protocol.OpcodeFullEntityRefresh:
 		gs.handleFullEntityRefresh(msg)
+	case protocol.GameOpcode(0x00B6): // Msg00B6: an ability's display index moved
+		gs.handleAbilityDisplayMove(msg)
 
 	// Entity update cascade (world recovery opcodes)
 	case protocol.OpcodeEntityUpdateFullUI:
@@ -740,6 +742,8 @@ func (gs *GameState) HandleMessage(msg *protocol.Message) {
 		gs.handleCooldownTimer(msg)
 	case protocol.OpcodeCastingCombat:
 		gs.handleCastingCombat(msg)
+	case protocol.GameOpcode(0x0776): // Msg0776: a spell effect between two others
+		gs.handlePlayEffect(msg)
 	case protocol.OpcodeSkillBarAck:
 		gs.handleSkillBarAck(msg)
 	case protocol.OpcodeNPCInteractResult:
