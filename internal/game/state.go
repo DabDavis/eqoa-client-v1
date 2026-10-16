@@ -297,15 +297,16 @@ type MailMessage struct {
 
 // FloatingText represents a rising/fading damage or heal number above an entity.
 type FloatingText struct {
-	Text     string    // e.g. "-105" or "+215"
+	Text     string    // |amount|, as CLIENT's "%d" draws it: "105"
 	X, Y, Z  float32  // world position at spawn time
 	SpawnTime time.Time
-	IsHeal   bool      // true=green heal, false=red damage
-	// Color is the server's colour for this number, when it sends one:
-	// Sandstorm's S2 reads three optional bytes after the defender
-	// (R, G, B) and draws the text and its outline in it.
+	IsHeal   bool      // the amount was positive
+	// Color is what the number is drawn in: CLIENT's green (a positive
+	// amount), white (my own hit) or yellow (a hit on me), or the server's
+	// own when it sends one — Sandstorm's S2 reads three optional bytes
+	// after the defender (R, G, B) and draws the text and its outline in it.
 	Color    [3]uint8
-	HasColor bool
+	HasColor bool // Color came from the server
 }
 
 // GameState holds all client-side game state.
@@ -375,6 +376,22 @@ type GameState struct {
 	Cooldowns    [10]time.Time
 	CooldownDurs [10]float32 // total cooldown duration in seconds
 
+	// AbilityStamp is VIClient+0x2BB60: the u32 every ability message but
+	// 0x00CD carries, which the client sends back first in 0x0032/0x0033/0x00FE.
+	AbilityStamp uint32
+
+	// MoveLock is VIClient+0x6DC8, the byte 0x00FC sets: while it is non-zero
+	// the walker's forward speed is zeroed (func_00BC3AE8, 0x00BC48D4).
+	MoveLock int
+
+	// ExpDebt is the player record's +0x2C (VIClient+0xC308), which 0x00D9
+	// sets whole. FrontiersForge calls it exp debt; unconfirmed.
+	ExpDebt uint32
+
+	// Words is the string table (WORDS.TXT) handlers print from; the visual
+	// client sets it once it has loaded one. Nil in tests and headless.
+	Words Words
+
 	// Dialogue state (populated by 0x0034 OptionBox / 0x0046 DialogueBox)
 	DialogueText    string   // greeting or message text
 	DialogueOptions []string // selectable options (empty for simple dialogue)
@@ -391,6 +408,7 @@ type GameState struct {
 	// Teleport pending — engine sends EnableChannel + 0x40 on next tick
 	TeleportPending      bool
 	TeleportWorld        byte
+	TeleportToken        int32 // 0x00B2's last u32, sent back zigzag in 0x0049
 	TeleportPhysicsReset bool // client should reset velocityY, onGround, etc.
 
 	// World change — visual client must reload terrain ESF when world ID changes.
@@ -1717,12 +1735,18 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 		log.Printf("Teleport: short data (%d bytes)", len(data))
 		return
 	}
+	// Msg00B2 (0x00BD38C8): u8 world, the position and the HPR as two
+	// VIVect3s (the heading is the HPR's first), then a u32 the client sends
+	// straight back, zigzag, as 0x0049 — 0x49 is 73, SendOpSigned(73, x).
 	reader := buffer.NewReader(data[2:]) // skip opcode
 	world, _ := reader.ReadByte()
 	x, _ := reader.ReadFloat32()
 	y, _ := reader.ReadFloat32()
 	z, _ := reader.ReadFloat32()
 	facing, _ := reader.ReadFloat32()
+	reader.Advance(8) // pitch, roll
+	token, _ := reader.ReadUint32()
+	gs.TeleportToken = int32(token)
 
 	gs.Player.X = x
 	gs.Player.Y = y
@@ -1735,6 +1759,7 @@ func (gs *GameState) handleTeleport(msg *protocol.Message) {
 	// Clear dialogue state
 	gs.DialogueActive = false
 	gs.DialogueOptions = nil
+	gs.MerchantOpen = false // CLIENT closes the merchant (and the bank, trade, loot)
 
 	// Clear all entities from previous zone — PS2 VIEntity visibility is purely
 	// state-channel-driven, so old entities are invalid after zone transition.
@@ -2112,35 +2137,33 @@ func (gs *GameState) handleDisbandGroup(msg *protocol.Message) {
 	})
 }
 
+// handleClassicTargetInfo is 0x0010 (Msg0010, 0x00BD9D60): three bytes —
+// the disposition (FrontiersForge 0..6; Go: face), then +0x2BB70 (Go: con)
+// and +0x2BB74 — two 64-character wide strings, then a u32 that must equal
+// the request's first word (Go sends 0) for the three bytes to land. The
+// strings are stored either way. Sandstorm sends no u32 at all (149 of 149
+// captured replies are 261 bytes), so the PS2 compares an uninitialised
+// local; Go takes a missing one as a match.
 func (gs *GameState) handleClassicTargetInfo(msg *protocol.Message) {
 	data := msg.Data()
-	// Wire format (from PS2 decompilation of func_00BD9D60 + pcap verification):
-	//   opcode(2) + faceColor(1) + conColor(1) + guildFlag(1) + title_utf16(128) + guild_utf16(128) + guildID(4)
-	//   Total: 2 + 1 + 1 + 1 + 128 + 128 + 4 = 264 bytes
 	if len(data) < 5 {
 		log.Printf("ClassicTargetInfo: short data (%d bytes)", len(data))
 		return
 	}
-	gs.TargetFaceColor = data[2]
-	gs.TargetConColor = data[3]
-
-	// Parse guild/title if present (guildFlag at byte 4)
-	gs.TargetGuildName = ""
-	gs.TargetTitle = ""
-	if len(data) >= 2+3+128+128 { // opcode + 3 flags + title + guild
-		guildFlag := data[4]
-		if guildFlag != 0 {
-			// Title: bytes 5-132 (64 UTF-16LE wchars = 128 bytes)
-			gs.TargetTitle = decodeUTF16LE(data[5:133])
-			// Guild: bytes 133-260 (64 UTF-16LE wchars = 128 bytes)
-			gs.TargetGuildName = decodeUTF16LE(data[133:261])
-		}
+	disp, con, flag := data[2], data[3], data[4]
+	if len(data) >= 5+256 {
+		gs.TargetTitle = decodeUTF16LE(data[5:133])
+		gs.TargetGuildName = decodeUTF16LE(data[133:261])
 	}
-
-	log.Printf("ClassicTargetInfo: dataLen=%d faceColor=%d conColor=%d guildFlag=%d guild=%q title=%q",
-		len(data), gs.TargetFaceColor, gs.TargetConColor, data[4], gs.TargetGuildName, gs.TargetTitle)
+	if len(data) >= 5+256+4 && binary.LittleEndian.Uint32(data[261:265]) != 0 {
+		log.Printf("ClassicTargetInfo: reply for request %d, not ours", binary.LittleEndian.Uint32(data[261:265]))
+		return
+	}
+	gs.TargetFaceColor = disp
+	gs.TargetConColor = con
+	log.Printf("ClassicTargetInfo: dataLen=%d faceColor=%d conColor=%d flag=%d guild=%q title=%q",
+		len(data), disp, con, flag, gs.TargetGuildName, gs.TargetTitle)
 }
-
 
 // decodePlayerState decodes channel 0 (player self) state data.
 func (gs *GameState) decodePlayerState(data []byte) {
@@ -3035,32 +3058,30 @@ func (gs *GameState) SendCharacterInWorld() {
 // New Opcode Handlers — Parse and log for DB population
 // =============================================================================
 
-// handleGrantXPOrItems handles opcode 0x0020.
-// In C# this is GrantXP (level + XP zigzag), but Sandstorm uses it for inventory items.
-// We try both interpretations.
+// handleGrantXPOrItems is 0x0020 (the dispatcher's case): zigzag level, then
+// zigzag experience, straight into the player record (+0xC300, +0xC304). A
+// higher level than before plays UI sound 16 (not ported). The item-list
+// reading of it this handler used to try has no basis in CLIENT.
 func (gs *GameState) handleGrantXPOrItems(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 4 {
+	if len(data) < 2 {
 		return
 	}
-
-	// If data is short (<20 bytes), try GrantXP format: opcode(2) + zigzag(level) + zigzag(xp)
-	if len(data) < 20 {
-		reader := buffer.NewReader(data[2:])
-		level, err1 := reader.Read7BitEncodedInt64()
-		xp, err2 := reader.Read7BitEncodedInt64()
-		if err1 == nil && err2 == nil && level > 0 && level < 70 {
-			gs.Player.Level = byte(level)
-			gs.Player.XPRaw = xp
-			gs.Player.XPPct = xpLevelPct(int(level), xp)
-			log.Printf("GrantXP: level=%d xp=%d xpPct=%d", level, xp, gs.Player.XPPct)
-			writeItemLog("XP", fmt.Sprintf("level=%d xp=%d xpPct=%d", level, xp, gs.Player.XPPct))
-			return
-		}
+	reader := buffer.NewReader(data[2:])
+	level, err := vimsSigned(reader)
+	if err != nil {
+		return
 	}
-
-	// Otherwise, treat as inventory/item data — extract items
-	gs.parseAndLogItems("0x0020_GrantXP", data)
+	old := gs.Player.Level
+	gs.Player.Level = byte(level)
+	xp, err := vimsSigned(reader)
+	if err != nil {
+		return
+	}
+	gs.Player.XPRaw = int64(xp)
+	gs.Player.XPPct = xpLevelPct(int(level), int64(xp))
+	log.Printf("GrantXP: level=%d (was %d) xp=%d xpPct=%d", level, old, xp, gs.Player.XPPct)
+	writeItemLog("XP", fmt.Sprintf("level=%d xp=%d xpPct=%d", level, xp, gs.Player.XPPct))
 }
 
 // FindItemIndex returns the index of a ParsedItem by key, or -1 if not found.
@@ -3208,78 +3229,102 @@ func (gs *GameState) handleAddQuestLog(msg *protocol.Message) {
 	writeItemLog("Quest", fmt.Sprintf("id=%d text=%q", questNum, text))
 }
 
+// handleDamageIndication is 0x00DB: u32 attacker, zigzag amount, u32 defender
+// (the dispatcher's case, 0x00BD2D70), then Sandstorm's optional R, G, B. An
+// attack of my own is DamageFromSelf (0x00BDC220): the number floats over the
+// defender. Anyone else's is DamageFromOther (0x00BDC288): it floats over ME,
+// and the defender is not used. VIClientPart4FD28 draws |amount| with "%d"
+// (func_00BE96A8), green when the amount is positive, else white for my own
+// hit and yellow for one on me (func_00BE9198); S2's colour replaces that.
+// Not ported: both are skipped under game option +0x92, and DamageFromOther
+// also in camera mode 0 or under a modal window.
 func (gs *GameState) handleDamageIndication(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 6 {
+	if len(data) < 2 {
 		return
 	}
-	payload := data[2:] // skip opcode
-	payLen := len(payload)
-	// Format: sourceObjID(4) + zigzag(damage) + targetObjID(4)
-	if payLen >= 9 {
-		sourceID := binary.LittleEndian.Uint32(payload[0:4])
-		reader := buffer.NewReader(payload[4:])
-		dmg, _ := reader.Read7BitEncodedInt64()
-		var targetID uint32
-		if reader.Remaining() >= 4 {
-			targetID, _ = reader.ReadUint32()
-		}
-		// Sandstorm's S2 (cave 0x000FBA40): three more bytes are an RGB the
-		// number is drawn in. Without them it keeps the retail colours.
-		var color [3]uint8
-		hasColor := false
-		if reader.Remaining() >= 3 {
-			rgb, _ := reader.ReadBytes(3)
-			copy(color[:], rgb)
-			hasColor = true
-		}
-
-		sourceName := gs.resolveObjectName(sourceID)
-		targetName := gs.resolveObjectName(targetID)
-
-		// Combat log
-		if dmg > 0 {
-			log.Printf("COMBAT: %s → %s heal=%+d", sourceName, targetName, dmg)
-		} else {
-			log.Printf("COMBAT: %s → %s dmg=%d", sourceName, targetName, dmg)
-		}
-
-		// Track when player takes damage (for hit reaction animation)
-		if targetID == gs.PlayerObjectID && dmg < 0 {
-			gs.PlayerHitTime = time.Now()
-		}
-
-		// Track when any entity takes damage (for NPC hit reaction animation)
-		if ent, ok := gs.Entities[targetID]; ok && dmg < 0 {
-			ent.LastDamageTime = time.Now()
-		}
-
-		// PS2 DamageIndication handler (0x00BD2D70) only queues floating damage
-		// text — it does NOT trigger attack animations or spell FX. Attack anims
-		// are driven entirely by CastingCombat → spell FX PlayAttack events.
-
-		// Spawn floating damage/heal text above target (victim)
-		var fx, fy, fz float32
-		if targetID == gs.PlayerObjectID {
-			fx, fy, fz = gs.Player.X, gs.Player.Y, gs.Player.Z
-		} else if ent, ok := gs.Entities[targetID]; ok {
-			fx, fy, fz = ent.X, ent.Y, ent.Z
-		}
-		text := fmt.Sprintf("%d", dmg)
-		if dmg > 0 {
-			text = fmt.Sprintf("+%d", dmg)
-		}
-		gs.FloatingTexts = append(gs.FloatingTexts, FloatingText{
-			Text:      text,
-			X:         fx,
-			Y:         fy,
-			Z:         fz,
-			SpawnTime: time.Now(),
-			IsHeal:    dmg > 0,
-			Color:     color,
-			HasColor:  hasColor,
-		})
+	reader := buffer.NewReader(data[2:])
+	sourceID, err := reader.ReadUint32()
+	if err != nil {
+		return
 	}
+	amount, err := vimsSigned(reader)
+	if err != nil {
+		return
+	}
+	targetID := uint32(0xFFFFFFFF)
+	if v, err := reader.ReadUint32(); err == nil {
+		targetID = v
+	}
+	// Sandstorm's S2 (cave 0x000FBA40): three more bytes are an RGB the
+	// number is drawn in. Without them it keeps the retail colours.
+	var color [3]uint8
+	hasColor := false
+	if reader.Remaining() >= 3 {
+		rgb, _ := reader.ReadBytes(3)
+		copy(color[:], rgb)
+		hasColor = true
+	}
+	dmg := int64(amount)
+
+	sourceName := gs.resolveObjectName(sourceID)
+	targetName := gs.resolveObjectName(targetID)
+
+	// Combat log
+	if dmg > 0 {
+		log.Printf("COMBAT: %s → %s heal=%+d", sourceName, targetName, dmg)
+	} else {
+		log.Printf("COMBAT: %s → %s dmg=%d", sourceName, targetName, dmg)
+	}
+
+	// Track when player takes damage (for hit reaction animation)
+	if targetID == gs.PlayerObjectID && dmg < 0 {
+		gs.PlayerHitTime = time.Now()
+	}
+
+	// Track when any entity takes damage (for NPC hit reaction animation)
+	if ent, ok := gs.Entities[targetID]; ok && dmg < 0 {
+		ent.LastDamageTime = time.Now()
+	}
+
+	// The number: over whom, and in which colour.
+	over := gs.PlayerObjectID
+	mine := sourceID == gs.PlayerObjectID
+	if mine {
+		over = targetID
+	}
+	var fx, fy, fz float32
+	if over == gs.PlayerObjectID {
+		fx, fy, fz = gs.Player.X, gs.Player.Y, gs.Player.Z
+	} else if ent, ok := gs.Entities[over]; ok {
+		fx, fy, fz = ent.X, ent.Y, ent.Z
+	} else {
+		return // AddDamage's actor is not in the scene: nothing is drawn
+	}
+	if !hasColor {
+		switch {
+		case amount > 0:
+			color = [3]uint8{0, 255, 0}
+		case mine:
+			color = [3]uint8{255, 255, 255}
+		default:
+			color = [3]uint8{204, 204, 25} // (0.8, 0.8, 0.1)
+		}
+	}
+	shown := amount
+	if shown < 0 {
+		shown = -shown // negu: INT32_MIN stays itself, as on the EE
+	}
+	gs.FloatingTexts = append(gs.FloatingTexts, FloatingText{
+		Text:      fmt.Sprintf("%d", shown),
+		X:         fx,
+		Y:         fy,
+		Z:         fz,
+		SpawnTime: time.Now(),
+		IsHeal:    amount > 0,
+		Color:     color,
+		HasColor:  hasColor,
+	})
 }
 
 // handlePlayerSearchEntry appends one result of Sandstorm's player search,
@@ -3343,64 +3388,33 @@ func (gs *GameState) getEquippedProcAnim() uint32 {
 	return 0
 }
 
+// handleResourceUpdate is 0x0775 (the dispatcher's case, 0x00BD1930): u32
+// entity id, u8 action, and nothing more. The entity's character sprite plays
+// the action (VICSprite::SetAction, the same call a spell's SetAction event
+// makes); on my own character only action 34 does, which the drowning
+// capture sends (breath_capture.pcap).
 func (gs *GameState) handleResourceUpdate(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 6 {
+	if len(data) < 7 {
 		return
 	}
-	payload := data[2:]
-
-	// PS2 wire format (0x00BD1930):
-	//   objectID(uint32) + animationAction(uint8)
-	//   → entity lookup + SetAction
-	//   → then reads HP fields, interaction type, etc.
-	if len(payload) < 5 {
-		log.Printf("ResourceUpdate: short payload %d bytes", len(payload))
+	objectID := binary.LittleEndian.Uint32(data[2:6])
+	action := data[6]
+	if objectID != gs.PlayerObjectID && gs.Entities[objectID] == nil {
+		return // FindEntity fails
+	}
+	if objectID == gs.PlayerObjectID && action != 34 {
 		return
 	}
-
-	objectID := binary.LittleEndian.Uint32(payload[0:4])
-	animAction := payload[4]
-	name := gs.resolveObjectName(objectID)
-
-	log.Printf("ResourceUpdate: obj=0x%08X(%s) animAction=%d remaining=%d",
-		objectID, name, animAction, len(payload)-5)
-
-	// Set animation action on the entity
-	if ent, ok := gs.Entities[objectID]; ok {
-		ent.Animation = animAction
-		ent.LastUpdate = time.Now()
+	log.Printf("ResourceUpdate: obj=0x%08X(%s) action=%d", objectID, gs.resolveObjectName(objectID), action)
+	sys := gs.SpellFXSys
+	if sys == nil || sys.OnSetAction == nil {
+		return
 	}
-
-	// Parse additional HP/interaction data if present
-	if len(payload) > 5 {
-		reader := buffer.NewReader(payload[5:])
-
-		// PS2 reads HP current/max at entity+0xC300/C304
-		if reader.Remaining() >= 8 {
-			hpCur, _ := reader.ReadUint32()
-			hpMax, _ := reader.ReadUint32()
-			if objectID == gs.PlayerObjectID {
-				gs.Player.HPInt = int32(hpCur)
-				gs.Player.MaxHPInt = int32(hpMax)
-				if hpMax > 0 {
-					gs.Player.HP = byte(hpCur * 255 / hpMax)
-				}
-				log.Printf("  → HP=%d/%d", hpCur, hpMax)
-			} else if ent, ok := gs.Entities[objectID]; ok {
-				ent.HPInt = int32(hpCur)
-				ent.MaxHPInt = int32(hpMax)
-				if hpMax > 0 {
-					ent.HP = byte(hpCur * 255 / hpMax)
-				}
-			}
-		}
-
-		// Remaining bytes: interaction counter, NPC type dispatch, 1024-byte blob
-		if reader.Remaining() > 0 {
-			log.Printf("  → extra %d bytes remaining", reader.Remaining())
-		}
+	if sys.IsCSprite != nil && !sys.IsCSprite(objectID) {
+		return // GetActorSpriteType != 5
 	}
+	sys.OnSetAction(objectID, int32(action))
 }
 
 // resolveObjectName returns a display name for an ObjectID by checking known entities.
@@ -3414,8 +3428,13 @@ func (gs *GameState) resolveObjectName(objectID uint32) string {
 	return "?"
 }
 
+// handleCharacterDied is 0x005E (Msg005E, 0x00BDAEB8). It has no payload:
+// my character takes its death pose, the spells it cast stop, and the cast
+// window clears. Not ported: the "death" cue at 0.4, UI mode 0, auto-attack
+// off (m_autoAttack = 0), every pending group invite declined (op 1572,
+// reason 3), the camera reset. The XP-loss, death-text and chat fields this
+// handler used to read are not on the wire.
 func (gs *GameState) handleCharacterDied(msg *protocol.Message) {
-	data := msg.Data()
 	if !gs.Player.Dead {
 		gs.SpellFXSys.StopIfThisWasCaster(gs.PlayerObjectID) // CLIENT: after SetDeath
 	}
@@ -3424,87 +3443,43 @@ func (gs *GameState) handleCharacterDied(msg *protocol.Message) {
 	gs.Player.HP = 0
 	gs.Player.HPInt = 0
 	gs.Player.Speed = 0
-
-	// PS2 shared tail: XP loss (2×int64), death UI string (64 bytes), chat message (24 bytes)
-	reader := buffer.NewReader(data[2:])
-
-	// Try to read XP loss (2 × int64 = 16 bytes)
-	if reader.Remaining() >= 16 {
-		xpBytes, _ := reader.ReadBytes(16)
-		xpLoss1 := int64(binary.LittleEndian.Uint64(xpBytes[0:8]))
-		xpLoss2 := int64(binary.LittleEndian.Uint64(xpBytes[8:16]))
-		if xpLoss1 != 0 || xpLoss2 != 0 {
-			log.Printf("CharacterDied: xpLoss=%d,%d", xpLoss1, xpLoss2)
-		}
-	}
-
-	// Try to read death UI string (64 bytes)
-	deathMsg := ""
-	if reader.Remaining() >= 64 {
-		msgBytes, err := reader.ReadBytes(64)
-		if err == nil {
-			for i, b := range msgBytes {
-				if b == 0 {
-					deathMsg = string(msgBytes[:i])
-					break
-				}
-			}
-		}
-	}
-
-	// Try to read chat message (24 bytes)
-	chatMsg := ""
-	if reader.Remaining() >= 24 {
-		chatBytes, err := reader.ReadBytes(24)
-		if err == nil {
-			for i, b := range chatBytes {
-				if b == 0 {
-					chatMsg = string(chatBytes[:i])
-					break
-				}
-			}
-		}
-	}
-
-	if deathMsg != "" {
-		gs.addChatMessage(deathMsg, ChatSystem)
-	} else if chatMsg != "" {
-		gs.addChatMessage(chatMsg, ChatSystem)
-	} else {
-		gs.addChatMessage("You have died!", ChatError)
-	}
-
-	log.Printf("CharacterDied: dead=true deathMsg=%q chatMsg=%q dataLen=%d", deathMsg, chatMsg, len(data))
+	gs.CastStartTime = time.Time{} // m_p2BB40 = m_p2BB48 = 0
+	gs.CastDurationMs = 0
+	gs.addChatMessage("You have died!", ChatError) // Go's own line; CLIENT prints none
+	log.Printf("CharacterDied")
 }
 
+// handleCooldownTimer is 0x00CD (Msg00CD, 0x00BCF500): a u8 display index,
+// the ability stamp, then a zigzag lockout in ms. The first ability with that
+// display index takes the lockout (Sandstorm sends 0 to clear it); one on the
+// bar also runs the slot's cooldown.
 func (gs *GameState) handleCooldownTimer(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
+	r := abilityReader(msg)
+	display, err := r.ReadByte()
+	if err != nil {
 		return
 	}
-	log.Printf("CooldownTimer: dataLen=%d hex=%X", len(data), data)
-	// Format: opcode(2) + byte(addedOrder) + 4 zero bytes + zigzag_varint(cooldownMs)
-	// addedOrder identifies the spell; we look up which hotbar slot has it.
-	reader := buffer.NewReader(data[2:])
-	addedOrder, _ := reader.ReadByte()
-	reader.ReadBytes(4) // skip 4 reserved zero bytes
-	cooldownMs := int64(0)
-	if reader.Remaining() > 0 {
-		cooldownMs, _ = reader.Read7BitEncodedInt64()
+	stamp, err := r.ReadUint32()
+	if err != nil {
+		return
 	}
-	log.Printf("  → addedOrder=%d cooldown=%dms", addedOrder, cooldownMs)
-
-	// Find which hotbar slot contains the spell with this AddedOrder
-	for i := 0; i < 10; i++ {
-		sp := gs.Hotbar[i]
-		if sp != nil && sp.AddedOrder == int64(addedOrder) {
-			gs.Cooldowns[i] = time.Now().Add(time.Duration(cooldownMs) * time.Millisecond)
-			gs.CooldownDurs[i] = float32(cooldownMs) / 1000.0
-			log.Printf("  → hotbar slot %d (%s) cooldown=%.1fs", i, sp.Name, float64(cooldownMs)/1000)
-			return
-		}
+	gs.AbilityStamp = stamp
+	ms, err := vimsSigned(r)
+	if err != nil {
+		return
 	}
-	log.Printf("  → no hotbar slot found for addedOrder=%d", addedOrder)
+	i := gs.abilityByDisplay(int64(display))
+	if i < 0 {
+		log.Printf("CooldownTimer: no ability with display index %d", display)
+		return
+	}
+	sp := &gs.ParsedSpells[i]
+	sp.Lockout = int64(ms)
+	log.Printf("CooldownTimer: %q display=%d lockout=%dms", sp.Name, display, ms)
+	if slot := sp.WhereOnHotBar; sp.OnHotBar != 0 && slot >= 0 && slot < 10 && gs.Hotbar[slot] == sp {
+		gs.Cooldowns[slot] = time.Now().Add(time.Duration(ms) * time.Millisecond)
+		gs.CooldownDurs[slot] = float32(ms) / 1000.0
+	}
 }
 
 func (gs *GameState) handleCastingCombat(msg *protocol.Message) {
@@ -3650,29 +3625,32 @@ func (gs *GameState) handleCastingCombat(msg *protocol.Message) {
 	}
 }
 
-func (gs *GameState) handleSkillBarAck(msg *protocol.Message) {
+// handlePlayEffect is 0x0776 (Msg0776, 0x00BD9E50): u32 caster, u32 target,
+// u32 effect. Unless I am the caster, and once both are found, the effect
+// plays between them with no cast time and no secondaries.
+func (gs *GameState) handlePlayEffect(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 8 { // 2 opcode + 6 payload
-		log.Printf("SkillBarAck: too short dataLen=%d", len(data))
+	if len(data) < 14 {
 		return
 	}
-	payload := data[2:]
-	flag := binary.LittleEndian.Uint32(payload[0:4])
-	spellIdx := int(payload[4])
-	hotbarSlot := int(payload[5])
-
-	log.Printf("SkillBarAck: flag=%d spellIdx=%d slot=%d", flag, spellIdx, hotbarSlot)
-
-	if hotbarSlot < 0 || hotbarSlot >= 10 {
+	caster := binary.LittleEndian.Uint32(data[2:6])
+	target := binary.LittleEndian.Uint32(data[6:10])
+	effect := binary.LittleEndian.Uint32(data[10:14])
+	if caster == gs.PlayerObjectID {
 		return
 	}
-
-	// Find spell by list index and assign to slot
-	if spellIdx < len(gs.ParsedSpells) {
-		gs.SetHotbarSlot(hotbarSlot, &gs.ParsedSpells[spellIdx])
-	} else {
-		gs.SetHotbarSlot(hotbarSlot, nil) // Clear slot
+	known := func(id uint32) bool { return id == gs.PlayerObjectID || gs.Entities[id] != nil }
+	if !known(caster) || !known(target) {
+		return
 	}
+	log.Printf("PlayEffect: caster=0x%08X target=0x%08X effect=0x%08X", caster, target, effect)
+	gs.SpellFXSys.Play(effect, 0, caster, target, time.Time{})
+}
+
+// handleSkillBarAck is 0x00B4, the server's echo of 0x0033: an ability
+// memorized or forgotten (handleAbilityMemorize).
+func (gs *GameState) handleSkillBarAck(msg *protocol.Message) {
+	gs.handleAbilityMemorize(msg)
 }
 
 func (gs *GameState) handlePlayerTunar(msg *protocol.Message) {
@@ -3681,8 +3659,11 @@ func (gs *GameState) handlePlayerTunar(msg *protocol.Message) {
 		return
 	}
 	reader := buffer.NewReader(data[2:])
-	tunarVal, _ := reader.Read7BitEncodedInt64()
-	gs.Tunar = tunarVal
+	tunarVal, err := vimsSigned(reader) // ReadSigned into the record's +0x34
+	if err != nil {
+		return
+	}
+	gs.Tunar = int64(tunarVal)
 	log.Printf("PlayerTunar: tunar=%d", tunarVal)
 }
 
@@ -4441,68 +4422,11 @@ type AuctionItem struct {
 	PageValues [3]int64
 }
 
-// parseSingleSpell reads one spell entry from the MemoryDump.
-// Sandstorm wire format (matches C# DumpSpell):
-//   9 zigzag + uint16(range) + 7 zigzag + name + desc + byte(0) terminator
-//
-// Fields: SpellID, AddedOrder, OnHotBar, WhereOnHotBar, Unk1, ShowHide,
-//         AbilityLevel, Unk2, Unk3, Range(uint16), CastTime, Power,
-//         IconColor, Icon, Scope, Recast, EqpRequire, Name, Desc, 0x00
+// parseSingleSpell reads one ability of the MemoryDump's list. It is
+// readAbility (VIAbility::Read): CLIENT's ReadAbilities (0x00BDCDC0) and
+// 0x00B3 read the same record.
 func parseSingleSpell(reader *buffer.Reader) (ParsedSpell, error) {
-	var sp ParsedSpell
-
-	// 9 zigzag fields
-	sp.SpellID, _ = reader.Read7BitEncodedInt64()
-	sp.AddedOrder, _ = reader.Read7BitEncodedInt64()
-	sp.OnHotBar, _ = reader.Read7BitEncodedInt64()
-	sp.WhereOnHotBar, _ = reader.Read7BitEncodedInt64()
-	sp.Unk1, _ = reader.Read7BitEncodedInt64()
-	sp.ShowHide, _ = reader.Read7BitEncodedInt64()
-	sp.AbilityLevel, _ = reader.Read7BitEncodedInt64()
-	sp.Unk2, _ = reader.Read7BitEncodedInt64()
-	sp.Unk3, _ = reader.Read7BitEncodedInt64()
-
-	// Range as uint16 (IEEE 754 half-float on wire; store raw for DB)
-	rangeRaw, _ := reader.ReadUint16()
-	sp.Range = int(rangeRaw)
-
-	// 7 zigzag fields
-	sp.CastTime, _ = reader.Read7BitEncodedInt64()
-	sp.Power, _ = reader.Read7BitEncodedInt64()
-	sp.IconColor, _ = reader.Read7BitEncodedInt64()
-	sp.Icon, _ = reader.Read7BitEncodedInt64()
-	sp.Scope, _ = reader.Read7BitEncodedInt64()
-	sp.Recast, _ = reader.Read7BitEncodedInt64()
-	sp.EqpRequire, _ = reader.Read7BitEncodedInt64()
-
-	// Spell name (WriteStringUnicode = int32 charCount + UTF-16LE)
-	nameLen, err := reader.ReadInt32()
-	if err != nil || nameLen < 0 || nameLen > 200 {
-		return sp, fmt.Errorf("bad spell name len: %d (pos=%d)", nameLen, reader.Position())
-	}
-	if nameLen > 0 {
-		sp.Name, err = reader.ReadStringUnicode(int(nameLen))
-		if err != nil {
-			return sp, err
-		}
-	}
-
-	// Spell description
-	descLen, err := reader.ReadInt32()
-	if err != nil || descLen < 0 || descLen > 2000 {
-		return sp, fmt.Errorf("bad spell desc len: %d (pos=%d)", descLen, reader.Position())
-	}
-	if descLen > 0 {
-		sp.Desc, err = reader.ReadStringUnicode(int(descLen))
-		if err != nil {
-			return sp, err
-		}
-	}
-
-	// Terminator byte (0x00)
-	reader.ReadByte()
-
-	return sp, nil
+	return readAbility(reader)
 }
 
 // HotkeySlot holds one directional slot (N/W/E/S) within a hotkey entry.
@@ -4559,26 +4483,28 @@ func parseHotkeys(reader *buffer.Reader, count int64) []HotkeyEntry {
 }
 
 // ParsedSpell holds a decoded spell from the server (DumpSpell fields).
+// ParsedSpell is one ability, VIAbility (game.h): the value of CLIENT's
+// ability map, in VIAbility::Read's order.
 type ParsedSpell struct {
-	SpellID      int64
-	AddedOrder   int64
-	OnHotBar     int64
-	WhereOnHotBar int64
-	Unk1         int64
-	ShowHide     int64
-	AbilityLevel int64
-	Unk2         int64
-	Unk3         int64
-	Range        int   // half-float decoded to int
-	CastTime     int64
-	Power        int64
-	IconColor    int64
-	Icon         int64
-	Scope        int64
-	Recast       int64
-	EqpRequire   int64
-	Name         string
-	Desc         string
+	SpellID       int64           // +0x00: the map's key, the ability id
+	AddedOrder    int64           // +0x04: display index, the server's key for it; 0xFC.. are items
+	OnHotBar      int64           // +0x08: valid — memorized (0x00B4 swaps it)
+	WhereOnHotBar int64           // +0x0C: its slot on the bar; 0x0032 sends it
+	Lockout       int64           // +0x10: cooldown lockout in ms (0x00CD)
+	ShowHide      int64           // +0x14: 0x00FD sets it; 0 also takes it off the bar
+	AbilityLevel  int64           // +0x18
+	RangeF        float32         // +0x1C: a raw float on the wire
+	Range         int             // RangeF as an int, toward zero
+	CastTime      int64           // +0x20
+	Power         int64           // +0x24
+	IconColor     int64           // +0x28: icon back, a UI texture hash
+	Icon          int64           // +0x2C: icon front
+	Scope         int64           // +0x30
+	Recast        int64           // +0x34
+	EqpRequire    int64           // +0x38: a bitmask
+	Name          string          // +0x3C: 64 wide characters
+	Desc          string          // +0xBC: 128
+	Records       []AbilityRecord // +0x1BC: a counted list, empty on Sandstorm
 }
 
 // CMSkill represents one skill in the CM tree.

@@ -44,268 +44,48 @@ func logPS2DisconnectCode(opcode uint16) {
 }
 
 // =============================================================================
-// Entity Lifecycle (0x00B3/B5/B8/FC/FD/FF)
+// The ability messages (0x00B3/B5/B8/FD/FF) and 0x00FC
 // =============================================================================
+//
+// The old notes read these as entity messages. CLIENT's handlers for all five
+// edit the ability map instead (abilities.go); the Go names stay until the
+// dispatch is renamed.
 
-// handleFullEntityCreate handles opcode 0x00B3 — master entity creation.
-// PS2: enters at BCF3A0→BCF0F8→BCF2D0→full creation header, then shared tail.
+// handleFullEntityCreate is 0x00B3, one ability added (handleAbilityAdd).
 func (gs *GameState) handleFullEntityCreate(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 6 {
-		return
-	}
-	reader := buffer.NewReader(data[2:]) // skip opcode
-	gs.parseEntityReliable(reader, "FullEntityCreate", true)
+	gs.handleAbilityAdd(msg)
 }
 
-// handleEntityUpdate handles opcode 0x00B5 — update existing entity properties.
-// PS2: skips creation header, starts at BCF5A8→BCF730→BCF8B0→shared tail.
+// handleEntityUpdate is 0x00B5, a bar entry moved (handleAbilitySlotMove).
 func (gs *GameState) handleEntityUpdate(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 6 {
-		return
-	}
-	reader := buffer.NewReader(data[2:])
-	gs.parseEntityReliable(reader, "EntityUpdate", false)
+	gs.handleAbilitySlotMove(msg)
 }
 
-// handleEntityDetailUpdate handles opcode 0x00B8 — detail refresh (merchant/inspect).
+// handleEntityDetailUpdate is 0x00B8, an ability erased (handleAbilityRemove).
 func (gs *GameState) handleEntityDetailUpdate(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	reader := buffer.NewReader(data[2:])
-	gs.parseEntityReliable(reader, "EntityDetailUpdate", false)
+	gs.handleAbilityRemove(msg)
 }
 
-// handleEntityStateRefresh handles opcode 0x00FC — lightweight state+name refresh.
+// handleEntityStateRefresh is 0x00FC: one byte, stored whole in
+// VIClient+0x6DC8, which zeroes the walker's forward speed while it is set.
 func (gs *GameState) handleEntityStateRefresh(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 4 {
+	if len(data) < 3 {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-	// PS2: reads raw(1) flag then shared entity tail
-	_, err := reader.ReadByte()
-	if err != nil {
-		return
-	}
-	gs.parseEntityReliable(reader, "EntityStateRefresh", false)
+	gs.MoveLock = int(data[2])
+	log.Printf("MoveLock: %d", gs.MoveLock)
 }
 
-// handleEntityDataUpdate handles opcode 0x00FD — entity data with validation.
+// handleEntityDataUpdate is 0x00FD, an ability's +0x14 by id (handleAbilitySetP14).
 func (gs *GameState) handleEntityDataUpdate(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	reader := buffer.NewReader(data[2:])
-	gs.parseEntityReliable(reader, "EntityDataUpdate", false)
+	gs.handleAbilitySetP14(msg)
 }
 
-// handleFullEntityRefresh handles opcode 0x00FF — complete entity property reset.
-// PS2: chains ALL property-set functions.
+// handleFullEntityRefresh is 0x00FF, every ability off the bar
+// (handleAbilityInvalidateAll).
 func (gs *GameState) handleFullEntityRefresh(msg *protocol.Message) {
-	data := msg.Data()
-	if len(data) < 4 {
-		return
-	}
-	reader := buffer.NewReader(data[2:])
-	gs.parseEntityReliable(reader, "FullEntityRefresh", false)
-}
-
-// parseEntityReliable is the shared entity parsing body for 0x00B3/B5/B8/FC/FD/FF.
-// It reads entity ID, name, position, and equipment data from reliable messages
-// and merges into the Entities map (same entities that state channels populate).
-func (gs *GameState) parseEntityReliable(reader *buffer.Reader, source string, isCreate bool) {
-	// Read entity ID (zigzag)
-	entityID, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		log.Printf("%s: failed to read entity ID: %v", source, err)
-		return
-	}
-	objID := uint32(entityID)
-	if objID == 0 {
-		return
-	}
-
-	// Get or create entity
-	ent, exists := gs.Entities[objID]
-	if !exists {
-		ent = &Entity{
-			ObjectID: objID,
-			Scale:    1.0,
-		}
-		gs.Entities[objID] = ent
-		log.Printf("%s: NEW entity 0x%08X", source, objID)
-	}
-
-	// Try to read name (24-byte fixed buffer)
-	if reader.Remaining() >= 24 {
-		nameBytes, err := reader.ReadBytes(24)
-		if err == nil {
-			name := ""
-			for i, b := range nameBytes {
-				if b == 0 {
-					name = string(nameBytes[:i])
-					break
-				}
-			}
-			if name == "" && nameBytes[0] != 0 {
-				name = string(nameBytes)
-			}
-			if name != "" {
-				ent.Name = name
-			}
-		}
-	}
-
-	// Try to read position data (zigzag X, Y, Z)
-	if reader.Remaining() >= 3 {
-		x, err1 := reader.Read7BitEncodedInt64()
-		y, err2 := reader.Read7BitEncodedInt64()
-		z, err3 := reader.Read7BitEncodedInt64()
-		if err1 == nil && err2 == nil && err3 == nil {
-			// Convert from server coordinate space
-			fx := float32(x) / 128.0
-			fy := float32(y) / 128.0
-			fz := float32(z) / 128.0
-			if fx != 0 || fy != 0 || fz != 0 {
-				ent.TargetX = fx
-				ent.TargetY = fy
-				ent.TargetZ = fz
-				if !ent.Interpolating {
-					ent.X = fx
-					ent.Y = fy
-					ent.Z = fz
-					ent.Interpolating = true
-				}
-			}
-		}
-	}
-
-	// Try to read level
-	if reader.Remaining() >= 1 {
-		level, err := reader.Read7BitEncodedInt64()
-		if err == nil && level > 0 && level < 100 {
-			ent.Level = byte(level)
-		}
-	}
-
-	// Extended fields (Go server sends these after level):
-	// modelID(uint32) + hp(byte) + dead(byte) + entityType(byte)
-	// + equipment(3×uint32 + 6×byte + 6×byte + 4×byte + byte + byte)
-	if reader.Remaining() >= 4 {
-		modelID, err := reader.ReadUint32()
-		if err == nil && modelID != 0 {
-			ent.ModelID = modelID
-		}
-	}
-
-	if reader.Remaining() >= 1 {
-		hp, _ := reader.ReadByte()
-		ent.HP = hp
-	}
-
-	if reader.Remaining() >= 1 {
-		dead, _ := reader.ReadByte()
-		if dead == 1 {
-			if !ent.Dead {
-				gs.SpellFXSys.StopIfThisWasCaster(ent.ObjectID) // CLIENT: after SetDeath
-			}
-			ent.Dead = true
-			ent.DeadSince = time.Now()
-		}
-	}
-
-	if reader.Remaining() >= 1 {
-		entType, _ := reader.ReadByte()
-		if entType == 0 {
-			ent.IsNPC = true
-		} else if entType == 1 {
-			ent.IsPlayer = true
-			ent.NameColor = 2 // player name color
-		}
-	}
-
-	// Equipment: weapons (3×uint32)
-	if reader.Remaining() >= 12 {
-		primary, _ := reader.ReadUint32()
-		secondary, _ := reader.ReadUint32()
-		shield, _ := reader.ReadUint32()
-		ent.PrimaryWeapon = primary
-		ent.SecondaryWeapon = secondary
-		ent.Shield = shield
-	}
-
-	// Armor slots (6 bytes)
-	if reader.Remaining() >= 6 {
-		armor, _ := reader.ReadBytes(6)
-		ent.Chest = armor[0]
-		ent.Bracer = armor[1]
-		ent.Gloves = armor[2]
-		ent.Legs = armor[3]
-		ent.Boots = armor[4]
-		ent.Helm = armor[5]
-	}
-
-	// Armor tints (6 bytes)
-	if reader.Remaining() >= 6 {
-		tints, _ := reader.ReadBytes(6)
-		ent.ChestTint = tints[0]
-		ent.BracerTint = tints[1]
-		ent.GlovesTint = tints[2]
-		ent.LegsTint = tints[3]
-		ent.BootsTint = tints[4]
-		ent.HelmTint = tints[5]
-	}
-
-	// Appearance: hairColor, hairLength, hairStyle, face (4 bytes)
-	if reader.Remaining() >= 4 {
-		app, _ := reader.ReadBytes(4)
-		ent.HairColor = app[0]
-		ent.HairLength = app[1]
-		ent.HairStyle = app[2]
-		ent.FaceOption = app[3]
-	}
-
-	// Robe (1 byte, 0xFF = no robe)
-	if reader.Remaining() >= 1 {
-		robe, _ := reader.ReadByte()
-		ent.Robe = robe
-	}
-
-	// Sex (1 byte)
-	if reader.Remaining() >= 1 {
-		sex, _ := reader.ReadByte()
-		ent.Sex = sex
-	}
-
-	ent.LastUpdate = time.Now()
-
-	if isCreate {
-		log.Printf("%s: entity 0x%08X name=%q pos=(%.1f,%.1f,%.1f) level=%d model=0x%08X hp=%d dead=%v type=%v",
-			source, objID, ent.Name, ent.X, ent.Y, ent.Z, ent.Level, ent.ModelID, ent.HP, ent.Dead,
-			func() string {
-				if ent.IsPlayer {
-					return "player"
-				}
-				if ent.IsNPC {
-					return "npc"
-				}
-				return "unknown"
-			}())
-	}
-
-	// Drain remaining data for logging
-	remaining := reader.Remaining()
-	if remaining > 0 && remaining <= 64 {
-		rest, _ := reader.ReadBytes(remaining)
-		log.Printf("%s: entity 0x%08X remaining %d bytes: %X", source, objID, remaining, rest)
-	} else if remaining > 64 {
-		log.Printf("%s: entity 0x%08X remaining %d bytes", source, objID, remaining)
-	}
+	gs.handleAbilityInvalidateAll(msg)
 }
 
 // =============================================================================
@@ -1037,59 +817,17 @@ func (gs *GameState) handleNPCMessage(msg *protocol.Message) {
 	}
 }
 
-// handleHPResourceUpdate handles opcode 0x00D9 — HP/resource update.
-// PS2: entity ID + zigzag amount. Self vs other dispatch. 7-way buff/debuff jump table.
+// handleHPResourceUpdate is 0x00D9 (the dispatcher's case): one raw u32,
+// stored whole in the player record's +0x2C (VIClient+0xC308, Go: ExpDebt).
+// It is not HP — that is the stat channel's (0x42). The entity id, zigzag
+// amount and buff type this handler used to read are not on the wire.
 func (gs *GameState) handleHPResourceUpdate(msg *protocol.Message) {
 	data := msg.Data()
-	if len(data) < 4 {
+	if len(data) < 6 {
 		return
 	}
-	reader := buffer.NewReader(data[2:])
-
-	// Read entity ID
-	entityID, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		return
-	}
-
-	// Read amount (zigzag)
-	amount, err := reader.Read7BitEncodedInt64()
-	if err != nil {
-		return
-	}
-
-	objID := uint32(entityID)
-	isSelf := objID == gs.PlayerObjectID
-
-	log.Printf("HPResourceUpdate: entity=0x%08X amount=%d self=%v", objID, amount, isSelf)
-
-	if isSelf {
-		// Update player HP
-		gs.Player.HPInt += int32(amount)
-		if gs.Player.MaxHPInt > 0 {
-			pct := gs.Player.HPInt * 255 / gs.Player.MaxHPInt
-			if pct < 0 {
-				pct = 0
-			}
-			if pct > 255 {
-				pct = 255
-			}
-			gs.Player.HP = byte(pct)
-		}
-	} else {
-		// Update entity HP
-		if ent, ok := gs.Entities[objID]; ok {
-			ent.HPInt += int32(amount)
-		}
-	}
-
-	// Read buff/debuff type if present (7-way jump table at +0x33950)
-	if reader.Remaining() >= 1 {
-		buffType, _ := reader.Read7BitEncodedInt64()
-		if buffType != 0 {
-			log.Printf("HPResourceUpdate: buffType=%d", buffType)
-		}
-	}
+	gs.ExpDebt = binary.LittleEndian.Uint32(data[2:6])
+	log.Printf("PlayerP2C (0x00D9): %d", gs.ExpDebt)
 }
 
 // =============================================================================
@@ -1445,10 +1183,15 @@ func (gs *GameState) handleTradeRequest(msg *protocol.Message) {
 	}
 }
 
-// handleOutMatched handles opcode 0x077A — outmatched warning.
+// handleOutMatched is 0x077A (the dispatcher's case), with no payload: word
+// 1196 in red (1, 0.25, 0.25), auto-attack off, and 0x077B (1915) back.
 func (gs *GameState) handleOutMatched(msg *protocol.Message) {
-	log.Printf("OutMatched: target too high level")
-	gs.addChatMessage("You are outmatched!", ChatError)
+	log.Printf("OutMatched")
+	gs.addWordLine(gs.wordText(1196), 255, 64, 64)
+	gs.CombatEnded = true // StopAutoAttack: the animation layer turns auto-attack off
+	if gs.Conn != nil {
+		gs.Conn.QueueReliable(protocol.GameOpcode(0x077B), nil)
+	}
 }
 
 // handleGuildInviteStuff handles opcode 0x057A — guild invite.
@@ -1618,16 +1361,15 @@ func (gs *GameState) handleUpdateTrainingPoints(msg *protocol.Message) {
 	if len(data) < 3 {
 		return
 	}
+	// Msg001D (0x00BDCAF0): the record's +0x40 -= z, then the window refreshes.
 	reader := buffer.NewReader(data[2:])
-	spent, err := reader.Read7BitEncodedInt64()
+	z, err := vimsSigned(reader)
 	if err != nil {
 		return
 	}
+	spent := int64(z)
 
 	gs.TrainingPoints -= spent
-	if gs.TrainingPoints < 0 {
-		gs.TrainingPoints = 0
-	}
 	// Clear pending allocations after successful spend
 	gs.TPAlloc = [7]int{}
 	log.Printf("UpdateTrainingPoints: spent=%d remaining=%d", spent, gs.TrainingPoints)

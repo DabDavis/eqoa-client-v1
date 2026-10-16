@@ -770,8 +770,12 @@ func (e *Engine) sendTeleportArrival() {
 	world := e.State.TeleportWorld
 	e.State.TeleportPending = false
 
-	// 1. Send EnableChannel (opcode 0x0049) with world byte
-	if !e.State.Conn.QueueReliable(protocol.OpcodeEnableChannel, []byte{world}) {
+	// 1. Send 0x0049: Msg00B2's SendOpSigned(73, x), the 0x00B2's last u32
+	// back as a zigzag int. Not the world: local-warp.pcap's world-8 warps
+	// carry x = 1 and the PS2 answers 02.
+	w := buffer.NewWriterSize(8)
+	w.Write7BitEncodedInt64(int64(e.State.TeleportToken))
+	if !e.State.Conn.QueueReliable(protocol.OpcodeEnableChannel, w.Bytes()) {
 		log.Printf("WARNING: EnableChannel send window full")
 	}
 
@@ -781,8 +785,8 @@ func (e *Engine) sendTeleportArrival() {
 	// 3. Flush both in one packet
 	e.State.Conn.Flush()
 
-	log.Printf("sendTeleportArrival: EnableChannel(world=%d) + 0x40 at (%.1f, %.1f, %.1f)",
-		world, e.State.Player.X, e.State.Player.Y, e.State.Player.Z)
+	log.Printf("sendTeleportArrival: 0x0049(token=%d) world=%d + 0x40 at (%.1f, %.1f, %.1f)",
+		e.State.TeleportToken, world, e.State.Player.X, e.State.Player.Y, e.State.Player.Z)
 }
 
 // SetMoveTarget starts smooth movement toward a destination.
@@ -1363,7 +1367,9 @@ func (e *Engine) SendCast(abilityByte uint8, objectID uint32) {
 		return
 	}
 	data := make([]byte, 9)
-	// bytes 0-3: always zero (confirmed from 35 PS2 pcap samples)
+	// bytes 0-3: the ability stamp (Send0032), 0 on Sandstorm — every one of
+	// 35 PS2 pcap samples is zero
+	binary.LittleEndian.PutUint32(data[0:4], e.State.AbilityStamp)
 	data[4] = abilityByte
 	binary.LittleEndian.PutUint32(data[5:9], objectID)
 	log.Printf("CAST: ability=%d target=0x%08X hex=%X", abilityByte, objectID, data)
@@ -1388,22 +1394,46 @@ func (e *Engine) SendDialogueOption(dialogueCounter uint32, option byte) {
 	log.Printf("Sent dialogue option: counter=%d option=%d", dialogueCounter, option)
 }
 
-// SendAddSkillToBar sends opcode 0x0033 to add/move a spell on the hotbar.
-// Wire format (6 bytes): uint32 LE flag + byte spellListIndex + byte hotbarSlot.
-// flag=1 to memorize, flag=0 to remove. spellListIndex is the 0-based position
-// in ParsedSpells. hotbarSlot is 0-9.
-func (e *Engine) SendAddSkillToBar(flag uint32, spellIdx byte, hotbarSlot byte) {
+// SendAddSkillToBar sends opcode 0x0033 (Send0033): the ability stamp, the
+// ability's DISPLAY index (ParsedSpell.AddedOrder) and a bar slot 0-9. The
+// server echoes it as 0x00B4, which memorizes the ability if it was not and
+// forgets it if it was — so nothing changes locally until then.
+func (e *Engine) SendAddSkillToBar(displayIndex byte, hotbarSlot byte) {
 	if e.State.Conn == nil {
 		return
 	}
 	data := make([]byte, 6)
-	binary.LittleEndian.PutUint32(data[0:4], flag)
-	data[4] = spellIdx
+	binary.LittleEndian.PutUint32(data[0:4], e.State.AbilityStamp)
+	data[4] = displayIndex
 	data[5] = hotbarSlot
 	if !e.State.Conn.QueueReliable(protocol.OpcodeAddSkillToBar, data) {
 		log.Printf("WARNING: AddSkillToBar send window full")
 	}
-	log.Printf("Sent AddSkillToBar: flag=%d spellIdx=%d slot=%d", flag, spellIdx, hotbarSlot)
+	log.Printf("Sent AddSkillToBar: display=%d slot=%d", displayIndex, hotbarSlot)
+}
+
+// MemorizeAbility puts an ability on the bar at slot with 0x0033. The
+// server's echo (0x00B4) swaps memorized and forgotten, so an ability on the
+// bar elsewhere is forgotten there first, and one already at slot is left.
+func (e *Engine) MemorizeAbility(sp *ParsedSpell, slot byte) {
+	if sp == nil {
+		return
+	}
+	if sp.OnHotBar != 0 {
+		if sp.WhereOnHotBar == int64(slot) {
+			return
+		}
+		e.SendAddSkillToBar(byte(sp.AddedOrder), byte(sp.WhereOnHotBar))
+	}
+	e.SendAddSkillToBar(byte(sp.AddedOrder), slot)
+}
+
+// ForgetAbility takes a memorized ability off the bar: 0x0033 at its slot.
+func (e *Engine) ForgetAbility(sp *ParsedSpell) {
+	if sp == nil || sp.OnHotBar == 0 {
+		return
+	}
+	e.SendAddSkillToBar(byte(sp.AddedOrder), byte(sp.WhereOnHotBar))
 }
 
 // SendDisconnect sends opcode 0x09B0 to notify the server of a clean disconnect,
@@ -1425,7 +1455,8 @@ func (e *Engine) SendClearSpellBar() {
 	if e.State.Conn == nil {
 		return
 	}
-	data := make([]byte, 4) // all zeros
+	data := make([]byte, 4) // the ability stamp (Send00FE); the answer is 0x00FF
+	binary.LittleEndian.PutUint32(data, e.State.AbilityStamp)
 	if !e.State.Conn.QueueReliable(protocol.OpcodeClearSpellBar, data) {
 		log.Printf("WARNING: ClearSpellBar send window full")
 	}

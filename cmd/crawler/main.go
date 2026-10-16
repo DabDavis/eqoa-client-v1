@@ -200,7 +200,7 @@ func (c *Crawler) findBuffSpell() {
 				log.Printf("Found buff spell: %q at hotbar slot %d", sp.Name, c.buffSlot)
 			} else {
 				// Put it on slot 9
-				c.engine.SendAddSkillToBar(1, byte(i), 9)
+				c.engine.MemorizeAbility(&gs.ParsedSpells[i], 9)
 				c.buffSlot = 9
 				log.Printf("Added buff spell %q to hotbar slot 9 (spell index %d)", sp.Name, i)
 				time.Sleep(500 * time.Millisecond)

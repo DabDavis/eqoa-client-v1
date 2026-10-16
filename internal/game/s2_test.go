@@ -79,7 +79,8 @@ func TestDamageColor(t *testing.T) {
 	if gs.FloatingTexts[0].HasColor {
 		t.Fatal("a retail 0x00DB got a colour")
 	}
-	if ft := gs.FloatingTexts[1]; !ft.HasColor || ft.Color != [3]uint8{255, 128, 0} || ft.Text != "-10" {
+	// CLIENT draws |amount| with "%d" (func_00BE96A8): no sign.
+	if ft := gs.FloatingTexts[1]; !ft.HasColor || ft.Color != [3]uint8{255, 128, 0} || ft.Text != "10" {
 		t.Fatalf("coloured number %+v", ft)
 	}
 }

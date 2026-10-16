@@ -117,8 +117,8 @@ func (c *Client) handleMenuInput() {
 			if gpCross {
 				idx := findSpellIndex(gs, c.spellCtxSpellID)
 				if idx >= 0 {
-					c.engine.SendAddSkillToBar(1, byte(idx), byte(c.spellSlotIdx))
-					gs.SetHotbarSlot(c.spellSlotIdx, &gs.ParsedSpells[idx])
+					// The bar changes when the server's 0x00B4 echo arrives.
+					c.engine.MemorizeAbility(&gs.ParsedSpells[idx], byte(c.spellSlotIdx))
 				}
 				c.spellCtxSpellID = -1
 				c.spellSlotPicker = false
@@ -3046,9 +3046,8 @@ func (c *Client) drawSpellSlotPicker() {
 			}
 			idx := findSpellIndex(gs, c.spellCtxSpellID)
 			if idx >= 0 {
-				c.engine.SendAddSkillToBar(1, byte(idx), byte(slot))
-				// Update local hotbar state
-				gs.SetHotbarSlot(slot, &gs.ParsedSpells[idx])
+				// The bar changes when the server's 0x00B4 echo arrives.
+				c.engine.MemorizeAbility(&gs.ParsedSpells[idx], byte(slot))
 			}
 			c.spellCtxSpellID = -1
 			c.spellSlotPicker = false

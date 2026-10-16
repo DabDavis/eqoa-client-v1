@@ -107,7 +107,8 @@ cmd/dumpbgm/main.go                 # Zone BGM placement extractor
 internal/game/
   engine.go                          # Core game loop, position updates, movement
   state.go                           # GameState, packet handling, state channels
-  handlers.go                        # Entity lifecycle opcodes (0x00B3/B5/B8/FC/FD/FF)
+  handlers.go                        # Opcode handlers (quests, zone transfer, chat, guild, social…)
+  abilities.go                       # The ability list (VIClient+0x2BB2C): VIAbility::Read, 0x00B3/B4/B5/B6/B8/CD/FD/FF
   spelldriver.go                     # SpellEffectSystem/Driver/EventDriver (17 event types)
   particles.go                       # ParticleSystem/Emitter — billboard quad rendering
   spellfx.go                         # SPELLFX.ESF loader
@@ -735,10 +736,11 @@ index 7 is the current HP), 0x43 effects (u32 count ≤ 8, 132-byte records: ico
 ## Combat System (verified on Sandstorm)
 
 - **Attack (0x000F)**: Auto-attack at 4s intervals
-- **UseSkill (0x0032)**: Byte 4 = WhereOnHotBar (0-9)
+- **UseSkill (0x0032)**: the ability stamp (u32, 0 on Sandstorm), then byte 4 = WhereOnHotBar (0-9), then the target
 - **ForcePositionFlush**: Must call after SendTarget before combat opcodes (server reads target from 0x40 bytes 37-40)
-- **DamageIndication (0x00DB)**: Zigzag-encoded. Negative=damage, positive=heal
-- **CastingCombat (0x00B1)**: 17 bytes. target(4) + source(4) + unk(1) + timer_ms(2) + pad(2) + animHash(4)
+- **DamageIndication (0x00DB)**: u32 attacker, zigzag amount, u32 defender (+ S2's optional RGB). CLIENT draws |amount|: over the defender when I attacked (white), else over ME (yellow); green when positive
+- **CastingCombat (0x00B1)**: caster(4) + target(4) + n(1) + n × secondary id(4) + time ms(4) + effect(4) — 17 bytes with no secondaries
+- **The ability messages** (`abilities.go`): 0x00B3 add (insert-only), 0x00B4 the echo of 0x0033 (memorize ⇄ forget, by DISPLAY index), 0x00B5/B6 slot/display moves, 0x00B8 erase, 0x00CD lockout, 0x00FD +0x14, 0x00FF clear the bar. Not entity messages
 
 ## CLI Tools
 

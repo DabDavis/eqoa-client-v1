@@ -76,6 +76,7 @@ func (c *Client) drawWorld() {
 		c.loadWords(dir)
 		c.saveArtFor = dir
 	}
+	gs.Words = c.words // the handlers' chat lines (abilities, outmatched)
 
 	// VIWorld::StreamLeaf: a zone streams in once its box is within 900
 	// (VIScene::Init's m_p2A48[1]) and out only past 950 ([0]), in 3D. The
@@ -865,13 +866,8 @@ func (c *Client) drawWorld() {
 		if progress > 0.6 {
 			alpha = uint8(255 * (1.0 - (progress-0.6)/0.4))
 		}
-		clr := rl.Color{R: 255, G: 60, B: 60, A: alpha} // red for damage
-		if ft.IsHeal {
-			clr = rl.Color{R: 60, G: 255, B: 60, A: alpha} // green for heal
-		}
-		if ft.HasColor { // the server's own colour (Sandstorm's S2)
-			clr = rl.Color{R: ft.Color[0], G: ft.Color[1], B: ft.Color[2], A: alpha}
-		}
+		// CLIENT's green/white/yellow (func_00BE9198), or the server's own (S2).
+		clr := rl.Color{R: ft.Color[0], G: ft.Color[1], B: ft.Color[2], A: alpha}
 		fontSize := int32(18)
 		textW := c.measureText(ft.Text, fontSize)
 		c.drawText(ft.Text, int32(screenPos.X)-textW/2, int32(screenPos.Y)-int32(floatRise*progress), fontSize, clr)

@@ -1600,17 +1600,13 @@ func handleCommand(engine *game.Engine, line string) {
 		}
 		idx, err1 := strconv.Atoi(parts[1])
 		slot, err2 := strconv.Atoi(parts[2])
-		if err1 != nil || err2 != nil || idx < 0 || slot < 0 || slot > 9 {
-			fmt.Println("Invalid arguments. spellListIndex >= 0, slot 0-9.")
+		gs := engine.State
+		if err1 != nil || err2 != nil || idx < 0 || idx >= len(gs.ParsedSpells) || slot < 0 || slot > 9 {
+			fmt.Println("Invalid arguments. spellListIndex in the spell list, slot 0-9.")
 			return
 		}
-		gs := engine.State
-		if idx < len(gs.ParsedSpells) {
-			fmt.Printf("Memorizing spell [%d] %s → slot %d\n", idx, gs.ParsedSpells[idx].Name, slot)
-		} else {
-			fmt.Printf("Memorizing spell index %d → slot %d\n", idx, slot)
-		}
-		engine.SendAddSkillToBar(1, byte(idx), byte(slot))
+		fmt.Printf("Memorizing spell [%d] %s → slot %d\n", idx, gs.ParsedSpells[idx].Name, slot)
+		engine.MemorizeAbility(&gs.ParsedSpells[idx], byte(slot))
 
 	case "unmemorize":
 		if len(parts) < 2 {
@@ -1622,8 +1618,13 @@ func handleCommand(engine *game.Engine, line string) {
 			fmt.Println("Invalid slot. Must be 0-9.")
 			return
 		}
-		fmt.Printf("Removing spell from slot %d\n", slot)
-		engine.SendAddSkillToBar(0, 0, byte(slot))
+		sp := engine.State.Hotbar[slot]
+		if sp == nil {
+			fmt.Printf("Slot %d is empty\n", slot)
+			return
+		}
+		fmt.Printf("Removing %s from slot %d\n", sp.Name, slot)
+		engine.ForgetAbility(sp)
 
 	case "clearbar":
 		fmt.Println("Clearing all spells from hotbar")

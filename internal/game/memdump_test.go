@@ -391,8 +391,10 @@ func writeTestItem(w *buffer.Writer,
 	}
 }
 
-// writeTestSpell writes a single DumpSpell to the buffer (test helper).
-// Matches the exact wire format: 9 zigzag + uint16(range) + 7 zigzag + name + desc + 0x00.
+// writeTestSpell writes a single ability to the buffer (test helper), as
+// VIAbility::Read takes it: 7 zigzag + float32 range + 7 zigzag + name + desc
+// + a zigzag sub-record count (0). unk2 and unk3 are unused: the C#
+// reference's two zigzags there were the float's low bytes.
 func writeTestSpell(w *buffer.Writer,
 	spellID, addedOrder, onHotBar, whereOnHotBar, unk1, showHide, abilityLvl, unk2, unk3 int64,
 	spellRange uint16, castTime, power int64, iconColor, icon int64, scope, recast, eqpReq int64,
@@ -405,9 +407,7 @@ func writeTestSpell(w *buffer.Writer,
 	w.Write7BitEncodedInt64(unk1)
 	w.Write7BitEncodedInt64(showHide)
 	w.Write7BitEncodedInt64(abilityLvl)
-	w.Write7BitEncodedInt64(unk2)
-	w.Write7BitEncodedInt64(unk3)
-	w.WriteUint16(spellRange)
+	w.WriteFloat32(float32(spellRange))
 	w.Write7BitEncodedInt64(castTime)
 	w.Write7BitEncodedInt64(power)
 	w.Write7BitEncodedInt64(iconColor)
@@ -417,5 +417,5 @@ func writeTestSpell(w *buffer.Writer,
 	w.Write7BitEncodedInt64(eqpReq)
 	w.WriteStringUnicode(name)
 	w.WriteStringUnicode(desc)
-	w.WriteByte(0x00) // terminator
+	w.WriteByte(0x00) // zigzag 0: no sub-records
 }
