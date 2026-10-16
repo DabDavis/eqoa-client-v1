@@ -147,7 +147,6 @@ type Entity struct {
 	AttackCount       int       // attack counter (driven by damage indications)
 	LastAttackAnimTime time.Time // throttle for entity attack animation triggers
 	CastAnimEnd   time.Time // when NPC casting animation ends
-	GroundSnapped bool      // true after idle Y snap applied (reset on move)
 
 	// State channel fields from ObjectUpdate (confirmed by PS2 CLIENT decompilation)
 	World     byte   // offset 16: continent (0=Tunaria)
@@ -212,14 +211,20 @@ type Entity struct {
 	Experience    int64
 	ExperienceMax int64
 
-	// PS2 VIWalkControl interpolation (InitParms exponential decay + velocity dead reckoning).
-	// smoothRate values from InitParms disassembly (25 live instances confirmed).
-	TargetX, TargetY, TargetZ float32 // latest server position
-	TargetFacing              float32 // latest server facing
-	VelX, VelY, VelZ          float32 // decoded velocity from state channel offsets 40-42
-	PrevVelX, PrevVelZ        float32 // velocity from previous update (for direction change detection)
+	// The last update's position and facing as the wire carried them, and
+	// the velocity (VICreatureEntity +0x218). X/Y/Z and Facing are where it
+	// is drawn; Motion is how CLIENT gets it there (entitymotion.go).
+	TargetX, TargetY, TargetZ float32
+	TargetFacing              float32
+	VelX, VelY, VelZ          float32
+	Motion                    EntityMotion
 	Interpolating             bool    // false until first position received
 	UpdateInterval            float32 // exponential moving average of seconds between state updates
+	// CombatFlag is VICreatureEntity +0x263, byte 155: LeaderByte263
+	// (0x00BD9350) plays the battle music while the player's own (or, in a
+	// group, the leader's) is set. ps2_main_capture.pcap: 0x24 from six
+	// seconds into a fight to its end.
+	CombatFlag byte
 }
 
 // ChatChannel represents the type of chat message.
@@ -359,9 +364,17 @@ type GameState struct {
 	// Whether the initial 0x40 world-entry handshake completed
 	WorldEntryAcked bool
 
-	// SampleHeightFunc is set by the visual client to provide terrain height lookup.
-	// Returns (groundY, true) if terrain exists at (x,z) near refY, else (0, false).
-	SampleHeightFunc func(x, z, refY float32) (float32, bool)
+	// CreatureFloorFunc is set by the visual client: a creature's floor probe
+	// (0x00CBCE40, entitymotion.go), the floor the sphere meets within 1.5
+	// of (x, y, z), or false when it meets none. Without it nothing is set
+	// down (the headless tool).
+	CreatureFloorFunc func(x, y, z float32) (float32, bool)
+
+	// NoCreatureSteps and NoEntityBlend are CLIENT's m_p2BD48 and m_p2BD4C
+	// cleared — the console's switches for UpdateCreatures' steps and
+	// Extrapolate's blend. Both are on (false here) from the constructor.
+	NoCreatureSteps bool
+	NoEntityBlend   bool
 
 	// Target response from server (opcode 0x0010)
 	TargetConColor  byte   // 0=red,1=yellow,2=white,3=dkblue,4=ltblue,5=green
@@ -2300,6 +2313,9 @@ func (gs *GameState) decodePlayerState(data []byte) {
 	if len(data) >= 146 {
 		gs.Player.Class = data[145]
 	}
+	if len(data) >= 156 {
+		gs.Player.CombatFlag = data[155] // +0x263, LeaderByte263's
+	}
 	gs.Player.IsPlayer = true
 }
 
@@ -2341,13 +2357,16 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte, created bool) 
 		}
 	}
 
-	// Position: 3-byte big-endian signed mediums at offsets 6, 9, 12 (value / 128.0)
+	// VIEntity's reader (0x00CC4CC8): the position, three s24 BE / 128, then
+	// the heading and the pitch, s8 × 2π/256 (the roll is 0).
 	newX := decodeMediumBE(data[6:9])
 	newY := decodeMediumBE(data[9:12])
 	newZ := decodeMediumBE(data[12:15])
-
-	// Facing: offset 15 (0-255 mapped to 0-2*pi)
-	newFacing := float32(data[15]) / 256.0 * 2 * 3.14159265
+	newFacing := float32(int8(data[15])) * headingScale
+	var pitch float32
+	if len(data) >= 17 {
+		pitch = float32(int8(data[16])) * headingScale
+	}
 
 	// Debug: log position delta BEFORE updating target (so we see actual change)
 	if gs.DebugEntityMovement && !wasNew && ent.Interpolating {
@@ -2356,114 +2375,44 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte, created bool) 
 		dz := newZ - ent.TargetZ
 		dist := mathutil.Dist3D(newX, newY, newZ, ent.TargetX, ent.TargetY, ent.TargetZ)
 		elapsed := time.Since(prevUpdate)
-		if dist > 0.01 {
-			var rawVelX, rawVelY, rawVelZ int8
-			if len(data) >= 43 {
-				rawVelX = int8(data[40])
-				rawVelY = int8(data[41])
-				rawVelZ = int8(data[42])
-			}
+		if dist > 0.01 && len(data) >= 59 {
 			log.Printf("MOVE ch=%d %q dt=%dms delta=(%.2f,%.2f,%.2f) dist=%.2f vel=(%d,%d,%d) anim=%d",
 				channel, ent.Name, elapsed.Milliseconds(),
 				dx, dy, dz, dist,
-				rawVelX, rawVelY, rawVelZ, data[58])
+				int8(data[40]), int8(data[41]), int8(data[42]), data[58])
 		}
 	}
 
-	// Save old target for implicit velocity computation.
-	oldTargetX := ent.TargetX
-	oldTargetY := ent.TargetY
-	oldTargetZ := ent.TargetZ
-
-	// PS2 VIWalkControl: set target for interpolation.
 	ent.TargetX = newX
 	ent.TargetY = newY
 	ent.TargetZ = newZ
-	ent.TargetFacing = newFacing
+	ent.TargetFacing = facing0To2Pi(newFacing)
 
-	// Decode velocity from state channel offsets 40-42 (signed bytes).
-	// Sandstorm velocity bytes encode direction with magnitude ~30 for walking NPCs.
-	// VICreatureEntity's reader (0x00CC2DB0) scales them by 21/128 (func_00CC2890:
-	// byte × scale × 1/128) into +0x218. Bytes 43-44, 45-47 and 48-49 follow the
-	// same way at 8, 63 and 32 (two, three and two components).
-	if len(data) >= 43 {
-		rawVX := float32(int8(data[40]))
-		rawVY := float32(int8(data[41]))
-		rawVZ := float32(int8(data[42]))
-		mag := float32(math.Sqrt(float64(rawVX*rawVX + rawVY*rawVY + rawVZ*rawVZ)))
-		if mag > 0.5 {
-			const velScale = float32(21.0 / 128.0)
-			ent.VelX = rawVX * velScale
-			ent.VelY = rawVY * velScale
-			ent.VelZ = rawVZ * velScale
-		} else {
-			// No explicit velocity — compute implicit velocity from successive
-			// target positions. Fixes Go server NPCs that don't send velocity
-			// bytes, preventing pulsing/snapping during patrol movement.
-			elapsed := float32(time.Since(prevUpdate).Seconds())
-			if elapsed > 0.01 && elapsed < 2.0 && ent.Interpolating {
-				dx := newX - oldTargetX
-				dy := newY - oldTargetY
-				dz := newZ - oldTargetZ
-				dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
-				if dist > 0.1 {
-					ent.VelX = dx / elapsed
-					ent.VelY = dy / elapsed
-					ent.VelZ = dz / elapsed
-				} else {
-					ent.VelX = 0
-					ent.VelY = 0
-					ent.VelZ = 0
-				}
-			} else {
-				ent.VelX = 0
-				ent.VelY = 0
-				ent.VelZ = 0
-			}
+	// VICreatureEntity's reader (0x00CC2DB0) goes on: the velocity (+0x218)
+	// is bytes 40-42, three s8 × 21/128 (func_00CC2890), and byte 141
+	// (+0x255) is set while the creature's own VIWalkControl walks it. A
+	// plain VIEntity (0x81) has neither.
+	creature := data[5] == entityTypeCreature
+	var vel [3]float32
+	walking := false
+	if creature && len(data) >= 43 {
+		for i := range vel {
+			vel[i] = float32(int8(data[40+i])) * creatureVelScale
 		}
 	}
+	if creature && len(data) >= 142 {
+		walking = data[141] != 0
+	}
+	ent.VelX, ent.VelY, ent.VelZ = vel[0], vel[1], vel[2]
 
-	// Animation byte: read early so we can gate velocity.
+	// The locomotion animation, +0x254 (byte 58): UpdateCreatures hands it
+	// to the sprite (SetLocomotion) when the creature is not walking.
 	if len(data) >= 59 {
 		ent.Animation = data[58]
 	}
 
-	// PS2: locomotion animation is derived from velocity (UpdateLocomotion),
-	// NOT from the state channel animation byte.
-	// For remote PLAYERS: animation byte is authoritative (0=idle means stopped).
-	// Sandstorm sends stale velocity bytes on stop, so zero velocity when idle.
-	// For NPCs: animation byte is always 0 (server doesn't set it), so don't
-	// zero velocity — let the animation system derive locomotion from movement.
-	if ent.Animation == 0 && ent.IsPlayer {
-		ent.VelX = 0
-		ent.VelY = 0
-		ent.VelZ = 0
-	}
-
-	// Snap entity position to server on every update. Dead-reckoning between
-	// updates provides smooth movement; this reset prevents drift accumulation.
-	if ent.Interpolating && !wasNew {
-		ent.X = newX
-		ent.Y = newY
-		ent.Z = newZ
-	}
-	// Save velocity for next update's direction change detection.
-	ent.PrevVelX = ent.VelX
-	ent.PrevVelZ = ent.VelZ
-
-	if wasNew {
-		// First appearance — snap position, enable interpolation
-		ent.X = newX
-		ent.Y = newY
-		ent.Z = newZ
-		ent.Facing = newFacing
-		ent.VelX = 0
-		ent.VelY = 0
-		ent.VelZ = 0
-		ent.PrevVelX = 0
-		ent.PrevVelZ = 0
-		ent.Interpolating = true
-	}
+	gs.entityUpdate(ent, wasNew, creature, [3]float32{newX, newY, newZ}, [3]float32{newFacing, pitch, 0}, vel, walking)
+	ent.Interpolating = true
 
 	// World: offset 16 (continent ID, 0=Tunaria)
 	if len(data) >= 18 {
@@ -2613,6 +2562,11 @@ func (gs *GameState) decodeEntityState(channel byte, data []byte, created bool) 
 	if len(data) >= 148 {
 		ent.NPCFlags = uint16(data[146]) | uint16(data[147])<<8
 	}
+	// +0x260..+0x264 are bytes 152-156 (+0x262 the Flag4/Flag8 byte); +0x263,
+	// byte 155, is what LeaderByte263 tests for the battle music.
+	if len(data) >= 156 {
+		ent.CombatFlag = data[155]
+	}
 
 	// Log new and changed entities
 	if wasNew {
@@ -2648,81 +2602,6 @@ func (gs *GameState) PurgeStaleEntities(timeout time.Duration) int {
 		}
 	}
 	return purged
-}
-
-// InterpolateEntities applies PS2 VIWalkControl smoothing each frame.
-//
-// Per entity per frame:
-//   1. Dead reckoning:  pos += vel * dt (only when entity is moving)
-//   2. Correction:      pos += (target - pos) * (1 - pow(smoothRate, dt))
-//
-// Key fixes over naive implementation:
-//   - Velocity zeroed when anim=0 (entity stopped) — prevents runaway dead reckoning
-//   - Velocity decayed when state data is stale (>2s since update) — prevents drift
-//
-// PS2 InitParms defaults (25 live EE instances confirmed):
-//   smoothRateX=0.02, smoothRateY=0.80, smoothRateZ=0.01, smoothRateHeading=0.02
-//   stepRemote=200ms (remote entity physics tick)
-func (gs *GameState) InterpolateEntities(dt float32) {
-	const (
-		smoothRateHeading = float64(0.02)
-	)
-
-	corrH := float32(1.0 - math.Pow(smoothRateHeading, float64(dt)))
-
-	for _, ent := range gs.Entities {
-		if !ent.Interpolating {
-			continue
-		}
-		// Dead entities: freeze position (no velocity, no correction).
-		if ent.HPFlag == 3 {
-			continue
-		}
-
-		// Dead-reckon X/Z from current position using velocity.
-		// Handler snaps position to server on each update, so drift is bounded
-		// to one update interval (~100ms).
-		moving := ent.VelX != 0 || ent.VelZ != 0
-		if moving {
-			ent.X += ent.VelX * dt
-			ent.Z += ent.VelZ * dt
-			ent.GroundSnapped = false
-		}
-
-		// Snap Y to terrain surface.
-		// Moving: every frame (slope following).
-		// Stopped: once immediately (fix patrol stop positions).
-		needSnap := moving || !ent.GroundSnapped
-		if gs.SampleHeightFunc != nil && needSnap {
-			if y, ok := gs.SampleHeightFunc(ent.X, ent.Z, ent.TargetY+2); ok {
-				ent.Y = y
-			} else {
-				ent.Y = ent.TargetY
-			}
-			if !moving {
-				ent.GroundSnapped = true
-			}
-		} else {
-			ent.Y = ent.TargetY
-		}
-
-		// Heading: exponential decay correction (shortest arc) for smooth turning.
-		facingDiff := ent.TargetFacing - ent.Facing
-		for facingDiff > math.Pi {
-			facingDiff -= 2 * math.Pi
-		}
-		for facingDiff < -math.Pi {
-			facingDiff += 2 * math.Pi
-		}
-		ent.Facing += facingDiff * corrH
-
-		for ent.Facing < 0 {
-			ent.Facing += 2 * math.Pi
-		}
-		for ent.Facing >= 2*math.Pi {
-			ent.Facing -= 2 * math.Pi
-		}
-	}
 }
 
 // decodeMediumBE decodes a 3-byte big-endian signed integer and returns float32(val) / 128.0.
